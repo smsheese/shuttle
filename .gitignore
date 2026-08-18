@@ -1,0 +1,79 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Dependencies
+node_modules/
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+.cursor/
+
+# Logs and local databases
+*.log
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Frontend / Tauri / Cargo build output
+shuttle-app/build/
+shuttle-app/.svelte-kit/
+shuttle-app/src-tauri/target/
+shuttle-app/src-tauri/gen/schemas
+dist/
+*.AppImage
+*.deb
+*.rpm
+*.dmg
+*.msi
+*.exe
+
+# Downloaded native helpers and generated launchers (scripts stay in git)
+connectors/bin/
+connectors/python-runtime/current/*
+!connectors/python-runtime/current/.gitkeep
+connectors/gowa/whatsapp
+connectors/gowa/*.tar.gz
+connectors/gowa/*.zip
+connectors/tdlib/*.so
+connectors/tdlib/*.dylib
+connectors/tdlib/*.dll
+connectors/tdlib/*.whl
+connectors/tdlib/*.zip
+connectors/tdlib/*.tar.gz
+connectors/tdlib/libtdjson*
+connectors/tdlib/tdjson*
+connectors/signal/runtime/
+connectors/signal/signal-cli
+connectors/signal/signal-cli.bat
+connectors/signal/signal-cli.exe
+connectors/signal/signal-cli.exe.bat
+connectors/signal/SOURCE.json
+connectors/signal/THIRD-PARTY-LICENSE.txt
+connectors/signal/*.tar.gz
+connectors/signal/*.zip
+
+# Windows packaging toolchain (downloaded locally)
+.tools/
+
+# Gauntlet / Beeper comparison artifacts (not part of the product)
+screenshots/
+progress.html
+progress.json

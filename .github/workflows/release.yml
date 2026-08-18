@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub Environment to use for telemetry secrets
+        required: true
+        default: testing
+        type: choice
+        options:
+          - production
+          - testing
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-environment:
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.pick.outputs.name }}
+      channel: ${{ steps.pick.outputs.channel }}
+    steps:
+      - id: pick
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENV="${{ github.event.inputs.environment }}"
+          elif [[ "${{ github.ref }}" == refs/heads/main || "${{ github.ref }}" == refs/tags/v* ]]; then
+            ENV="production"
+          else
+            ENV="testing"
+          fi
+          echo "name=$ENV" >> "$GITHUB_OUTPUT"
+          echo "channel=$ENV" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve-environment
+    environment: ${{ needs.resolve-environment.outputs.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-amd64
+            rust_target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+            rust_target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            platform: macos-universal
+            rust_target: universal-apple-darwin
+          - os: windows-latest
+            platform: windows-amd64
+            rust_target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            platform: windows-arm64
+            rust_target: aarch64-pc-windows-msvc
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: shuttle-app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config python3 \
+            libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libjavascriptcoregtk-4.1-dev libsoup-3.0-dev librsvg2-dev \
+            libdbus-1-dev libssl-dev libayatana-appindicator3-dev libxdo-dev
+
+      - name: Stage release assets
+        shell: bash
+        run: ./scripts/stage-release-assets.sh
+
+      - name: Install frontend
+        working-directory: shuttle-app
+        run: npm ci
+
+      - name: Build bundles
+        working-directory: shuttle-app
+        shell: bash
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+          POSTHOG_HOST: ${{ secrets.POSTHOG_HOST }}
+          SHUTTLE_BUILD_CHANNEL: ${{ needs.resolve-environment.outputs.channel }}
+          SHUTTLE_GIT_COMMIT: ${{ github.sha }}
+        run: |
+          if [[ "${{ matrix.rust_target }}" == "universal-apple-darwin" ]]; then
+            npm run tauri build -- --target universal-apple-darwin
+          elif [[ "${{ matrix.rust_target }}" != "x86_64-unknown-linux-gnu" && "${{ runner.os }}" != "Windows" ]]; then
+            npm run tauri build -- --target "${{ matrix.rust_target }}"
+          elif [[ "${{ runner.os }}" == "Windows" && "${{ matrix.rust_target }}" != "x86_64-pc-windows-msvc" ]]; then
+            npm run tauri build -- --target "${{ matrix.rust_target }}"
+          else
+            npm run tauri build
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: shuttle-${{ matrix.platform }}
+          path: |
+            shuttle-app/src-tauri/target/release/bundle/**/*
+            shuttle-app/src-tauri/target/${{ matrix.rust_target }}/release/bundle/**/*
+            !**/*.d
+
+  publish:
+    needs: [resolve-environment, build]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

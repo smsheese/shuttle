@@ -1,0 +1,63 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Shuttle",
+  "version": "0.1.1",
+  "identifier": "com.shuttle.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Shuttle",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 768,
+        "minHeight": 500,
+        "decorations": true,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "../../connectors/shuttle_ipc.py": "connectors/shuttle_ipc.py",
+      "../../connectors/email-connector.py": "connectors/email-connector.py",
+      "../../connectors/instagram-connector.py": "connectors/instagram-connector.py",
+      "../../connectors/matrix-connector.py": "connectors/matrix-connector.py",
+      "../../connectors/messenger-connector.py": "connectors/messenger-connector.py",
+      "../../connectors/signal-connector.py": "connectors/signal-connector.py",
+      "../../connectors/telegram-connector.py": "connectors/telegram-connector.py",
+      "../../connectors/whatsapp-connector.py": "connectors/whatsapp-connector.py",
+      "../../connectors/python-runtime/current": "python-runtime",
+      "../../connectors/signal/signal-cli": "connectors/signal/signal-cli",
+      "../../connectors/signal/runtime": "connectors/signal/runtime",
+      "../../connectors/signal/SOURCE.json": "connectors/signal/SOURCE.json",
+      "../../connectors/signal/THIRD-PARTY-LICENSE.txt": "connectors/signal/THIRD-PARTY-LICENSE.txt",
+      "../../third-party/licenses/signal-cli-GPL-3.0.txt": "licenses/signal-cli-GPL-3.0.txt",
+      "../../third-party/licenses/AGPL-3.0.txt": "licenses/AGPL-3.0.txt",
+      "../../LICENSE": "licenses/Shuttle-AGPL-3.0.txt",
+      "../../ATTRIBUTION.md": "ATTRIBUTION.md"
+    },
+    "linux": {
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    }
+  }
+}

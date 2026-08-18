@@ -1,0 +1,6 @@
+# Isolated sidecar Python dependencies. Install into a venv, not the system Python, if you can.
+# Telegram (TDLib) and Email (imap/smtp) use the standard library + a local tdjson library.
+# Signal uses the signal-cli binary, not a Python package.
+
+fbchat>=2.0.0a5,<2.1
+instagrapi>=2.1.0

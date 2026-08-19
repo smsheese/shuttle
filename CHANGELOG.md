@@ -9,44 +9,20 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 
 ## [Unreleased]
 
-## [0.2.1-e] - 2026-08-19
-
-### Fixed
-
-- Release CI: install `libfuse2` on Linux for reliable AppImage bundling via linuxdeploy.
-
-## [0.2.1-d] - 2026-08-19
-
-### Fixed
-
-- Release CI: pass `--` before Windows bundle flags on the default `tauri build` path so `--bundles nsis` is parsed correctly.
-
-## [0.2.1-c] - 2026-08-19
-
-### Fixed
-
-- Release CI: build Windows with NSIS only so letter prerelease versions (e.g. `0.2.1-c`) work; MSI requires numeric prerelease identifiers.
-
-### Changed
-
-- Release CI reads `.github/ci-rebuild-platforms.txt` to rebuild only failed platforms instead of the full matrix every push (`all` / platform names / `none` to skip).
-
-## [0.2.1-b] - 2026-08-19
-
-### Fixed
-
-- Release CI: install real macOS Rust targets (`aarch64` + `x86_64`) instead of invalid `universal-apple-darwin` rustup triple; pass universal target only to Tauri.
-- Release CI: install `xdg-utils` on Linux so AppImage bundling succeeds on ARM runners.
-
 ## [0.2.1] - 2026-08-19
 
 ### Fixed
 
 - Release CI now passes `VITE_GIPHY_API_KEY` into `tauri build` so Giphy works in production installers when set as a GitHub Environment secret.
+- Release CI: install real macOS Rust targets (`aarch64` + `x86_64`) instead of invalid `universal-apple-darwin` rustup triple; pass universal target only to Tauri.
+- Release CI: install `xdg-utils` on Linux so AppImage bundling succeeds on ARM runners.
+- Release CI: install `libfuse2` on Linux for reliable AppImage bundling via linuxdeploy.
+- Release CI: pass `--` before Windows bundle flags on the default `tauri build` path so `--bundles nsis` is parsed correctly.
 
 ### Changed
 
 - `.env.example` documents that `VITE_GIPHY_API_KEY` can be set locally or via GitHub Environment secrets for release builds.
+- Release CI reads `.github/ci-rebuild-platforms.txt` to rebuild only failed platforms instead of the full matrix every push (`all` / platform names / `none` to skip). Tag pushes always build the full matrix and publish GitHub Releases with changelog notes.
 
 ## [0.2.0] - 2026-08-19
 

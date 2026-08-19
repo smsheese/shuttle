@@ -41,6 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.filter.outputs.matrix }}
+      has_jobs: ${{ steps.filter.outputs.has_jobs }}
     steps:
       - uses: actions/checkout@v4
 
@@ -56,6 +57,12 @@ jobs:
           ]'
 
           WANT=$(grep -v '^\s*#' .github/ci-rebuild-platforms.txt | grep -v '^\s*$' | tr '\n' ' ')
+          if [[ "$WANT" == *"none"* ]]; then
+            echo "Rebuild skipped (ci-rebuild-platforms.txt is 'none')"
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "has_jobs=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [[ -z "$WANT" || "$WANT" == *"all"* ]]; then
             FILTERED="$FULL"
           else
@@ -71,9 +78,11 @@ jobs:
           echo "Selected platforms:"
           echo "$FILTERED" | jq -r '.[].platform'
           echo "matrix=$(echo "$FILTERED" | jq -c '{include: .}')" >> "$GITHUB_OUTPUT"
+          echo "has_jobs=true" >> "$GITHUB_OUTPUT"
 
   build:
     needs: [resolve-environment, prepare-matrix]
+    if: needs.prepare-matrix.outputs.has_jobs == 'true'
     environment: ${{ needs.resolve-environment.outputs.name }}
     strategy:
       fail-fast: false

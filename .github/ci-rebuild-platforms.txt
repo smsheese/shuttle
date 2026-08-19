@@ -1,2 +1,5 @@
-# Platforms to rebuild on the next push (one per line). Use "all" for the full matrix.
-linux-amd64
+# Platforms to rebuild on the next push (one per line).
+#   all   — full matrix (5 platforms)
+#   none  — skip build jobs (use after all platforms are green)
+# All platforms green at v0.2.1-e (2026-08-19).
+none

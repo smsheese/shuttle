@@ -1,0 +1,4 @@
+# Platforms to rebuild on the next push (one per line). Use "all" for the full matrix.
+# Successful platforms from run 32283357056 are omitted to save CI time.
+windows-amd64
+windows-arm64

@@ -37,29 +37,47 @@ jobs:
           echo "name=$ENV" >> "$GITHUB_OUTPUT"
           echo "channel=$ENV" >> "$GITHUB_OUTPUT"
 
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.filter.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: filter
+        shell: bash
+        run: |
+          FULL='[
+            {"os":"ubuntu-latest","platform":"linux-amd64","rust_target":"x86_64-unknown-linux-gnu"},
+            {"os":"ubuntu-24.04-arm","platform":"linux-arm64","rust_target":"aarch64-unknown-linux-gnu"},
+            {"os":"macos-latest","platform":"macos-universal","rust_targets":"aarch64-apple-darwin,x86_64-apple-darwin","tauri_target":"universal-apple-darwin"},
+            {"os":"windows-latest","platform":"windows-amd64","rust_target":"x86_64-pc-windows-msvc"},
+            {"os":"windows-11-arm","platform":"windows-arm64","rust_target":"aarch64-pc-windows-msvc"}
+          ]'
+
+          WANT=$(grep -v '^\s*#' .github/ci-rebuild-platforms.txt | grep -v '^\s*$' | tr '\n' ' ')
+          if [[ -z "$WANT" || "$WANT" == *"all"* ]]; then
+            FILTERED="$FULL"
+          else
+            FILTERED=$(echo "$FULL" | jq --arg want "$WANT" '[.[] | select(.platform as $p | ($want | split(" ") | map(select(length > 0))) | index($p))]')
+          fi
+
+          COUNT=$(echo "$FILTERED" | jq 'length')
+          if [[ "$COUNT" -eq 0 ]]; then
+            echo "No platforms matched; defaulting to full matrix"
+            FILTERED="$FULL"
+          fi
+
+          echo "Selected platforms:"
+          echo "$FILTERED" | jq -r '.[].platform'
+          echo "matrix=$(echo "$FILTERED" | jq -c '{include: .}')" >> "$GITHUB_OUTPUT"
+
   build:
-    needs: resolve-environment
+    needs: [resolve-environment, prepare-matrix]
     environment: ${{ needs.resolve-environment.outputs.name }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            platform: linux-amd64
-            rust_target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            platform: linux-arm64
-            rust_target: aarch64-unknown-linux-gnu
-          - os: macos-latest
-            platform: macos-universal
-            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
-            tauri_target: universal-apple-darwin
-          - os: windows-latest
-            platform: windows-amd64
-            rust_target: x86_64-pc-windows-msvc
-          - os: windows-11-arm
-            platform: windows-arm64
-            rust_target: aarch64-pc-windows-msvc
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
 
     runs-on: ${{ matrix.os }}
 
@@ -103,14 +121,20 @@ jobs:
           SHUTTLE_COMPONENTS_BASE_URL: ${{ secrets.SHUTTLE_COMPONENTS_BASE_URL }}
           VITE_GIPHY_API_KEY: ${{ secrets.VITE_GIPHY_API_KEY }}
         run: |
+          BUNDLE_ARGS=()
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            # MSI rejects letter prerelease identifiers (e.g. 0.2.1-c); NSIS is fine.
+            BUNDLE_ARGS=(--bundles nsis)
+          fi
+
           if [[ -n "${{ matrix.tauri_target }}" ]]; then
-            npm run tauri build -- --target "${{ matrix.tauri_target }}"
+            npm run tauri build -- --target "${{ matrix.tauri_target }}" "${BUNDLE_ARGS[@]}"
           elif [[ "${{ matrix.rust_target }}" != "x86_64-unknown-linux-gnu" && "${{ runner.os }}" != "Windows" ]]; then
-            npm run tauri build -- --target "${{ matrix.rust_target }}"
+            npm run tauri build -- --target "${{ matrix.rust_target }}" "${BUNDLE_ARGS[@]}"
           elif [[ "${{ runner.os }}" == "Windows" && "${{ matrix.rust_target }}" != "x86_64-pc-windows-msvc" ]]; then
-            npm run tauri build -- --target "${{ matrix.rust_target }}"
+            npm run tauri build -- --target "${{ matrix.rust_target }}" "${BUNDLE_ARGS[@]}"
           else
-            npm run tauri build
+            npm run tauri build "${BUNDLE_ARGS[@]}"
           fi
 
       - name: Upload artifacts

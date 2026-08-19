@@ -9,6 +9,16 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 
 ## [Unreleased]
 
+## [0.2.1-c] - 2026-08-19
+
+### Fixed
+
+- Release CI: build Windows with NSIS only so letter prerelease versions (e.g. `0.2.1-c`) work; MSI requires numeric prerelease identifiers.
+
+### Changed
+
+- Release CI reads `.github/ci-rebuild-platforms.txt` to rebuild only failed platforms instead of the full matrix every push.
+
 ## [0.2.1-b] - 2026-08-19
 
 ### Fixed

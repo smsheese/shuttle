@@ -23,15 +23,8 @@ jobs:
         id: inputs
         shell: bash
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-            echo "run_id=${{ github.event.inputs.run_id }}" >> "$GITHUB_OUTPUT"
-          else
-            TAG=$(jq -r '.tag' .github/release-republish.json)
-            RUN_ID=$(jq -r '.run_id' .github/release-republish.json)
-            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-            echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-          fi
+          echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          echo "run_id=${{ github.event.inputs.run_id }}" >> "$GITHUB_OUTPUT"
 
       - name: Extract release notes
         id: notes

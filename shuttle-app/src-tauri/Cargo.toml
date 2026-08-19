@@ -1,6 +1,6 @@
 [package]
 name = "shuttle"
-version = "0.2.1"
+version = "0.2.1b"
 description = "Local-first unified messaging desktop app"
 authors = ["Sheese Sheikh <https://shee.se>"]
 homepage = "https://shee.se"

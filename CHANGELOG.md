@@ -9,6 +9,13 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 
 ## [Unreleased]
 
+## [0.2.1b] - 2026-08-19
+
+### Fixed
+
+- Release CI: install real macOS Rust targets (`aarch64` + `x86_64`) instead of invalid `universal-apple-darwin` rustup triple; pass universal target only to Tauri.
+- Release CI: install `xdg-utils` on Linux so AppImage bundling succeeds on ARM runners.
+
 ## [0.2.1] - 2026-08-19
 
 ### Fixed

@@ -1,3 +1,2 @@
 # Platforms to rebuild on the next push (one per line). Use "all" for the full matrix.
-# windows-arm64 succeeded in run 32284571756.
-windows-amd64
+all

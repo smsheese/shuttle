@@ -22,7 +22,7 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 ### Changed
 
 - `.env.example` documents that `VITE_GIPHY_API_KEY` can be set locally or via GitHub Environment secrets for release builds.
-- Release CI reads `.github/ci-rebuild-platforms.txt` to rebuild only failed platforms instead of the full matrix every push (`all` / platform names / `none` to skip). Tag pushes always build the full matrix and publish GitHub Releases with changelog notes.
+- Release CI reads `.github/ci-rebuild-platforms.txt` to rebuild only failed platforms instead of the full matrix every push (`all` / platform names / `none` to skip). Tag pushes always build the full matrix and publish GitHub Releases with changelog notes and installer artifacts only.
 
 ## [0.2.0] - 2026-08-19
 

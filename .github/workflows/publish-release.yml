@@ -9,10 +9,6 @@ on:
       run_id:
         description: Workflow run ID with build artifacts
         required: true
-  push:
-    branches: [main]
-    paths:
-      - .github/release-republish.json
 
 permissions:
   contents: write
@@ -92,6 +88,6 @@ jobs:
           name: Shuttle ${{ steps.inputs.outputs.tag }}
           body: ${{ steps.notes.outputs.body }}
           files: release-assets/*
-          replace_assets: true
+          overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

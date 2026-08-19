@@ -212,6 +212,6 @@ jobs:
           name: Shuttle ${{ github.ref_name }}
           body: ${{ steps.notes.outputs.body }}
           files: release-assets/*
-          replace_assets: true
+          overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

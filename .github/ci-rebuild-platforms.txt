@@ -1,2 +1,2 @@
 # Platforms to rebuild on the next push (one per line). Use "all" for the full matrix.
-all
+linux-amd64

@@ -9,6 +9,12 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 
 ## [Unreleased]
 
+## [0.2.1-e] - 2026-08-19
+
+### Fixed
+
+- Release CI: install `libfuse2` on Linux for reliable AppImage bundling via linuxdeploy.
+
 ## [0.2.1-d] - 2026-08-19
 
 ### Fixed

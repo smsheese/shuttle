@@ -1,6 +1,6 @@
 {
   "name": "shuttle-app",
-  "version": "0.2.1b",
+  "version": "0.2.1-b",
   "description": "Local-first unified messaging desktop app",
   "type": "module",
   "scripts": {

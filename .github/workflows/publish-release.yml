@@ -41,7 +41,7 @@ jobs:
         id: notes
         shell: bash
         run: |
-          VERSION="${{ github.event.inputs.tag }}"
+          VERSION="${{ steps.inputs.outputs.tag }}"
           VERSION="${VERSION#v}"
           NOTES=$(awk -v ver="$VERSION" '
             BEGIN { found=0 }

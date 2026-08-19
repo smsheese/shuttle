@@ -9,6 +9,12 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 
 ## [Unreleased]
 
+## [0.2.1-d] - 2026-08-19
+
+### Fixed
+
+- Release CI: pass `--` before Windows bundle flags on the default `tauri build` path so `--bundles nsis` is parsed correctly.
+
 ## [0.2.1-c] - 2026-08-19
 
 ### Fixed

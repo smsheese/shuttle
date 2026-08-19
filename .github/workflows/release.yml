@@ -134,7 +134,7 @@ jobs:
           elif [[ "${{ runner.os }}" == "Windows" && "${{ matrix.rust_target }}" != "x86_64-pc-windows-msvc" ]]; then
             npm run tauri build -- --target "${{ matrix.rust_target }}" "${BUNDLE_ARGS[@]}"
           else
-            npm run tauri build "${BUNDLE_ARGS[@]}"
+            npm run tauri build -- "${BUNDLE_ARGS[@]}"
           fi
 
       - name: Upload artifacts

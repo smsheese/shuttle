@@ -195,13 +195,11 @@ jobs:
         shell: bash
         run: |
           mkdir -p release-assets
+          # One primary installer per CI platform (5), plus CHANGELOG.
           find dist -type f \( \
             -path '*/bundle/deb/*.deb' \
-            -o -path '*/bundle/rpm/*.rpm' \
-            -o -path '*/bundle/appimage/*.AppImage' \
             -o -path '*/bundle/dmg/*.dmg' \
             -o -path '*/bundle/msi/*.msi' \
-            -o -path '*/bundle/nsis/*.exe' \
           \) -size +1024c -print -exec cp {} release-assets/ \;
           cp CHANGELOG.md release-assets/
           echo "Release assets:"

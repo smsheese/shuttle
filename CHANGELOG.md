@@ -9,6 +9,16 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-19
+
+### Fixed
+
+- Release CI now passes `VITE_GIPHY_API_KEY` into `tauri build` so Giphy works in production installers when set as a GitHub Environment secret.
+
+### Changed
+
+- `.env.example` documents that `VITE_GIPHY_API_KEY` can be set locally or via GitHub Environment secrets for release builds.
+
 ## [0.2.0] - 2026-08-19
 
 ### Added

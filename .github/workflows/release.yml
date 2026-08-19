@@ -99,6 +99,7 @@ jobs:
           SHUTTLE_BUILD_CHANNEL: ${{ needs.resolve-environment.outputs.channel }}
           SHUTTLE_GIT_COMMIT: ${{ github.sha }}
           SHUTTLE_COMPONENTS_BASE_URL: ${{ secrets.SHUTTLE_COMPONENTS_BASE_URL }}
+          VITE_GIPHY_API_KEY: ${{ secrets.VITE_GIPHY_API_KEY }}
         run: |
           if [[ "${{ matrix.rust_target }}" == "universal-apple-darwin" ]]; then
             npm run tauri build -- --target universal-apple-darwin

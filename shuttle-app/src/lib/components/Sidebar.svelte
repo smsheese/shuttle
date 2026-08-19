@@ -9,6 +9,7 @@
     onadd: () => void;
     unreadTotal: number;
     mobileTab?: 'inbox' | 'settings';
+    settingsActive?: boolean;
     ontabchange?: (tab: 'inbox' | 'settings') => void;
     onsettings?: () => void;
     onaccountmenu?: (account: Account, x: number, y: number) => void;
@@ -21,6 +22,7 @@
     onadd,
     unreadTotal,
     mobileTab = 'inbox',
+    settingsActive = false,
     ontabchange,
     onsettings,
     onaccountmenu,
@@ -29,31 +31,31 @@
   let brandClicks = 0;
   let brandTimer: ReturnType<typeof setTimeout> | undefined;
 
+  async function onBrandClick() {
+    brandClicks += 1;
+    clearTimeout(brandTimer);
+    brandTimer = setTimeout(() => (brandClicks = 0), 2500);
+    if (brandClicks >= 8) {
+      brandClicks = 0;
+      const { openDevtools } = await import('$lib/api');
+      openDevtools();
+    }
+  }
+
 </script>
 
 <nav class="sidebar" aria-label="Main navigation">
   <!-- Desktop: network rail -->
   <div class="desktop-rail">
-    <div
+    <button
+      type="button"
       class="brand"
       title="Shuttle"
-      role="button"
-      tabindex="0"
-      onclick={async () => {
-        brandClicks += 1;
-        clearTimeout(brandTimer);
-        brandTimer = setTimeout(() => (brandClicks = 0), 2500);
-        if (brandClicks >= 8) {
-          brandClicks = 0;
-          const { openDevtools } = await import('$lib/api');
-          openDevtools();
-        }
-      }}
+      aria-label="Shuttle"
+      onclick={onBrandClick}
     >
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-        <path d="M4 12h16M4 12l4-4M4 12l4 4M20 12l-4-4M20 12l-4 4" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>
-    </div>
+      <img class="brand-logo" src="/shuttle-logo.svg" width="22" height="22" alt="" />
+    </button>
 
     <button
       class="nav-item all-chats"
@@ -67,7 +69,7 @@
         <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
       </svg>
       {#if unreadTotal > 0}
-        <span class="badge">{unreadTotal > 99 ? '99+' : unreadTotal}</span>
+        <span class="badge badge-pulse">{unreadTotal > 99 ? '99+' : unreadTotal}</span>
       {/if}
     </button>
 
@@ -99,17 +101,26 @@
       {/each}
     </div>
 
-    <button class="nav-item add" onclick={onadd} title="Add account" aria-label="Add account">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-        <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-      </svg>
-    </button>
-    <button class="nav-item add" onclick={() => onsettings?.()} title="Settings" aria-label="Settings">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-        <circle cx="12" cy="12" r="3"/>
-        <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
-      </svg>
-    </button>
+    <div class="rail-footer">
+      <button class="nav-item add" onclick={onadd} title="Add account" aria-label="Add account">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+      </button>
+      <button
+        class="nav-item settings"
+        class:active={settingsActive}
+        onclick={() => onsettings?.()}
+        title="Settings"
+        aria-label="Settings"
+        aria-current={settingsActive ? 'page' : undefined}
+      >
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+        </svg>
+      </button>
+    </div>
   </div>
 
   <!-- Mobile: Inbox | Settings tab bar -->
@@ -144,8 +155,9 @@
 
 <style>
   .sidebar {
-    width: var(--rail-width);
+    width: 100%;
     min-width: var(--rail-width);
+    height: 100%;
     background: var(--bg-sidebar);
     border-right: 1px solid var(--border-subtle);
     display: flex;
@@ -176,8 +188,19 @@
     align-items: center;
     justify-content: center;
     margin-bottom: 8px;
+    border: none;
+    padding: 0;
     border-radius: var(--radius-md);
     background: var(--accent-muted);
+    cursor: pointer;
+    color: inherit;
+  }
+
+  .brand-logo {
+    display: block;
+    width: 22px;
+    height: 22px;
+    object-fit: contain;
   }
 
   .networks {
@@ -301,20 +324,75 @@
     animation: pulse 1.5s infinite;
   }
 
+  .badge-pulse {
+    animation: badge-breathe 2.4s ease-in-out infinite;
+  }
+
   @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.35; }
   }
 
-  .add {
+  @keyframes badge-breathe {
+    0%, 100% {
+      transform: scale(1);
+      box-shadow: 0 0 0 2px var(--bg-sidebar), 0 0 0 0 color-mix(in srgb, var(--accent) 50%, transparent);
+    }
+    50% {
+      transform: scale(1.1);
+      box-shadow: 0 0 0 2px var(--bg-sidebar), 0 0 0 5px color-mix(in srgb, var(--accent) 0%, transparent);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .badge-pulse {
+      animation: none;
+    }
+  }
+
+  .rail-footer {
     margin-top: auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding-top: 6px;
+  }
+
+  .add {
     opacity: 0.55;
     border: 1px dashed var(--border);
     width: 40px;
     height: 40px;
   }
 
-  .add:hover {
+  .settings {
+    width: 44px;
+    height: 44px;
+    opacity: 0.72;
+  }
+
+  .settings.active {
+    opacity: 1;
+    background: var(--bg-active);
+    color: var(--text);
+  }
+
+  .settings.active::before {
+    content: '';
+    position: absolute;
+    left: -8px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 3px;
+    height: 22px;
+    border-radius: 0 2px 2px 0;
+    background: var(--accent);
+  }
+
+  .add:hover,
+  .settings:hover {
     opacity: 1;
     border-color: var(--text-muted);
     color: var(--text);
@@ -338,7 +416,6 @@
       border-right: none;
       border-top: 1px solid var(--border-subtle);
       flex-shrink: 0;
-      order: 1;
     }
 
     .desktop-rail {

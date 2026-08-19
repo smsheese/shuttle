@@ -17,17 +17,30 @@ Build each OS on a machine (or CI runner) with the matching CPU architecture. ma
 
 | Layer | amd64 + arm64 | Notes |
 | --- | --- | --- |
-| Tauri shell + Rust core | yes | Built per target triple or macOS universal |
+| Tauri shell + Rust core | yes | Built per target triple or macOS universal (~30 MB installer) |
 | Svelte UI | yes | Same web assets everywhere |
-| Python connector scripts | yes | Bundled into app resources; core prefers the bundled CPython runtime and falls back only for dev |
-| GOWA (WhatsApp) | per OS + arch | `./connectors/gowa/fetch.sh` |
-| TDLib (Telegram) | per OS + arch | `./connectors/tdlib/fetch.sh` |
-| signal-cli (Signal) | per OS + arch | `./connectors/signal/fetch.sh` |
-| Messenger / Instagram / Matrix / Email | yes* | Python + stdlib or pip deps; no arch-specific binary |
+| Connector sidecars + native helpers | per OS + arch | **Downloaded on demand** when you add an account (hosted on S3; see below) |
+| Python runtime | per OS + arch | Downloaded when needed; system Python 3.12+ is used when compatible |
 
-\*Messenger and Instagram deps are installed into the bundled runtime during `./scripts/fetch-python-runtime.sh`. Email and Matrix use the Python standard library only.
+Release installers ship **core only**. Connector scripts, native binaries (GOWA, TDLib, signal-cli), slim CPython, and per-network Python deps are fetched lazily from a versioned manifest:
 
-The embedded Python runtime and native helpers are **not** committed to git (see the root `.gitignore`). Run the fetch scripts on each platform before packaging, or let CI fetch them on each matrix leg. Local copies of NSIS under `.tools/` and installer files under `dist/` are also ignored.
+```
+{SHUTTLE_COMPONENTS_BASE_URL}/v{app_version}/manifest.json
+```
+
+Installed under `~/.local/share/shuttle/components/` (or `$SHUTTLE_DATA_DIR/components/`).
+
+Publish component archives with `./scripts/publish-components.sh` (CI: `.github/workflows/publish-components.yml` on `v*` tags).
+
+Local development still uses repo `connectors/` when running `npm run tauri dev` (debug fallback).
+
+| Component | Build / fetch helper |
+| --- | --- |
+| GOWA (WhatsApp) | `./connectors/gowa/fetch.sh` |
+| TDLib (Telegram) | `./connectors/tdlib/fetch.sh` |
+| signal-cli (Signal) | `./connectors/signal/fetch.sh` |
+| Slim Python runtime | `SHUTTLE_PYTHON_SKIP_DEPS=1 ./scripts/fetch-python-runtime.sh` + `./scripts/slim-python-runtime.sh` |
+| Messenger / Instagram deps | Built into separate tarballs during `./scripts/publish-components.sh` |
 
 ## Rust target triples
 
@@ -106,4 +119,4 @@ Until that work lands, treat Android as **roadmap only**. The `cdylib` / `static
 
 - **32-bit** (i686, armv7) is still out of scope. Tauri/WebKit packaging plus native helper coverage makes it non-trivial rather than a quick win.
 - **Linux i386 / musl-only** distros are untested; glibc-based builds are the default.
-- **GPL signal-cli** is bundled in release builds with license texts ([ATTRIBUTION.md](../ATTRIBUTION.md), [licensing.md](licensing.md)).
+- **GPL signal-cli** is downloaded on demand when you add a Signal account (license text ships with the app; see [licensing.md](licensing.md)).

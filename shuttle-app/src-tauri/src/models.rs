@@ -97,6 +97,10 @@ pub struct Message {
     pub timestamp: DateTime<Utc>,
     pub status: MessageStatus,
     pub metadata: serde_json::Value,
+    #[serde(default)]
+    pub starred: bool,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +111,55 @@ pub struct Contact {
     pub display_name: String,
     pub avatar_url: Option<String>,
     pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContactProfile {
+    pub username: Option<String>,
+    pub phone: Option<String>,
+    pub about: Option<String>,
+    pub business_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContactProfileBundle {
+    pub profile: ContactProfile,
+    pub media: Vec<Message>,
+    pub docs: Vec<Message>,
+    pub links: Vec<Message>,
+    pub starred: Vec<Message>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchMessageHit {
+    pub message: Message,
+    pub conversation_title: String,
+    pub account_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchScope {
+    Global,
+    Account,
+    Conversation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResults {
+    pub conversations: Vec<Conversation>,
+    pub messages: Vec<SearchMessageHit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallState {
+    pub call_id: String,
+    pub conversation_id: String,
+    pub account_id: String,
+    pub direction: String,
+    pub mode: String,
+    pub status: String,
+    pub remote_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

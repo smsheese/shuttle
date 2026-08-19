@@ -20,13 +20,13 @@ Planned work (media, AI replies, more networks, calls) is in [docs/roadmap.md](d
 
 ## Connectors
 
-Sidecars are Python processes over a newline-delimited JSON protocol. Release builds ship a managed CPython runtime and, where needed, native helpers fetched at build time.
+Sidecars are Python processes over a newline-delimited JSON protocol. **Release installers ship the core app only.** When you add an account, Shuttle downloads the connector scripts, native helpers, slim Python runtime, and any pip deps from a versioned S3 manifest (`SHUTTLE_COMPONENTS_BASE_URL`, baked at build time). System Python 3.12+ is used when compatible.
 
 | Network | Integrator | Auth | Notes |
 | --- | --- | --- | --- |
 | WhatsApp | [GOWA](https://github.com/aldinokemal/go-whatsapp-web-multidevice) (local, `127.0.0.1`) | QR | MIT; uses [whatsmeow](https://github.com/tulir/whatsmeow) (MPL-2.0) |
 | Telegram | [TDLib](https://github.com/tdlib/td) `tdjson` | Phone + code | Official client library (BSL-1.0). You supply your own `api_id` / `api_hash` |
-| Signal | [signal-cli](https://github.com/AsamK/signal-cli) JSON-RPC | Phone | Unofficial. **GPL-3.0**; bundled as a separate process in release builds |
+| Signal | [signal-cli](https://github.com/AsamK/signal-cli) JSON-RPC | Phone | Unofficial. **GPL-3.0**; downloaded on demand (~350 MB) |
 | Messenger | [fbchat](https://github.com/fbchat-dev/fbchat) | Email + password | Unofficial private API (BSD-3-Clause) |
 | Instagram | [instagrapi](https://github.com/subzeroid/instagrapi) | Username + password | Unofficial private API (MIT) |
 | Matrix | Matrix Client-Server API | Homeserver + password | Standard HTTPS API |
@@ -44,7 +44,7 @@ AGPL is a copyleft license with a **network clause**: if you modify Shuttle and 
 
 Third-party integrators keep **their own licenses**. Shuttle does not relicense them. In particular:
 
-- **signal-cli** is GPL-3.0 and is bundled in release builds (license text and source metadata ship with the app)
+- **signal-cli** is GPL-3.0 and is downloaded when you add Signal (license text ships with the app)
 - Embedded CPython is MPL-2.0 / PSF
 - GOWA, TDLib, fbchat, and instagrapi keep MIT / BSL / BSD as listed above
 
@@ -79,7 +79,7 @@ cd shuttle-app && npm install && npm run dev
 # Full desktop app (requires Tauri prerequisites)
 cd shuttle-app && npm run tauri dev
 
-# Connector sidecars and native helpers
+# Connector sidecars (local dev — production downloads on add-account)
 ./connectors/build.sh
 ./connectors/gowa/fetch.sh         # WhatsApp / GOWA
 ./connectors/tdlib/fetch.sh        # Telegram / TDLib
@@ -89,12 +89,17 @@ cd shuttle-app && npm run tauri dev
 
 ```bash
 ./scripts/build-release.sh
-# Stages Python runtime + signal-cli + licenses, then builds host-OS bundles.
+# Builds a slim core-only installer for the host OS.
 # macOS Intel + Apple Silicon in one app:
 ./scripts/build-release.sh -- --target universal-apple-darwin
+
+# Publish lazy-install component archives to S3 (maintainers):
+SHUTTLE_COMPONENTS_BASE_URL=https://your-cdn.example/shuttle/components ./scripts/publish-components.sh
 ```
 
-Optional overrides: `SHUTTLE_DATA_DIR`, `SHUTTLE_GOWA_BIN` / `SHUTTLE_GOWA_URL`, `SHUTTLE_TDLIB`, `SHUTTLE_SIGNAL_CLI`.
+Set `SHUTTLE_COMPONENTS_BASE_URL` when building release installers so the app knows where to fetch `v{version}/manifest.json`.
+
+Optional overrides: `SHUTTLE_DATA_DIR`, `SHUTTLE_PYTHON`, `SHUTTLE_GOWA_BIN`, `SHUTTLE_TDLIB`, `SHUTTLE_SIGNAL_CLI`.
 
 For local telemetry testing, copy [`.env.example`](.env.example) to `.env`. Production CI builds bake GitHub Environment secrets into the binary. See [docs/telemetry-events.md](docs/telemetry-events.md).
 

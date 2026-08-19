@@ -30,7 +30,7 @@ from shuttle_ipc import (
 
 CONNECTOR_ID = "telegram"
 VERSION = "1.0.0"
-CAPABILITIES = ["text", "media", "read_receipts", "groups", "channels"]
+CAPABILITIES = ["text", "media", "read_receipts", "groups", "channels", "calls:audio"]
 
 
 def find_tdjson() -> Optional[Path]:
@@ -372,6 +372,84 @@ class TelegramSession:
         )
         send({"type": "ok", "request_id": None})
 
+    def fetch_contact_profile(self, remote_id: str) -> None:
+        profile = {
+            "username": remote_id,
+            "phone": None,
+            "about": None,
+            "business_name": None,
+        }
+        if self.td:
+            try:
+                chat_id = int(remote_id)
+                self.td.send({"@type": "getChat", "chat_id": chat_id})
+            except ValueError:
+                pass
+        send({"type": "contact_profile", "conversation_id": remote_id, "profile": profile})
+
+    def start_call(self, remote_id: str, mode: str) -> None:
+        if not self.td:
+            emit_error("not connected")
+            return
+        try:
+            chat_id = int(remote_id)
+        except ValueError:
+            emit_error(f"invalid telegram chat id: {remote_id}")
+            return
+        call_id = str(chat_id)
+        self.td.send(
+            {
+                "@type": "createCall",
+                "user_id": chat_id,
+                "protocol": {
+                    "@type": "callProtocol",
+                    "udp_p2p": True,
+                    "udp_reflector": True,
+                    "min_layer": 65,
+                    "max_layer": 92,
+                    "library_versions": ["2.7.7"],
+                },
+                "is_video": mode == "video",
+            }
+        )
+        emit_event(
+            self.account_id,
+            "call.ringing",
+            {
+                "call_id": call_id,
+                "conversation_id": remote_id,
+                "direction": "outbound",
+                "mode": mode,
+                "status": "ringing",
+            },
+        )
+
+    def accept_call(self, call_id: str) -> None:
+        if not self.td:
+            return
+        try:
+            self.td.send({"@type": "acceptCall", "call_id": int(call_id)})
+        except Exception as e:
+            emit_event(self.account_id, "call.error", {"call_id": call_id, "message": str(e)})
+
+    def reject_call(self, call_id: str) -> None:
+        if not self.td:
+            return
+        try:
+            self.td.send({"@type": "discardCall", "call_id": int(call_id), "is_disconnected": True, "duration": 0, "is_video": False, "connection_id": 0})
+        except Exception:
+            pass
+        emit_event(self.account_id, "call.ended", {"call_id": call_id, "status": "rejected"})
+
+    def hangup_call(self, call_id: str) -> None:
+        if not self.td:
+            return
+        try:
+            self.td.send({"@type": "discardCall", "call_id": int(call_id), "is_disconnected": True, "duration": 0, "is_video": False, "connection_id": 0})
+        except Exception:
+            pass
+        emit_event(self.account_id, "call.ended", {"call_id": call_id, "status": "ended"})
+
     def shutdown(self) -> None:
         self.stop.set()
         if self.td:
@@ -436,6 +514,25 @@ def main() -> None:
             session.send_text(req.get("conversation_id") or "", req.get("text") or "")
         elif rtype == "mark_read":
             send({"type": "ok", "request_id": None})
+        elif rtype == "fetch_contact_profile":
+            if session:
+                session.fetch_contact_profile(req.get("conversation_id") or "")
+            else:
+                emit_error("not connected")
+        elif rtype == "start_call":
+            if session:
+                session.start_call(req.get("conversation_id") or "", req.get("mode") or "audio")
+            else:
+                emit_error("not connected")
+        elif rtype == "accept_call":
+            if session:
+                session.accept_call(req.get("call_id") or "")
+        elif rtype == "reject_call":
+            if session:
+                session.reject_call(req.get("call_id") or "")
+        elif rtype == "hangup_call":
+            if session:
+                session.hangup_call(req.get("call_id") or "")
         elif rtype in {"shutdown", "disconnect"}:
             if session:
                 session.shutdown()

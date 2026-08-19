@@ -5,9 +5,16 @@ import type {
   Account,
   AccountPatch,
   AppConfig,
+  AttachmentPayload,
   ChatTodo,
   ConnectorInfo,
+  ComponentInstallProgress,
+  ConnectorRequirements,
+  InstalledComponent,
   Conversation,
+  Contact,
+  ContactProfileBundle,
+  CallState,
   ConversationPatch,
   ForwardRule,
   ForwardRuleDraft,
@@ -18,6 +25,8 @@ import type {
   Reminder,
   ScheduledMessage,
   ScheduleMessageDraft,
+  SearchResults,
+  SearchScope,
   ShuttleEvent,
   Workspace,
 } from './types';
@@ -29,6 +38,55 @@ export async function listAccounts(): Promise<Account[]> {
 
 export async function listConnectors(): Promise<ConnectorInfo[]> {
   return isTauri() ? invoke('list_connectors') : mockApi.listConnectors();
+}
+
+export async function getConnectorRequirements(
+  connectorId: string
+): Promise<ConnectorRequirements> {
+  return isTauri()
+    ? invoke('get_connector_requirements', { connectorId })
+    : {
+        connector_id: connectorId,
+        components: [],
+        total_download_bytes: 0,
+      };
+}
+
+export async function getInstalledComponents(): Promise<InstalledComponent[]> {
+  return isTauri() ? invoke('get_installed_components') : [];
+}
+
+export async function ensureConnectorComponents(connectorId: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('ensure_connector_components', { connectorId });
+}
+
+export async function cancelComponentInstall(): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('cancel_component_install');
+}
+
+export function onComponentInstallProgress(
+  handler: (progress: ComponentInstallProgress) => void
+): Promise<UnlistenFn> {
+  if (!isTauri()) return Promise.resolve(async () => {});
+  return listen<ShuttleEvent>('shuttle-event', (e) => {
+    if (e.payload.kind === 'component.install.progress') {
+      handler(e.payload.payload as unknown as ComponentInstallProgress);
+    }
+  });
+}
+
+export function formatBytes(bytes: number): string {
+  if (bytes <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
 }
 
 export async function createAccount(connectorId: string, name: string): Promise<Account> {
@@ -66,15 +124,76 @@ export async function submitAuth(
 export async function listConversations(
   accountId?: string,
   workspaceId?: string,
-  priorityGroup?: string
+  priorityGroup?: string,
+  archivedOnly?: boolean
 ): Promise<Conversation[]> {
   return isTauri()
     ? invoke('list_conversations', {
         accountId: accountId ?? null,
         workspaceId: workspaceId ?? null,
         priorityGroup: priorityGroup ?? null,
+        archivedOnly: archivedOnly ?? false,
       })
-    : mockApi.listConversations(accountId, workspaceId, priorityGroup);
+    : mockApi.listConversations(accountId, workspaceId, priorityGroup, archivedOnly);
+}
+
+export async function listContacts(accountId: string): Promise<Contact[]> {
+  return isTauri() ? invoke('list_contacts', { accountId }) : mockApi.listContacts(accountId);
+}
+
+export async function startConversation(
+  accountId: string,
+  remoteId: string,
+  title: string
+): Promise<Conversation> {
+  return isTauri()
+    ? invoke('start_conversation', { accountId, remoteId, title })
+    : mockApi.startConversation(accountId, remoteId, title);
+}
+
+export async function createGroup(
+  accountId: string,
+  title: string,
+  participants: string[]
+): Promise<void> {
+  if (isTauri()) {
+    await invoke('create_group', { accountId, title, participants });
+  } else {
+    await mockApi.createGroup(accountId, title, participants);
+  }
+}
+
+export async function downloadMessageMedia(
+  accountId: string,
+  conversationId: string,
+  messageId: string
+): Promise<void> {
+  if (isTauri()) {
+    await invoke('download_message_media', { accountId, conversationId, messageId });
+  }
+}
+
+export async function readMessageMedia(path: string): Promise<string> {
+  return invoke('read_message_media', { path });
+}
+
+export async function shuttleFilesRoot(accountId: string): Promise<string> {
+  return invoke('shuttle_files_root', { accountId });
+}
+
+export async function fetchConversationAvatar(
+  accountId: string,
+  conversationId: string
+): Promise<void> {
+  if (isTauri()) {
+    await invoke('fetch_conversation_avatar', { accountId, conversationId });
+  }
+}
+
+export async function syncConversation(accountId: string, conversationId: string): Promise<void> {
+  if (isTauri()) {
+    await invoke('sync_conversation', { accountId, conversationId });
+  }
 }
 
 export async function updateConversation(
@@ -100,6 +219,29 @@ export async function sendMessage(
   return isTauri()
     ? invoke('send_message', { accountId, conversationId, text })
     : mockApi.sendMessage(accountId, conversationId, text);
+}
+
+export async function sendAttachment(
+  accountId: string,
+  conversationId: string,
+  attachment: AttachmentPayload
+): Promise<Message> {
+  return isTauri()
+    ? invoke('send_attachment', {
+        accountId,
+        conversationId,
+        kind: attachment.kind,
+        caption: attachment.caption ?? null,
+        filename: attachment.filename ?? null,
+        mime: attachment.mime ?? null,
+        dataBase64: attachment.data_base64 ?? null,
+        latitude: attachment.latitude ?? null,
+        longitude: attachment.longitude ?? null,
+        question: attachment.question ?? null,
+        options: attachment.options ?? null,
+        maxAnswer: attachment.max_answer ?? null,
+      })
+    : mockApi.sendAttachment(accountId, conversationId, attachment);
 }
 
 export async function forwardMessage(
@@ -128,6 +270,75 @@ export async function searchConversations(query: string): Promise<Conversation[]
     : mockApi.searchConversations(query);
 }
 
+export async function searchMessages(
+  query: string,
+  scope: SearchScope,
+  accountId?: string,
+  conversationId?: string
+): Promise<SearchResults> {
+  return isTauri()
+    ? invoke('search_messages', {
+        query,
+        scope,
+        accountId: accountId ?? null,
+        conversationId: conversationId ?? null,
+      })
+    : { conversations: await mockApi.searchConversations(query), messages: [] };
+}
+
+export async function starMessage(messageId: string, starred: boolean): Promise<Message> {
+  return isTauri() ? invoke('star_message', { messageId, starred }) : ({} as Message);
+}
+
+export async function pinMessage(messageId: string, pinned: boolean): Promise<Message> {
+  return isTauri() ? invoke('pin_message', { messageId, pinned }) : ({} as Message);
+}
+
+export async function fetchContactProfile(
+  accountId: string,
+  conversationId: string
+): Promise<ContactProfileBundle> {
+  return isTauri()
+    ? invoke('fetch_contact_profile', { accountId, conversationId })
+    : {
+        profile: {},
+        media: [],
+        docs: [],
+        links: [],
+        starred: [],
+      };
+}
+
+export async function startCall(
+  accountId: string,
+  conversationId: string,
+  mode: 'audio' | 'video',
+  shareScreen?: boolean
+): Promise<CallState> {
+  return isTauri()
+    ? invoke('start_call', { accountId, conversationId, mode, shareScreen: shareScreen ?? false })
+    : ({
+        call_id: 'mock',
+        conversation_id: conversationId,
+        account_id: accountId,
+        direction: 'outbound',
+        mode,
+        status: 'ringing',
+      } as CallState);
+}
+
+export async function acceptCall(accountId: string, callId: string): Promise<void> {
+  if (isTauri()) await invoke('accept_call', { accountId, callId });
+}
+
+export async function rejectCall(accountId: string, callId: string): Promise<void> {
+  if (isTauri()) await invoke('reject_call', { accountId, callId });
+}
+
+export async function hangupCall(accountId: string, callId: string): Promise<void> {
+  if (isTauri()) await invoke('hangup_call', { accountId, callId });
+}
+
 export async function totalUnread(): Promise<number> {
   return isTauri() ? invoke('total_unread') : mockApi.totalUnread();
 }
@@ -138,6 +349,18 @@ export async function getAppConfig(): Promise<AppConfig> {
 
 export async function saveAppConfig(config: AppConfig): Promise<AppConfig> {
   return isTauri() ? invoke('save_app_config', { config }) : mockApi.saveAppConfig(config);
+}
+
+export async function fetchTweakcnTheme(themeId: string): Promise<import('./tweakcn').TweakcnTheme> {
+  if (isTauri()) {
+    const json = await invoke<string>('fetch_tweakcn_theme', { themeId });
+    return JSON.parse(json);
+  }
+  const res = await fetch(`https://tweakcn.com/r/themes/${encodeURIComponent(themeId)}`);
+  if (!res.ok) {
+    throw new Error(`Theme not found (${res.status})`);
+  }
+  return res.json();
 }
 
 export async function listWorkspaces(): Promise<Workspace[]> {
@@ -255,6 +478,19 @@ export async function deleteScheduledMessage(id: string): Promise<void> {
   return isTauri() ? invoke('delete_scheduled_message', { id }) : mockApi.deleteScheduledMessage(id);
 }
 
+export async function updateScheduledMessage(
+  id: string,
+  patch: { body?: string; send_at?: string }
+): Promise<ScheduledMessage> {
+  return isTauri()
+    ? invoke('update_scheduled_message', {
+        id,
+        body: patch.body ?? null,
+        sendAt: patch.send_at ?? null,
+      })
+    : mockApi.updateScheduledMessage(id, patch);
+}
+
 export async function exportBackup(
   path: string,
   password: string,
@@ -312,18 +548,71 @@ export async function telemetrySetForeground(foreground: boolean): Promise<void>
   await invoke('telemetry_set_foreground', { foreground });
 }
 
-export function formatTime(iso: string | null): string {
+export const DATETIME_FORMATS: { id: string; label: string; example: string }[] = [
+  { id: '12h_full', label: '12-hour with date', example: '07:02 AM 19 Aug' },
+  { id: '24h_full', label: '24-hour with date', example: '19:02 19 Aug' },
+  { id: '12h_long', label: '12-hour, full date', example: '07:02 AM Aug 19, 2026' },
+  { id: '24h_long', label: '24-hour, full date', example: '19:02 19 Aug 2026' },
+  { id: 'relative', label: 'Relative (today / weekday)', example: '7:02 AM' },
+  { id: 'eu', label: 'Day/month/year 24-hour', example: '19/08/2026 19:02' },
+  { id: 'us', label: 'Month/day/year 12-hour', example: '08/19/2026 07:02 AM' },
+  { id: 'iso', label: 'ISO-style', example: '2026-08-19 19:02' },
+];
+
+const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+function pad2(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
+function clock12(d: Date): { h: string; mm: string; ampm: string } {
+  const hour = d.getHours();
+  return {
+    h: pad2(hour % 12 || 12),
+    mm: pad2(d.getMinutes()),
+    ampm: hour >= 12 ? 'PM' : 'AM',
+  };
+}
+
+export function formatTime(iso: string | null, format = '12h_full'): string {
   if (!iso) return '';
   const d = new Date(iso);
-  const now = new Date();
-  const diff = now.getTime() - d.getTime();
-  if (diff < 86400000 && d.getDate() === now.getDate()) {
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  if (Number.isNaN(d.getTime())) return '';
+  const dd = pad2(d.getDate());
+  const mmm = MONTHS_SHORT[d.getMonth()];
+  const yyyy = d.getFullYear();
+  const h24 = pad2(d.getHours());
+  const mm = pad2(d.getMinutes());
+  const c12 = clock12(d);
+
+  switch (format) {
+    case '24h_full':
+      return `${h24}:${mm} ${dd} ${mmm}`;
+    case '12h_long':
+      return `${c12.h}:${c12.mm} ${c12.ampm} ${mmm} ${d.getDate()}, ${yyyy}`;
+    case '24h_long':
+      return `${h24}:${mm} ${dd} ${mmm} ${yyyy}`;
+    case 'relative': {
+      const now = new Date();
+      const diff = now.getTime() - d.getTime();
+      if (diff < 86400000 && d.getDate() === now.getDate()) {
+        return `${c12.h}:${c12.mm} ${c12.ampm}`;
+      }
+      if (diff < 604800000) {
+        return d.toLocaleDateString([], { weekday: 'short' });
+      }
+      return `${dd} ${mmm}`;
+    }
+    case 'eu':
+      return `${dd}/${pad2(d.getMonth() + 1)}/${yyyy} ${h24}:${mm}`;
+    case 'us':
+      return `${pad2(d.getMonth() + 1)}/${dd}/${yyyy} ${c12.h}:${c12.mm} ${c12.ampm}`;
+    case 'iso':
+      return `${yyyy}-${pad2(d.getMonth() + 1)}-${dd} ${h24}:${mm}`;
+    case '12h_full':
+    default:
+      return `${c12.h}:${c12.mm} ${c12.ampm} ${dd} ${mmm}`;
   }
-  if (diff < 604800000) {
-    return d.toLocaleDateString([], { weekday: 'short' });
-  }
-  return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
 export function getInitials(name: string): string {
@@ -340,4 +629,9 @@ export function avatarColor(name: string): string {
   let hash = 0;
   for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
   return colors[Math.abs(hash) % colors.length];
+}
+
+export function conversationAvatar(conv: { metadata?: Record<string, unknown> | null }): string | null {
+  const data = conv.metadata?.avatar_data ?? conv.metadata?.avatar_url;
+  return typeof data === 'string' && data.length > 8 ? data : null;
 }

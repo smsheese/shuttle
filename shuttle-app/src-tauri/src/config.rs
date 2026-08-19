@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub privacy: PrivacyConfig,
     #[serde(default)]
     pub channel_styles: HashMap<String, ChannelStyle>,
+    #[serde(default)]
+    pub media_retention: MediaRetentionConfig,
 }
 
 impl Default for AppConfig {
@@ -24,6 +26,40 @@ impl Default for AppConfig {
             notifications: NotificationConfig::default(),
             privacy: PrivacyConfig::default(),
             channel_styles: default_channel_styles(),
+            media_retention: MediaRetentionConfig::default(),
+        }
+    }
+}
+
+/// How long (in days) to keep downloaded media locally. `None` = keep forever.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaRetentionConfig {
+    #[serde(default)]
+    pub images_days: Option<u32>,
+    #[serde(default)]
+    pub videos_days: Option<u32>,
+    #[serde(default)]
+    pub audio_days: Option<u32>,
+    #[serde(default)]
+    pub documents_days: Option<u32>,
+    #[serde(default)]
+    pub stickers_days: Option<u32>,
+    #[serde(default)]
+    pub gifs_days: Option<u32>,
+    #[serde(default)]
+    pub voice_days: Option<u32>,
+}
+
+impl Default for MediaRetentionConfig {
+    fn default() -> Self {
+        Self {
+            images_days: None,
+            videos_days: None,
+            audio_days: None,
+            documents_days: None,
+            stickers_days: None,
+            gifs_days: None,
+            voice_days: None,
         }
     }
 }
@@ -47,15 +83,25 @@ pub struct AppearanceConfig {
     pub color_scheme: String,
     #[serde(default = "default_theme")]
     pub theme_id: String,
+    #[serde(default = "default_datetime_format")]
+    pub datetime_format: String,
+    #[serde(default = "default_font_scale")]
+    pub font_scale: f64,
     #[serde(default)]
     pub tweakcn_css: Option<String>,
 }
 
 fn system_scheme() -> String {
-    "system".into()
+    "light".into()
 }
 fn default_theme() -> String {
-    "shuttle".into()
+    "cmlhfpjhw000004l4f4ax3m7z".into()
+}
+fn default_datetime_format() -> String {
+    "12h_full".into()
+}
+fn default_font_scale() -> f64 {
+    1.0
 }
 
 impl Default for AppearanceConfig {
@@ -63,6 +109,8 @@ impl Default for AppearanceConfig {
         Self {
             color_scheme: system_scheme(),
             theme_id: default_theme(),
+            datetime_format: default_datetime_format(),
+            font_scale: default_font_scale(),
             tweakcn_css: None,
         }
     }

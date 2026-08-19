@@ -9,6 +9,71 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-19
+
+### Added
+
+- Rich **Contact details** modal: profile fetch, copy phone, media/docs/links/starred tabs, call buttons, workspace/priority organize row.
+- **Star and pin** messages: DB migration, context menu actions, badges in thread.
+- **Search scopes**: global, per-network, and in-chat message search with jump-to-hit.
+- **Call protocol** and **CallPanel** UI; Signal/Telegram audio call paths; WhatsApp calls shown disabled with tooltip.
+- **Giphy** GIF and sticker picker (`@giphy/js-fetch-api`) with infinite scroll; Rust `fetch_url_bytes` for reliable media download.
+- **Emoji picker** (`emoji-picker-element`) in composer.
+- Attachment menu icons; Giphy/emoji/sticker composer buttons.
+- **Media retention** settings (per-type expiry days) in Contact details → Account tab; stored in app config.
+- New Shuttle **app icon**, favicon, and window/taskbar icon (in-love emoji SVG).
+- `VITE_GIPHY_API_KEY` in `.env.example`; Vite `envDir` points to repo root.
+- Component publishing workflow and bundled connector runtime scripts.
+
+### Changed
+
+- Conversation list sorting uses GOWA `list_rank` and `force_recency` for WhatsApp parity.
+- Message bubble spacing: no inner margin between content and time; 2px gap after bubble.
+- Sent images/GIFs embed as data URLs locally; GIF sends use `compress: false` for WhatsApp.
+- Contact details media/docs tabs use 6-column scrollable grids; thumbnails load from disk cache.
+- App shell layout hardened: fixed sidebar rail, list pane, and thread pane with overflow clipping.
+- Auto-scroll to bottom on conversation open and when new messages arrive (if near bottom).
+- Default organization: single **Default** workspace; workspace/priority filters appear only after custom entries.
+- **Settings → Workspaces & priorities**: add and remove priority labels.
+
+### Fixed
+
+- Empty message bubbles and garbage bodies (hex keys, JIDs) hidden in thread.
+- `[Image]`/`[Sticker]` placeholder text no longer shown below media bubbles.
+- WhatsApp: saved contact names via GOWA contacts and `sender_display_name`.
+- WhatsApp: GOWA `POST /devices` “already exists” treated as success on resume.
+- CSP allows `https:` images for Giphy previews; Giphy env loaded from repo-root `.env`.
+- `tauri dev` compile warnings and unused CSS selectors cleaned up.
+
+## [0.1.3] - 2026-08-18
+
+### Added
+
+- Full [tweakcn](https://github.com/jnsahaj/tweakcn) theme integration: fetch by URL/id, apply colours and Google Fonts, reload app.
+- Default theme: tweakcn **Light Green** (`cmlhfpjhw000004l4f4ax3m7z`) with light colour scheme.
+
+### Fixed
+
+- Light mode form controls (dropdowns, inputs) now use theme `--input` / `--text` instead of staying dark grey.
+
+## [0.1.2] - 2026-08-18
+
+### Added
+
+- Startup splash screen with Shuttle logo while the app loads.
+- Tabbed Settings layout (Appearance, Notifications, Privacy, and more) instead of one long page.
+- Color scheme picker buttons in Settings → Appearance.
+
+### Changed
+
+- App icons and favicon regenerated from the Shuttle logo.
+- Settings cog moved to the bottom-left rail; highlights when Settings is open.
+- Installer metadata: author **Sheese Sheikh** ([shee.se](https://shee.se), [github.com/smsheese](https://github.com/smsheese)), Shuttle description, and Cursor Agent credit.
+
+### Fixed
+
+- Settings toggles and checkboxes no longer broken by global `appearance: none` on inputs.
+
 ## [0.1.1] - 2026-08-18
 
 ### Fixed

@@ -164,7 +164,7 @@ impl TelemetryManager {
     }
 
     pub fn set_foreground(&self, foreground: bool) {
-        self.performance.set_foreground(foreground);
+        self.sampler().set_foreground(foreground);
     }
 
     pub fn emit_database_initialized(&self) {
@@ -177,23 +177,25 @@ impl TelemetryManager {
             "database_size_bucket".into(),
             json!(system::bucket_bytes(size)),
         );
-        props.insert("accounts_total".into(), json!(accounts));
-        props.insert("connector_count".into(), json!(accounts));
+        props.insert("accounts_total".into(), json!(system::bucket_count(accounts)));
+        props.insert("connector_count".into(), json!(system::bucket_count(accounts)));
         self.track("database_initialized", props);
     }
 
     pub fn spawn_background_tasks(self: &Arc<Self>) {
-        let perf = self.performance.clone();
         let weak = Arc::downgrade(self);
         tauri::async_runtime::spawn(async move {
-            let mut sample_tick = tokio::time::interval(Duration::from_secs(60));
             let mut batch_tick = tokio::time::interval(POSTHOG_BATCH_INTERVAL);
             loop {
+                let sample_wait = weak
+                    .upgrade()
+                    .map(|mgr| mgr.sampler().sample_interval())
+                    .unwrap_or(Duration::from_secs(60));
                 tokio::select! {
-                    _ = sample_tick.tick() => {
+                    _ = tokio::time::sleep(sample_wait) => {
                         if let Some(mgr) = weak.upgrade() {
                             if mgr.config.get().privacy.usage_diagnostics {
-                                perf.set_foreground(mgr.performance.is_foreground());
+                                let perf = mgr.sampler();
                                 perf.record_sample();
                                 if let Some(snapshot) = perf.maybe_snapshot() {
                                     mgr.track_performance_snapshot(snapshot);
@@ -214,7 +216,10 @@ impl TelemetryManager {
     fn track_performance_snapshot(&self, snapshot: PerformanceSnapshot) {
         let mut props = Map::new();
         props.insert("foreground".into(), json!(snapshot.foreground));
-        props.insert("sample_count".into(), json!(snapshot.sample_count));
+        props.insert(
+            "sample_count".into(),
+            json!(system::bucket_count(snapshot.sample_count)),
+        );
         props.insert("cpu_avg".into(), json!(snapshot.cpu_avg));
         props.insert("cpu_p95".into(), json!(snapshot.cpu_p95));
         props.insert(
@@ -252,7 +257,7 @@ impl TelemetryManager {
                 properties.insert("$environment".into(), json!(environment));
                 json!({
                     "event": item.event,
-                    "distinct_id": self.installation_id,
+                    "distinct_id": self.installation_id(),
                     "properties": properties,
                 })
             })

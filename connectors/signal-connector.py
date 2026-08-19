@@ -30,7 +30,7 @@ from shuttle_ipc import (
 
 CONNECTOR_ID = "signal"
 VERSION = "1.0.0"
-CAPABILITIES = ["text", "media", "read_receipts", "groups"]
+CAPABILITIES = ["text", "media", "read_receipts", "groups", "calls:audio"]
 
 
 def find_signal_cli() -> Optional[Path]:
@@ -281,6 +281,62 @@ class SignalSession:
         self._rpc("send", params)
         send({"type": "ok", "request_id": None})
 
+    def fetch_contact_profile(self, remote_id: str) -> None:
+        phone = remote_id if remote_id.startswith("+") else None
+        if not phone and remote_id.isdigit():
+            phone = f"+{remote_id}"
+        profile = {
+            "username": remote_id,
+            "phone": phone,
+            "about": None,
+            "business_name": None,
+        }
+        send({"type": "contact_profile", "conversation_id": remote_id, "profile": profile})
+
+    def start_call(self, remote_id: str, mode: str) -> None:
+        call_id = remote_id
+        offer = "video" if mode == "video" else "audio"
+        try:
+            self._rpc("startCall", {"recipient": remote_id, "offerType": offer})
+        except Exception as e:
+            emit_event(
+                self.account_id,
+                "call.error",
+                {"call_id": call_id, "message": str(e), "conversation_id": remote_id},
+            )
+            return
+        emit_event(
+            self.account_id,
+            "call.ringing",
+            {
+                "call_id": call_id,
+                "conversation_id": remote_id,
+                "direction": "outbound",
+                "mode": mode,
+                "status": "ringing",
+            },
+        )
+
+    def accept_call(self, call_id: str) -> None:
+        try:
+            self._rpc("acceptCall", {"callId": call_id})
+        except Exception as e:
+            emit_event(self.account_id, "call.error", {"call_id": call_id, "message": str(e)})
+
+    def reject_call(self, call_id: str) -> None:
+        try:
+            self._rpc("rejectCall", {"callId": call_id})
+        except Exception:
+            pass
+        emit_event(self.account_id, "call.ended", {"call_id": call_id, "status": "rejected"})
+
+    def hangup_call(self, call_id: str) -> None:
+        try:
+            self._rpc("hangupCall", {"callId": call_id})
+        except Exception:
+            pass
+        emit_event(self.account_id, "call.ended", {"call_id": call_id, "status": "ended"})
+
     def shutdown(self) -> None:
         if self.proc:
             self.proc.terminate()
@@ -325,6 +381,25 @@ def main() -> None:
                 emit_error("not connected")
         elif rtype == "mark_read":
             send({"type": "ok", "request_id": None})
+        elif rtype == "fetch_contact_profile":
+            if session:
+                session.fetch_contact_profile(req.get("conversation_id") or "")
+            else:
+                emit_error("not connected")
+        elif rtype == "start_call":
+            if session:
+                session.start_call(req.get("conversation_id") or "", req.get("mode") or "audio")
+            else:
+                emit_error("not connected")
+        elif rtype == "accept_call":
+            if session:
+                session.accept_call(req.get("call_id") or "")
+        elif rtype == "reject_call":
+            if session:
+                session.reject_call(req.get("call_id") or "")
+        elif rtype == "hangup_call":
+            if session:
+                session.hangup_call(req.get("call_id") or "")
         elif rtype in {"shutdown", "disconnect"}:
             if session:
                 session.shutdown()

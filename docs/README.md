@@ -10,6 +10,7 @@ Product landing page and contributor setup live in the [root README](../README.m
 | [platforms.md](platforms.md) | Windows / Linux / macOS, amd64 + arm64, packaging and CI |
 | [licensing.md](licensing.md) | AGPL-3.0 intent and third-party connector licenses |
 | [roadmap.md](roadmap.md) | Landed tracks vs remaining work |
+| [matrix-mautrix-feasibility.md](matrix-mautrix-feasibility.md) | Closed assessment: stay native; do not use mautrix as a transport layer |
 | [telemetry-events.md](telemetry-events.md) | Live telemetry contract, privacy rules, env vars |
 | [telemetry-implementation-plan.md](telemetry-implementation-plan.md) | Original telemetry design (implemented; use the events doc day-to-day) |
 

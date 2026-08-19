@@ -1,0 +1,165 @@
+name: Publish components
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Shuttle version to publish (defaults to package.json)
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-amd64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+          - os: macos-latest
+            platform: macos-universal
+          - os: windows-latest
+            platform: windows-amd64
+          - os: windows-11-arm
+            platform: windows-arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.version }}" ]]; then
+            echo "value=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "value=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=$(node -p "require('./shuttle-app/package.json').version")" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip python3-venv curl
+
+      - name: macOS Python
+        if: runner.os == 'macOS'
+        run: python3 -m pip install --upgrade pip wheel
+
+      - name: Windows Python
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python -m pip install --upgrade pip wheel
+
+      - name: Build and stage component archives
+        shell: bash
+        env:
+          SHUTTLE_COMPONENTS_VERSION: ${{ steps.version.outputs.value }}
+          SHUTTLE_COMPONENTS_BASE_URL: ${{ secrets.SHUTTLE_COMPONENTS_BASE_URL }}
+          SHUTTLE_COMPONENTS_PLATFORM: ${{ matrix.platform == 'macos-universal' && 'macos-arm64' || matrix.platform }}
+        run: ./scripts/publish-components.sh
+
+      - name: Upload staged manifest fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-${{ matrix.platform }}
+          path: dist/components/publish/v${{ steps.version.outputs.value }}/manifest.json
+
+      - name: Upload platform artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: components-${{ matrix.platform }}
+          path: dist/components/publish/v${{ steps.version.outputs.value }}/
+
+  upload:
+    needs: publish
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.version }}" ]]; then
+            echo "value=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "value=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=$(node -p "require('./shuttle-app/package.json').version")" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all component artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/components/merged
+          pattern: components-*
+          merge-multiple: true
+
+      - name: Merge manifest fragments
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.value }}"
+          PUBLISH="dist/components/publish/v${VERSION}"
+          mkdir -p "$PUBLISH"
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const version = process.env.VERSION;
+          const root = process.env.PUBLISH;
+          const merged = { schema: 1, shuttle_version: version, platforms: {} };
+          for (const dir of fs.readdirSync('dist/components/merged')) {
+            const manifestPath = path.join('dist/components/merged', dir, 'manifest.json');
+            if (!fs.existsSync(manifestPath)) continue;
+            const part = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+            Object.assign(merged.platforms, part.platforms || {});
+          }
+          fs.mkdirSync(root, { recursive: true });
+          fs.writeFileSync(path.join(root, 'manifest.json'), JSON.stringify(merged, null, 2));
+          NODE
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+          PUBLISH: dist/components/publish/v${{ steps.version.outputs.value }}
+
+      - name: Upload to S3-compatible bucket
+        if: env.S3_BUCKET != ''
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.S3_REGION || 'auto' }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          pip install awscli --quiet
+          EXTRA=()
+          if [[ -n "$S3_ENDPOINT" ]]; then
+            EXTRA+=(--endpoint-url "$S3_ENDPOINT")
+          fi
+          aws s3 sync "dist/components/publish/v${VERSION}/" "s3://${S3_BUCKET}/shuttle/components/v${VERSION}/" "${EXTRA[@]}"
+
+      - name: Attach manifest to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/components/publish/v${{ steps.version.outputs.value }}/manifest.json

@@ -14,9 +14,6 @@ echo "==> Installing frontend dependencies"
 cd "$ROOT/shuttle-app"
 npm ci
 
-echo "==> Staging release assets (Python runtime, signal-cli, licenses)"
-"$ROOT/scripts/stage-release-assets.sh"
-
 echo "==> Building Shuttle"
 npx tauri build "${args[@]}"
 

@@ -1,3 +1,4 @@
+use crate::components::ComponentManager;
 use crate::config::{AppConfig, ConfigStore};
 use crate::connectors::{AppEvent, ConnectorManager};
 use crate::db::Database;
@@ -17,9 +18,12 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use tempfile::tempdir;
 
+use tokio::sync::broadcast;
+
 pub struct AppState {
     pub db: Arc<Database>,
     pub connectors: Arc<ConnectorManager>,
+    pub components: Arc<ComponentManager>,
     pub config: Arc<ConfigStore>,
     pub telemetry: Arc<TelemetryManager>,
 }
@@ -27,6 +31,39 @@ pub struct AppState {
 #[tauri::command]
 pub fn list_accounts(state: State<'_, AppState>) -> Result<Vec<Account>, String> {
     state.db.list_accounts().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_connector_requirements(
+    state: State<'_, AppState>,
+    connector_id: String,
+) -> Result<crate::components::ConnectorRequirements, String> {
+    state.components.get_connector_requirements(&connector_id)
+}
+
+#[tauri::command]
+pub fn get_installed_components(
+    state: State<'_, AppState>,
+) -> Vec<crate::components::InstalledComponent> {
+    state.components.installed_components()
+}
+
+#[tauri::command]
+pub async fn ensure_connector_components(
+    state: State<'_, AppState>,
+    connector_id: String,
+) -> Result<(), String> {
+    state.components.clear_cancel();
+    state
+        .components
+        .ensure_connector_installed_async(&connector_id)
+        .await
+}
+
+#[tauri::command]
+pub fn cancel_component_install(state: State<'_, AppState>) -> Result<(), String> {
+    state.components.cancel_install();
+    Ok(())
 }
 
 #[tauri::command]
@@ -87,7 +124,7 @@ pub fn update_account(
         let connector_id = account.connector_id.clone();
         let id = account_id.clone();
         tauri::async_runtime::spawn(async move {
-            let _ = connectors.start_connector(&connector_id, &id, creds).await;
+            let _ = connectors.start_connector(&connector_id, &id, creds);
         });
     }
     Ok(account)
@@ -99,6 +136,7 @@ pub fn list_conversations(
     account_id: Option<String>,
     workspace_id: Option<String>,
     priority_group: Option<String>,
+    archived_only: Option<bool>,
 ) -> Result<Vec<Conversation>, String> {
     state
         .db
@@ -106,7 +144,7 @@ pub fn list_conversations(
             account_id.as_deref(),
             workspace_id.as_deref(),
             priority_group.as_deref(),
-            false,
+            archived_only.unwrap_or(false),
         )
         .map_err(|e| e.to_string())
 }
@@ -133,6 +171,41 @@ pub async fn send_message(
     state
         .connectors
         .send_message(&account_id, &conversation_id, &text)
+        .await
+}
+
+#[tauri::command]
+pub async fn send_attachment(
+    state: State<'_, AppState>,
+    account_id: String,
+    conversation_id: String,
+    kind: String,
+    caption: Option<String>,
+    filename: Option<String>,
+    mime: Option<String>,
+    data_base64: Option<String>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    question: Option<String>,
+    options: Option<Vec<String>>,
+    max_answer: Option<i32>,
+) -> Result<Message, String> {
+    state
+        .connectors
+        .send_attachment(
+            &account_id,
+            &conversation_id,
+            &kind,
+            caption.as_deref(),
+            filename.as_deref(),
+            mime.as_deref(),
+            data_base64.as_deref(),
+            latitude,
+            longitude,
+            question.as_deref(),
+            options.unwrap_or_default(),
+            max_answer,
+        )
         .await
 }
 
@@ -184,12 +257,210 @@ pub fn update_conversation(
 }
 
 #[tauri::command]
+pub fn list_contacts(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<Vec<Contact>, String> {
+    state.db.list_contacts(&account_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn start_conversation(
+    state: State<'_, AppState>,
+    account_id: String,
+    remote_id: String,
+    title: String,
+) -> Result<Conversation, String> {
+    state
+        .connectors
+        .start_conversation(&account_id, &remote_id, &title)
+}
+
+#[tauri::command]
+pub fn create_group(
+    state: State<'_, AppState>,
+    account_id: String,
+    title: String,
+    participants: Vec<String>,
+) -> Result<(), String> {
+    state.connectors.create_group(&account_id, &title, participants)
+}
+
+#[tauri::command]
+pub fn download_message_media(
+    state: State<'_, AppState>,
+    account_id: String,
+    conversation_id: String,
+    message_id: String,
+) -> Result<(), String> {
+    state
+        .connectors
+        .download_message_media(&account_id, &conversation_id, &message_id)
+}
+
+#[tauri::command]
+pub fn read_message_media(path: String) -> Result<String, String> {
+    crate::media_store::read_as_data_url(&path)
+}
+
+#[tauri::command]
+pub fn shuttle_files_root(account_id: String) -> Result<String, String> {
+    Ok(crate::media_store::account_files_root(&account_id)
+        .to_string_lossy()
+        .into_owned())
+}
+
+#[tauri::command]
+pub fn fetch_conversation_avatar(
+    state: State<'_, AppState>,
+    account_id: String,
+    conversation_id: String,
+) -> Result<(), String> {
+    state
+        .connectors
+        .fetch_conversation_avatar(&account_id, &conversation_id)
+}
+
+#[tauri::command]
+pub fn sync_conversation(
+    state: State<'_, AppState>,
+    account_id: String,
+    conversation_id: String,
+) -> Result<(), String> {
+    state
+        .connectors
+        .sync_conversation(&account_id, &conversation_id)
+}
+
+#[tauri::command]
 pub fn search_conversations(state: State<'_, AppState>, query: String) -> Result<Vec<Conversation>, String> {
     let result = state.db.search(&query).map_err(|e| e.to_string());
     if result.is_ok() && !query.is_empty() {
         state.telemetry.track("search_used", serde_json::Map::new());
     }
     result
+}
+
+#[tauri::command]
+pub fn search_messages(
+    state: State<'_, AppState>,
+    query: String,
+    scope: String,
+    account_id: Option<String>,
+    conversation_id: Option<String>,
+) -> Result<SearchResults, String> {
+    let scope = match scope.as_str() {
+        "account" => SearchScope::Account,
+        "conversation" => SearchScope::Conversation,
+        _ => SearchScope::Global,
+    };
+    let result = state
+        .db
+        .search_messages(
+            &query,
+            scope,
+            account_id.as_deref(),
+            conversation_id.as_deref(),
+        )
+        .map_err(|e| e.to_string());
+    if result.is_ok() && !query.is_empty() {
+        state.telemetry.track("search_used", serde_json::Map::new());
+    }
+    result
+}
+
+#[tauri::command]
+pub fn star_message(
+    state: State<'_, AppState>,
+    message_id: String,
+    starred: bool,
+) -> Result<Message, String> {
+    state
+        .db
+        .set_message_starred(&message_id, starred)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn pin_message(
+    state: State<'_, AppState>,
+    message_id: String,
+    pinned: bool,
+) -> Result<Message, String> {
+    state
+        .db
+        .set_message_pinned(&message_id, pinned)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn fetch_contact_profile(
+    state: State<'_, AppState>,
+    account_id: String,
+    conversation_id: String,
+) -> Result<ContactProfileBundle, String> {
+    let conv = state
+        .db
+        .get_conversation(&conversation_id)
+        .map_err(|e| e.to_string())?;
+    let profile = conv
+        .metadata
+        .get("contact_profile")
+        .and_then(|v| serde_json::from_value::<ContactProfile>(v.clone()).ok())
+        .unwrap_or_default();
+    let _ = state
+        .connectors
+        .fetch_contact_profile(&account_id, &conversation_id);
+    Ok(ContactProfileBundle {
+        profile,
+        media: state
+            .db
+            .list_messages_by_kind(&conversation_id, "media", 40)
+            .map_err(|e| e.to_string())?,
+        docs: state
+            .db
+            .list_messages_by_kind(&conversation_id, "docs", 40)
+            .map_err(|e| e.to_string())?,
+        links: state
+            .db
+            .list_messages_by_kind(&conversation_id, "links", 40)
+            .map_err(|e| e.to_string())?,
+        starred: state
+            .db
+            .list_messages_by_kind(&conversation_id, "starred", 40)
+            .map_err(|e| e.to_string())?,
+    })
+}
+
+#[tauri::command]
+pub fn start_call(
+    state: State<'_, AppState>,
+    account_id: String,
+    conversation_id: String,
+    mode: String,
+    share_screen: Option<bool>,
+) -> Result<CallState, String> {
+    state.connectors.start_call(
+        &account_id,
+        &conversation_id,
+        &mode,
+        share_screen.unwrap_or(false),
+    )
+}
+
+#[tauri::command]
+pub fn accept_call(state: State<'_, AppState>, account_id: String, call_id: String) -> Result<(), String> {
+    state.connectors.accept_call(&account_id, &call_id)
+}
+
+#[tauri::command]
+pub fn reject_call(state: State<'_, AppState>, account_id: String, call_id: String) -> Result<(), String> {
+    state.connectors.reject_call(&account_id, &call_id)
+}
+
+#[tauri::command]
+pub fn hangup_call(state: State<'_, AppState>, account_id: String, call_id: String) -> Result<(), String> {
+    state.connectors.hangup_call(&account_id, &call_id)
 }
 
 #[tauri::command]
@@ -220,7 +491,6 @@ pub async fn connect_account(
     state
         .connectors
         .start_connector(&account.connector_id, &account_id, merged)
-        .await
 }
 
 #[tauri::command]
@@ -243,6 +513,55 @@ pub fn save_app_config(state: State<'_, AppState>, config: AppConfig) -> Result<
     let saved = state.config.save(config)?;
     state.telemetry.apply_consent();
     Ok(saved)
+}
+
+#[tauri::command]
+pub async fn fetch_tweakcn_theme(theme_id: String) -> Result<String, String> {
+    let id = theme_id.trim();
+    if id.is_empty() {
+        return Err("Theme id is required".into());
+    }
+    if !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err("Invalid theme id".into());
+    }
+    let url = format!("https://tweakcn.com/r/themes/{id}");
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("Failed to fetch theme: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Theme not found ({})", resp.status()));
+    }
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+    serde_json::from_str::<serde_json::Value>(&body)
+        .map_err(|e| format!("Invalid theme JSON: {e}"))?;
+    Ok(body)
+}
+
+#[tauri::command]
+pub async fn fetch_url_bytes(url: String) -> Result<String, String> {
+    // Only allow fetching from known safe CDN hosts (Giphy)
+    let is_allowed = url.starts_with("https://media.giphy.com/")
+        || url.starts_with("https://media0.giphy.com/")
+        || url.starts_with("https://media1.giphy.com/")
+        || url.starts_with("https://media2.giphy.com/")
+        || url.starts_with("https://media3.giphy.com/")
+        || url.starts_with("https://media4.giphy.com/")
+        || url.starts_with("https://i.giphy.com/")
+        || url.starts_with("https://upload.giphy.com/");
+    if !is_allowed {
+        tracing::warn!("[fetch_url_bytes] host not allowed: {url}");
+        return Err(format!("Host not allowed for fetch_url_bytes: {url}"));
+    }
+    tracing::info!("[fetch_url_bytes] fetching {url}");
+    let resp = reqwest::get(&url).await.map_err(|e| {
+        tracing::error!("[fetch_url_bytes] fetch error: {e}");
+        format!("Fetch failed: {e}")
+    })?;
+    let status = resp.status();
+    let bytes = resp.bytes().await.map_err(|e| format!("Read failed: {e}"))?;
+    tracing::info!("[fetch_url_bytes] got {} bytes, status={status}", bytes.len());
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    Ok(STANDARD.encode(&bytes))
 }
 
 #[tauri::command]
@@ -449,6 +768,19 @@ pub fn delete_scheduled_message(state: State<'_, AppState>, id: String) -> Resul
 }
 
 #[tauri::command]
+pub fn update_scheduled_message(
+    state: State<'_, AppState>,
+    id: String,
+    body: Option<String>,
+    send_at: Option<String>,
+) -> Result<ScheduledMessage, String> {
+    state
+        .db
+        .update_scheduled_message(&id, body.as_deref(), send_at.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn export_backup(
     state: State<'_, AppState>,
     path: String,
@@ -602,34 +934,25 @@ pub fn init_state(app: &AppHandle) -> AppState {
     telemetry.emit_database_initialized();
     telemetry.spawn_background_tasks();
 
-    let connectors_dir = app
-        .path()
-        .resource_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join("connectors");
-
-    let connectors_dir = if connectors_dir.join("whatsapp-connector.py").exists()
-        || connectors_dir.join("whatsapp-connector").exists()
-    {
-        connectors_dir
-    } else {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../connectors")
-    };
-
+    let (event_tx, _) = broadcast::channel(4096);
+    let components = Arc::new(ComponentManager::new(&data_dir, event_tx.clone()));
     let connectors = Arc::new(ConnectorManager::new(
         db.clone(),
         config.clone(),
-        connectors_dir,
         data_dir.clone(),
         telemetry.clone(),
+        components.clone(),
+        event_tx.clone(),
     ));
     spawn_event_forwarder(app.clone(), connectors.clone());
     spawn_reminder_loop(app.clone(), db.clone());
     spawn_scheduled_message_loop(app.clone(), db.clone(), connectors.clone());
+    connectors.resume_saved_accounts();
 
     AppState {
         db,
         connectors,
+        components,
         config,
         telemetry,
     }

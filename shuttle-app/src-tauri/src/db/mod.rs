@@ -25,6 +25,8 @@ pub enum DbError {
     Builtin,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
 }
 
 struct Conn {
@@ -274,17 +276,17 @@ impl Database {
         account_id: Option<&str>,
         workspace_id: Option<&str>,
         priority_group: Option<&str>,
-        include_archived: bool,
+        archived_only: bool,
     ) -> Result<Vec<Conversation>, DbError> {
         let accounts = self.list_accounts()?;
         let mut all = if let Some(aid) = account_id {
             let inbox = self.inbox(aid)?;
             let conn = inbox.conn.lock();
-            list_conversations_in(&conn, Some(aid), include_archived)?
+            list_conversations_in(&conn, Some(aid), archived_only)?
         } else {
             self.for_each_inbox(|aid, inbox| {
                 let conn = inbox.conn.lock();
-                list_conversations_in(&conn, Some(aid), include_archived)
+                list_conversations_in(&conn, Some(aid), archived_only)
             })?
         };
         if let Some(ws) = workspace_id {
@@ -321,7 +323,7 @@ impl Database {
         let inbox = self.inbox(&conv.account_id)?;
         let conn = inbox.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, remote_id, sender_id, sender_name, direction, body, timestamp, status, metadata
+            "SELECT id, conversation_id, remote_id, sender_id, sender_name, direction, body, timestamp, status, metadata, starred, pinned
              FROM messages WHERE conversation_id = ?1
              ORDER BY timestamp DESC LIMIT ?2",
         )?;
@@ -330,6 +332,208 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()?;
         rows.reverse();
         Ok(rows)
+    }
+
+    pub fn set_message_starred(&self, message_id: &str, starred: bool) -> Result<Message, DbError> {
+        let (account_id, conversation_id) = self.locate_message(message_id)?;
+        let inbox = self.inbox(&account_id)?;
+        let conn = inbox.conn.lock();
+        conn.execute(
+            "UPDATE messages SET starred = ?1 WHERE id = ?2",
+            params![if starred { 1 } else { 0 }, message_id],
+        )?;
+        get_message_locked(&conn, &conversation_id, message_id)
+    }
+
+    pub fn set_message_pinned(&self, message_id: &str, pinned: bool) -> Result<Message, DbError> {
+        let (account_id, conversation_id) = self.locate_message(message_id)?;
+        let inbox = self.inbox(&account_id)?;
+        let conn = inbox.conn.lock();
+        conn.execute(
+            "UPDATE messages SET pinned = ?1 WHERE id = ?2",
+            params![if pinned { 1 } else { 0 }, message_id],
+        )?;
+        get_message_locked(&conn, &conversation_id, message_id)
+    }
+
+    pub fn list_messages_by_kind(
+        &self,
+        conversation_id: &str,
+        kind: &str,
+        limit: i64,
+    ) -> Result<Vec<Message>, DbError> {
+        let conv = self.get_conversation(conversation_id)?;
+        let inbox = self.inbox(&conv.account_id)?;
+        let conn = inbox.conn.lock();
+        let sql = match kind {
+            "media" => "SELECT id, conversation_id, remote_id, sender_id, sender_name, direction, body, timestamp, status, metadata, starred, pinned
+                 FROM messages WHERE conversation_id = ?1
+                   AND (
+                     json_extract(metadata, '$.media_type') IN ('image','photo','video','audio','ptt','sticker')
+                   )
+                 ORDER BY timestamp DESC LIMIT ?2",
+            "docs" => "SELECT id, conversation_id, remote_id, sender_id, sender_name, direction, body, timestamp, status, metadata, starred, pinned
+                 FROM messages WHERE conversation_id = ?1
+                   AND json_extract(metadata, '$.media_type') = 'document'
+                 ORDER BY timestamp DESC LIMIT ?2",
+            "links" => "SELECT id, conversation_id, remote_id, sender_id, sender_name, direction, body, timestamp, status, metadata, starred, pinned
+                 FROM messages WHERE conversation_id = ?1
+                   AND (body LIKE '%http://%' OR body LIKE '%https://%')
+                 ORDER BY timestamp DESC LIMIT ?2",
+            "starred" => "SELECT id, conversation_id, remote_id, sender_id, sender_name, direction, body, timestamp, status, metadata, starred, pinned
+                 FROM messages WHERE conversation_id = ?1 AND starred = 1
+                 ORDER BY timestamp DESC LIMIT ?2",
+            _ => return Ok(vec![]),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(params![conversation_id, limit], map_message_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn locate_message(&self, message_id: &str) -> Result<(String, String), DbError> {
+        for account in self.list_accounts()? {
+            let inbox = self.inbox(&account.id)?;
+            let conn = inbox.conn.lock();
+            if let Ok(row) = conn.query_row(
+                "SELECT c.account_id, m.conversation_id FROM messages m
+                 JOIN conversations c ON c.id = m.conversation_id
+                 WHERE m.id = ?1",
+                params![message_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            ) {
+                return Ok(row);
+            }
+        }
+        Err(DbError::NotFound(message_id.to_string()))
+    }
+
+    pub fn search_messages(
+        &self,
+        query: &str,
+        scope: SearchScope,
+        account_id: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<SearchResults, DbError> {
+        let pattern = format!("%{query}%");
+        let mut conversations = Vec::new();
+        let mut messages = Vec::new();
+
+        match scope {
+            SearchScope::Conversation => {
+                let cid = conversation_id.ok_or_else(|| DbError::InvalidInput("conversation_id required".into()))?;
+                let conv = self.get_conversation(cid)?;
+                let inbox = self.inbox(&conv.account_id)?;
+                let conn = inbox.conn.lock();
+                if conv.title.to_lowercase().contains(&query.to_lowercase()) {
+                    conversations.push(conv.clone());
+                }
+                let mut stmt = conn.prepare(
+                    "SELECT m.id, m.conversation_id, m.remote_id, m.sender_id, m.sender_name, m.direction, m.body, m.timestamp, m.status, m.metadata, m.starred, m.pinned
+                     FROM messages m
+                     WHERE m.conversation_id = ?1 AND (m.body LIKE ?2 OR m.sender_name LIKE ?2)
+                     ORDER BY m.timestamp DESC LIMIT 50",
+                )?;
+                let rows = stmt.query_map(params![cid, &pattern], map_message_row)?;
+                for msg in rows {
+                    messages.push(SearchMessageHit {
+                        message: msg?,
+                        conversation_title: conv.title.clone(),
+                        account_id: conv.account_id.clone(),
+                    });
+                }
+            }
+            SearchScope::Account => {
+                let aid = account_id.ok_or_else(|| DbError::InvalidInput("account_id required".into()))?;
+                let inbox = self.inbox(aid)?;
+                let conn = inbox.conn.lock();
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT c.id, c.account_id, c.remote_id, c.contact_id, c.title, c.conversation_type,
+                            c.unread_count, c.last_message_at, c.last_message_preview, c.pinned, c.archived, c.muted, c.metadata,
+                            c.workspace_id, c.priority_group, c.notes, c.notify_enabled, c.send_receipts
+                     FROM conversations c
+                     LEFT JOIN messages m ON m.conversation_id = c.id
+                     WHERE c.account_id = ?1 AND (c.title LIKE ?2 OR m.body LIKE ?2 OR m.sender_name LIKE ?2)
+                     ORDER BY datetime(COALESCE(NULLIF(c.last_message_at, ''), c.updated_at, '1970-01-01')) DESC
+                     LIMIT 50",
+                )?;
+                conversations = stmt
+                    .query_map(params![aid, &pattern], map_conversation_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut stmt = conn.prepare(
+                    "SELECT m.id, m.conversation_id, m.remote_id, m.sender_id, m.sender_name, m.direction, m.body, m.timestamp, m.status, m.metadata, m.starred, m.pinned,
+                            c.title, c.account_id
+                     FROM messages m
+                     JOIN conversations c ON c.id = m.conversation_id
+                     WHERE c.account_id = ?1 AND (m.body LIKE ?2 OR m.sender_name LIKE ?2 OR c.title LIKE ?2)
+                     ORDER BY m.timestamp DESC LIMIT 50",
+                )?;
+                let rows = stmt.query_map(params![aid, &pattern], |row| {
+                    Ok(SearchMessageHit {
+                        message: Message {
+                            id: row.get(0)?,
+                            conversation_id: row.get(1)?,
+                            remote_id: row.get(2)?,
+                            sender_id: row.get(3)?,
+                            sender_name: row.get(4)?,
+                            direction: parse_direction(&row.get::<_, String>(5)?),
+                            body: row.get(6)?,
+                            timestamp: row.get::<_, String>(7)?.parse().unwrap_or_else(|_| Utc::now()),
+                            status: parse_message_status(&row.get::<_, String>(8)?),
+                            metadata: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
+                            starred: row.get::<_, i64>(10)? != 0,
+                            pinned: row.get::<_, i64>(11)? != 0,
+                        },
+                        conversation_title: row.get(12)?,
+                        account_id: row.get(13)?,
+                    })
+                })?;
+                messages = rows.collect::<Result<Vec<_>, _>>()?;
+            }
+            SearchScope::Global => {
+                conversations = self.search(query)?;
+                messages = self.for_each_inbox(|aid, inbox| {
+                    let conn = inbox.conn.lock();
+                    let mut stmt = conn.prepare(
+                        "SELECT m.id, m.conversation_id, m.remote_id, m.sender_id, m.sender_name, m.direction, m.body, m.timestamp, m.status, m.metadata, m.starred, m.pinned,
+                                c.title
+                         FROM messages m
+                         JOIN conversations c ON c.id = m.conversation_id
+                         WHERE m.body LIKE ?1 OR m.sender_name LIKE ?1 OR c.title LIKE ?1
+                         ORDER BY m.timestamp DESC LIMIT 50",
+                    )?;
+                    let rows = stmt.query_map(params![&pattern], |row| {
+                        Ok(SearchMessageHit {
+                            message: Message {
+                                id: row.get(0)?,
+                                conversation_id: row.get(1)?,
+                                remote_id: row.get(2)?,
+                                sender_id: row.get(3)?,
+                                sender_name: row.get(4)?,
+                                direction: parse_direction(&row.get::<_, String>(5)?),
+                                body: row.get(6)?,
+                                timestamp: row.get::<_, String>(7)?.parse().unwrap_or_else(|_| Utc::now()),
+                                status: parse_message_status(&row.get::<_, String>(8)?),
+                                metadata: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
+                                starred: row.get::<_, i64>(10)? != 0,
+                                pinned: row.get::<_, i64>(11)? != 0,
+                            },
+                            conversation_title: row.get(12)?,
+                            account_id: aid.to_string(),
+                        })
+                    })?;
+                    rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+                })?;
+                messages.sort_by(|a, b| b.message.timestamp.cmp(&a.message.timestamp));
+                messages.truncate(50);
+            }
+        }
+
+        Ok(SearchResults {
+            conversations,
+            messages,
+        })
     }
 
     pub fn insert_message(&self, msg: &Message) -> Result<bool, DbError> {
@@ -353,18 +557,76 @@ impl Database {
             ],
         )?;
         let inserted = conn.changes() > 0;
+        let preview = message_preview(&msg.body, &msg.metadata);
+        let ts = msg.timestamp.to_rfc3339();
         if inserted {
-            let ts = msg.timestamp.to_rfc3339();
             conn.execute(
                 "UPDATE conversations SET
-                    last_message_preview = CASE WHEN last_message_at IS NULL OR last_message_at < ?1 THEN ?2 ELSE last_message_preview END,
-                    last_message_at = CASE WHEN last_message_at IS NULL OR last_message_at < ?1 THEN ?1 ELSE last_message_at END,
+                    last_message_preview = CASE
+                        WHEN last_message_at IS NULL OR last_message_at LIKE '0001-%' OR last_message_at <= ?1 THEN ?2
+                        ELSE last_message_preview
+                    END,
+                    last_message_at = CASE
+                        WHEN last_message_at IS NULL OR last_message_at LIKE '0001-%' OR last_message_at <= ?1 THEN ?1
+                        ELSE last_message_at
+                    END,
                     updated_at = ?1
                  WHERE id = ?3",
-                params![ts, msg.body, msg.conversation_id],
+                params![ts, preview, msg.conversation_id],
+            )?;
+        } else if let Some(remote) = &msg.remote_id {
+            merge_message_metadata_locked(&conn, &msg.conversation_id, remote, &msg.metadata)?;
+            conn.execute(
+                "UPDATE conversations SET
+                    last_message_preview = CASE
+                        WHEN last_message_at IS NULL OR last_message_at LIKE '0001-%' OR last_message_at <= ?1 THEN ?2
+                        ELSE last_message_preview
+                    END,
+                    last_message_at = CASE
+                        WHEN last_message_at IS NULL OR last_message_at LIKE '0001-%' OR last_message_at <= ?1 THEN ?1
+                        ELSE last_message_at
+                    END,
+                    updated_at = ?1
+                 WHERE id = ?3",
+                params![ts, preview, msg.conversation_id],
             )?;
         }
         Ok(inserted)
+    }
+
+    pub fn refresh_conversation_previews(&self, account_id: &str) -> Result<(), DbError> {
+        let inbox = self.inbox(account_id)?;
+        let conn = inbox.conn.lock();
+        let mut stmt = conn.prepare("SELECT id FROM conversations WHERE account_id = ?1")?;
+        let ids = stmt
+            .query_map(params![account_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for id in ids {
+            let mut msg_stmt = conn.prepare(
+                "SELECT body, timestamp, metadata FROM messages WHERE conversation_id = ?1
+                 ORDER BY timestamp DESC LIMIT 1",
+            )?;
+            let row = msg_stmt
+                .query_row(params![&id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .optional()?;
+            if let Some((body, ts, meta_raw)) = row {
+                let meta: serde_json::Value =
+                    serde_json::from_str(&meta_raw).unwrap_or_else(|_| serde_json::json!({}));
+                let preview = message_preview(&body, &meta);
+                conn.execute(
+                    "UPDATE conversations SET last_message_at = ?1, last_message_preview = ?2, updated_at = ?1 WHERE id = ?3",
+                    params![ts, preview, id],
+                )?;
+            }
+        }
+        Ok(())
     }
 
     pub fn upsert_conversation(
@@ -375,34 +637,44 @@ impl Database {
         conversation_type: ConversationType,
         last_message_at: Option<&str>,
         preview: Option<&str>,
-        archived: bool,
+        archived: Option<bool>,
+        pinned: Option<bool>,
+        force_recency: bool,
     ) -> Result<Conversation, DbError> {
         let inbox = self.inbox(account_id)?;
         let conn = inbox.conn.lock();
         if let Some(existing) = get_conversation_by_remote_locked(&conn, account_id, remote_id)? {
             let now = Utc::now().to_rfc3339();
+            let last_message_at = normalize_stored_ts(last_message_at);
+            let force = if force_recency { 1 } else { 0 };
             conn.execute(
                 "UPDATE conversations SET title = ?1,
                  last_message_preview = CASE
+                    WHEN ?8 = 1 AND ?3 IS NOT NULL THEN ?3
                     WHEN ?3 IS NULL THEN last_message_preview
                     WHEN last_message_preview IS NULL THEN ?3
-                    WHEN last_message_at IS NULL OR (?2 IS NOT NULL AND last_message_at < ?2) THEN ?3
+                    WHEN last_message_at IS NULL OR last_message_at LIKE '0001-%' OR (?2 IS NOT NULL AND last_message_at < ?2) THEN ?3
                     ELSE last_message_preview
                  END,
                  last_message_at = CASE
+                    WHEN ?8 = 1 AND ?2 IS NOT NULL THEN ?2
                     WHEN ?2 IS NULL THEN last_message_at
-                    WHEN last_message_at IS NULL OR last_message_at < ?2 THEN ?2
+                    WHEN last_message_at IS NULL OR last_message_at LIKE '0001-%' OR last_message_at < ?2 THEN ?2
                     ELSE last_message_at
                  END,
-                 archived = ?4, updated_at = ?5
-                 WHERE id = ?6",
+                 archived = COALESCE(?4, archived),
+                 pinned = COALESCE(?5, pinned),
+                 updated_at = ?6
+                 WHERE id = ?7",
                 params![
                     title,
                     last_message_at,
                     preview,
-                    if archived { 1 } else { 0 },
+                    archived.map(|v| if v { 1 } else { 0 }),
+                    pinned.map(|v| if v { 1 } else { 0 }),
                     now,
-                    existing.id
+                    existing.id,
+                    force,
                 ],
             )?;
             return get_conversation_locked(&conn, &existing.id);
@@ -416,16 +688,17 @@ impl Database {
         conn.execute(
             "INSERT INTO conversations (id, account_id, remote_id, title, conversation_type, unread_count,
              last_message_at, last_message_preview, pinned, archived, muted, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, 0, ?8, 0, '{}')",
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, 0, '{}')",
             params![
                 id,
                 account_id,
                 remote_id,
                 title,
                 ctype,
-                last_message_at,
+                normalize_stored_ts(last_message_at),
                 preview,
-                if archived { 1 } else { 0 }
+                if pinned.unwrap_or(false) { 1 } else { 0 },
+                if archived.unwrap_or(false) { 1 } else { 0 }
             ],
         )?;
         get_conversation_locked(&conn, &id)
@@ -441,12 +714,200 @@ impl Database {
         get_conversation_by_remote_locked(&conn, account_id, remote_id)
     }
 
+    pub fn get_message(&self, conversation_id: &str, message_id: &str) -> Result<Message, DbError> {
+        let conv = self.get_conversation(conversation_id)?;
+        let inbox = self.inbox(&conv.account_id)?;
+        let conn = inbox.conn.lock();
+        get_message_locked(&conn, conversation_id, message_id)
+    }
+
+    pub fn merge_conversation_metadata(
+        &self,
+        account_id: &str,
+        remote_id: &str,
+        patch: &serde_json::Value,
+    ) -> Result<Option<Conversation>, DbError> {
+        let inbox = self.inbox(account_id)?;
+        let conn = inbox.conn.lock();
+        let Some(existing) = get_conversation_by_remote_locked(&conn, account_id, remote_id)? else {
+            return Ok(None);
+        };
+        let merged = merge_json_objects(existing.metadata.clone(), patch.clone());
+        conn.execute(
+            "UPDATE conversations SET metadata = ?1 WHERE id = ?2",
+            params![merged.to_string(), existing.id],
+        )?;
+        Ok(Some(get_conversation_locked(&conn, &existing.id)?))
+    }
+
+    pub fn merge_message_metadata_by_remote(
+        &self,
+        account_id: &str,
+        conversation_remote_id: &str,
+        message_remote_id: &str,
+        patch: &serde_json::Value,
+    ) -> Result<Option<Message>, DbError> {
+        let inbox = self.inbox(account_id)?;
+        let conn = inbox.conn.lock();
+        let Some(conv) = get_conversation_by_remote_locked(&conn, account_id, conversation_remote_id)? else {
+            return Ok(None);
+        };
+        merge_message_metadata_locked(&conn, &conv.id, message_remote_id, patch)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, remote_id, sender_id, sender_name, direction, body, timestamp, status, metadata
+             FROM messages WHERE conversation_id = ?1 AND remote_id = ?2 LIMIT 1",
+        )?;
+        stmt.query_row(params![conv.id, message_remote_id], map_message_row)
+            .optional()
+            .map_err(DbError::from)
+    }
+
+    pub fn merge_message_metadata_by_remote_id(
+        &self,
+        account_id: &str,
+        message_remote_id: &str,
+        patch: &serde_json::Value,
+    ) -> Result<Option<Message>, DbError> {
+        let inbox = self.inbox(account_id)?;
+        let conn = inbox.conn.lock();
+        let conversation_id: Option<String> = conn
+            .query_row(
+                "SELECT m.conversation_id FROM messages m
+                 INNER JOIN conversations c ON c.id = m.conversation_id
+                 WHERE c.account_id = ?1 AND m.remote_id = ?2 LIMIT 1",
+                params![account_id, message_remote_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(conversation_id) = conversation_id else {
+            return Ok(None);
+        };
+        merge_message_metadata_locked(&conn, &conversation_id, message_remote_id, patch)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, conversation_id, remote_id, sender_id, sender_name, direction, body, timestamp, status, metadata
+             FROM messages WHERE conversation_id = ?1 AND remote_id = ?2 LIMIT 1",
+        )?;
+        stmt.query_row(params![conversation_id, message_remote_id], map_message_row)
+            .optional()
+            .map_err(DbError::from)
+    }
+
+    pub fn mark_message_media_error(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        error: &str,
+    ) -> Result<Option<Message>, DbError> {
+        let conv = self.get_conversation(conversation_id)?;
+        let inbox = self.inbox(&conv.account_id)?;
+        let conn = inbox.conn.lock();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT metadata FROM messages WHERE id = ?1 AND conversation_id = ?2",
+                params![message_id, conversation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(raw) = existing else {
+            return Ok(None);
+        };
+        let base: serde_json::Value =
+            serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
+        let merged = merge_json_objects(base, serde_json::json!({ "media_error": error }));
+        conn.execute(
+            "UPDATE messages SET metadata = ?1 WHERE id = ?2",
+            params![merged.to_string(), message_id],
+        )?;
+        drop(conn);
+        match self.get_message(conversation_id, message_id) {
+            Ok(msg) => Ok(Some(msg)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub fn upsert_contact(
+        &self,
+        account_id: &str,
+        remote_id: &str,
+        display_name: &str,
+    ) -> Result<Contact, DbError> {
+        let inbox = self.inbox(account_id)?;
+        let conn = inbox.conn.lock();
+        let id = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO contacts (id, account_id, remote_id, display_name, avatar_url, metadata)
+             VALUES (?1, ?2, ?3, ?4, NULL, '{}')
+             ON CONFLICT(account_id, remote_id) DO UPDATE SET display_name = excluded.display_name",
+            params![id, account_id, remote_id, display_name],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT id, account_id, remote_id, display_name, avatar_url, metadata
+             FROM contacts WHERE account_id = ?1 AND remote_id = ?2",
+        )?;
+        stmt.query_row(params![account_id, remote_id], map_contact_row)
+            .map_err(DbError::from)
+    }
+
+    pub fn fix_self_conversation_titles(&self, account_id: &str, identity: &str) -> Result<(), DbError> {
+        let contacts = self.list_contacts(account_id)?;
+        let inbox = self.inbox(account_id)?;
+        let conn = inbox.conn.lock();
+        let mut stmt = conn.prepare("SELECT id, remote_id, title FROM conversations WHERE account_id = ?1")?;
+        let rows = stmt.query_map(params![account_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, remote_id, title) = row?;
+            if !crate::media_store::jids_same(&remote_id, identity) {
+                continue;
+            }
+            if title.ends_with("(You)") {
+                continue;
+            }
+            let new_title = contacts
+                .iter()
+                .find(|c| crate::media_store::jids_same(&c.remote_id, &remote_id))
+                .map(|c| format!("{} (You)", c.display_name))
+                .unwrap_or_else(|| "Message yourself".to_string());
+            conn.execute(
+                "UPDATE conversations SET title = ?1 WHERE id = ?2",
+                params![new_title, id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn list_contacts(&self, account_id: &str) -> Result<Vec<Contact>, DbError> {
+        let inbox = self.inbox(account_id)?;
+        let conn = inbox.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, account_id, remote_id, display_name, avatar_url, metadata
+             FROM contacts WHERE account_id = ?1 ORDER BY display_name COLLATE NOCASE ASC",
+        )?;
+        let rows = stmt.query_map(params![account_id], map_contact_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+    }
+
     pub fn increment_unread(&self, conversation_id: &str) -> Result<(), DbError> {
         let conv = self.get_conversation(conversation_id)?;
         let inbox = self.inbox(&conv.account_id)?;
         inbox.conn.lock().execute(
             "UPDATE conversations SET unread_count = unread_count + 1 WHERE id = ?1",
             params![conversation_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_unread_count(&self, conversation_id: &str, count: i64) -> Result<(), DbError> {
+        let conv = self.get_conversation(conversation_id)?;
+        let inbox = self.inbox(&conv.account_id)?;
+        inbox.conn.lock().execute(
+            "UPDATE conversations SET unread_count = ?1 WHERE id = ?2",
+            params![count.max(0), conversation_id],
         )?;
         Ok(())
     }
@@ -1178,6 +1639,23 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_scheduled_message(
+        &self,
+        id: &str,
+        body: Option<&str>,
+        send_at: Option<&str>,
+    ) -> Result<ScheduledMessage, DbError> {
+        let existing = self.get_scheduled_message(id)?;
+        if existing.sent {
+            return Err(DbError::NotFound(id.to_string()));
+        }
+        self.catalog.conn.lock().execute(
+            "UPDATE scheduled_messages SET body = COALESCE(?1, body), send_at = COALESCE(?2, send_at) WHERE id = ?3 AND sent = 0",
+            params![body, send_at, id],
+        )?;
+        self.get_scheduled_message(id)
+    }
+
     pub fn get_app_meta(&self, key: &str) -> Result<Option<String>, DbError> {
         let conn = self.catalog.conn.lock();
         conn.query_row(
@@ -1236,25 +1714,22 @@ impl Database {
 fn list_conversations_in(
     conn: &Connection,
     account_id: Option<&str>,
-    include_archived: bool,
+    archived_only: bool,
 ) -> Result<Vec<Conversation>, DbError> {
+    let archived = if archived_only { 1 } else { 0 };
     if let Some(aid) = account_id {
-        let sql = if include_archived {
-            format!("{CONV_SELECT} WHERE c.account_id = ?1 ORDER BY c.pinned DESC, c.last_message_at DESC")
-        } else {
-            format!("{CONV_SELECT} WHERE c.account_id = ?1 AND c.archived = 0 ORDER BY c.pinned DESC, c.last_message_at DESC")
-        };
+        let sql = format!(
+            "{CONV_SELECT} WHERE c.account_id = ?1 AND c.archived = ?2 ORDER BY c.pinned DESC, datetime(COALESCE(NULLIF(c.last_message_at, ''), c.updated_at, '1970-01-01')) DESC, COALESCE(json_extract(c.metadata, '$.list_rank'), 999999) ASC"
+        );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![aid], map_conversation_row)?;
+        let rows = stmt.query_map(params![aid, archived], map_conversation_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
     } else {
-        let sql = if include_archived {
-            format!("{CONV_SELECT} ORDER BY c.pinned DESC, c.last_message_at DESC")
-        } else {
-            format!("{CONV_SELECT} WHERE c.archived = 0 ORDER BY c.pinned DESC, c.last_message_at DESC")
-        };
+        let sql = format!(
+            "{CONV_SELECT} WHERE c.archived = ?1 ORDER BY c.pinned DESC, datetime(COALESCE(NULLIF(c.last_message_at, ''), c.updated_at, '1970-01-01')) DESC, COALESCE(json_extract(c.metadata, '$.list_rank'), 999999) ASC"
+        );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], map_conversation_row)?;
+        let rows = stmt.query_map(params![archived], map_conversation_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
     }
 }
@@ -1437,7 +1912,13 @@ fn map_conversation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conversatio
         unread_count: row.get(6)?,
         last_message_at: row
             .get::<_, Option<String>>(7)?
-            .and_then(|s| s.parse().ok()),
+            .and_then(|s| {
+                if s.starts_with("0001-") || s.starts_with("0000-") {
+                    None
+                } else {
+                    s.parse().ok()
+                }
+            }),
         last_message_preview: row.get(8)?,
         pinned: row.get::<_, i64>(9)? != 0,
         archived: row.get::<_, i64>(10)? != 0,
@@ -1453,6 +1934,15 @@ fn map_conversation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conversatio
 
 fn opt_bool(v: Option<i64>) -> Option<bool> {
     v.map(|n| n != 0)
+}
+
+fn normalize_stored_ts(value: Option<&str>) -> Option<&str> {
+    let s = value?.trim();
+    if s.is_empty() || s.starts_with("0001-") || s.starts_with("0000-") {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 fn effective_workspace<'a>(conv: &'a Conversation, account: Option<&'a Account>) -> &'a str {
@@ -1535,7 +2025,116 @@ fn map_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         timestamp: row.get::<_, String>(7)?.parse().unwrap_or_else(|_| Utc::now()),
         status: parse_message_status(&row.get::<_, String>(8)?),
         metadata: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
+        starred: row.get::<_, i64>(10).unwrap_or(0) != 0,
+        pinned: row.get::<_, i64>(11).unwrap_or(0) != 0,
     })
+}
+
+fn get_message_locked(
+    conn: &Connection,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<Message, DbError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, conversation_id, remote_id, sender_id, sender_name, direction, body, timestamp, status, metadata, starred, pinned
+         FROM messages WHERE id = ?1 AND conversation_id = ?2",
+    )?;
+    stmt.query_row(params![message_id, conversation_id], map_message_row)
+        .optional()?
+        .ok_or_else(|| DbError::NotFound(message_id.to_string()))
+}
+
+fn map_contact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Contact> {
+    Ok(Contact {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        remote_id: row.get(2)?,
+        display_name: row.get(3)?,
+        avatar_url: row.get(4)?,
+        metadata: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+    })
+}
+
+pub fn message_preview(body: &str, metadata: &serde_json::Value) -> String {
+    let media_type = metadata
+        .get("media_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_lowercase());
+    let text = body.trim();
+    if let Some(media) = media_type {
+        let label = match media.as_str() {
+            "image" | "photo" => "📷 Photo",
+            "sticker" => "Sticker",
+            "video" => "🎬 Video",
+            "audio" | "ptt" => "🎵 Audio",
+            "document" => "📎 Document",
+            "contact" => "👤 Contact",
+            "poll" => "📊 Poll",
+            "event" => "📅 Event",
+            "location" => "📍 Location",
+            other => other,
+        };
+        let placeholder = format!("[{}]", media);
+        if !text.is_empty() && text.to_lowercase() != placeholder {
+            return text.to_string();
+        }
+        if media == "document" {
+            if let Some(name) = metadata.get("filename").and_then(|v| v.as_str()) {
+                if !name.trim().is_empty() {
+                    return format!("📎 {}", name.trim());
+                }
+            }
+        }
+        return label.to_string();
+    }
+    text.to_string()
+}
+
+fn merge_json_objects(base: serde_json::Value, patch: serde_json::Value) -> serde_json::Value {
+    match (base, patch) {
+        (serde_json::Value::Object(mut a), serde_json::Value::Object(b)) => {
+            for (k, v) in b {
+                if v.is_null() {
+                    continue;
+                }
+                if k == "media_data" {
+                    if let Some(existing) = a.get("media_data").and_then(|x| x.as_str()) {
+                        if !existing.is_empty() {
+                            continue;
+                        }
+                    }
+                }
+                a.insert(k, v);
+            }
+            serde_json::Value::Object(a)
+        }
+        (_, patch) => patch,
+    }
+}
+
+fn merge_message_metadata_locked(
+    conn: &Connection,
+    conversation_id: &str,
+    remote_id: &str,
+    patch: &serde_json::Value,
+) -> Result<(), DbError> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT metadata FROM messages WHERE conversation_id = ?1 AND remote_id = ?2 LIMIT 1",
+            params![conversation_id, remote_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = existing else {
+        return Ok(());
+    };
+    let base: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
+    let merged = merge_json_objects(base, patch.clone());
+    conn.execute(
+        "UPDATE messages SET metadata = ?1 WHERE conversation_id = ?2 AND remote_id = ?3",
+        params![merged.to_string(), conversation_id, remote_id],
+    )?;
+    Ok(())
 }
 
 fn parse_account_status(s: &str) -> AccountStatus {

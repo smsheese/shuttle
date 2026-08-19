@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Shuttle",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "identifier": "com.shuttle.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -12,43 +12,52 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Shuttle",
         "width": 1280,
         "height": 800,
         "minWidth": 768,
         "minHeight": 500,
         "decorations": true,
-        "resizable": true
+        "resizable": true,
+        "visible": false
+      },
+      {
+        "label": "splashscreen",
+        "title": "Shuttle",
+        "width": 420,
+        "height": 320,
+        "center": true,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "url": "splash.html"
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+      "csp": "default-src 'self'; connect-src 'self' https: http://localhost:* ws://localhost:*; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "Sheese Sheikh",
+    "homepage": "https://shee.se",
+    "copyright": "Copyright © 2026 Sheese Sheikh. Built with Cursor Agent.",
+    "category": "SocialNetworking",
+    "shortDescription": "Local-first unified messaging for your desktop",
+    "longDescription": "Shuttle is a local-first unified messaging desktop app. One inbox for WhatsApp, Telegram, Signal, Messenger, Instagram, Matrix, and email — on your machine, not in the cloud.\n\nCreated by Sheese Sheikh (https://shee.se, github.com/smsheese) with Cursor Agent.",
     "icon": [
       "icons/32x32.png",
+      "icons/64x64.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
+      "icons/icon.png",
       "icons/icon.icns",
       "icons/icon.ico"
     ],
     "resources": {
-      "../../connectors/shuttle_ipc.py": "connectors/shuttle_ipc.py",
-      "../../connectors/email-connector.py": "connectors/email-connector.py",
-      "../../connectors/instagram-connector.py": "connectors/instagram-connector.py",
-      "../../connectors/matrix-connector.py": "connectors/matrix-connector.py",
-      "../../connectors/messenger-connector.py": "connectors/messenger-connector.py",
-      "../../connectors/signal-connector.py": "connectors/signal-connector.py",
-      "../../connectors/telegram-connector.py": "connectors/telegram-connector.py",
-      "../../connectors/whatsapp-connector.py": "connectors/whatsapp-connector.py",
-      "../../connectors/python-runtime/current": "python-runtime",
-      "../../connectors/signal/signal-cli": "connectors/signal/signal-cli",
-      "../../connectors/signal/runtime": "connectors/signal/runtime",
-      "../../connectors/signal/SOURCE.json": "connectors/signal/SOURCE.json",
-      "../../connectors/signal/THIRD-PARTY-LICENSE.txt": "connectors/signal/THIRD-PARTY-LICENSE.txt",
       "../../third-party/licenses/signal-cli-GPL-3.0.txt": "licenses/signal-cli-GPL-3.0.txt",
       "../../third-party/licenses/AGPL-3.0.txt": "licenses/AGPL-3.0.txt",
       "../../LICENSE": "licenses/Shuttle-AGPL-3.0.txt",

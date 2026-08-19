@@ -1,6 +1,15 @@
 <script lang="ts">
   import { fade, fly } from 'svelte/transition';
-  import { CONNECTOR_COLORS, type ConnectorInfo } from '$lib/types';
+  import { onMount } from 'svelte';
+  import {
+    cancelComponentInstall,
+    ensureConnectorComponents,
+    formatBytes,
+    getConnectorRequirements,
+    onComponentInstallProgress,
+  } from '$lib/api';
+  import { CONNECTOR_COLORS, type ConnectorInfo, type ConnectorRequirements } from '$lib/types';
+  import type { UnlistenFn } from '@tauri-apps/api/event';
 
   interface Props {
     open: boolean;
@@ -45,6 +54,27 @@
   let telegramApiHash = $state('');
   let qrReady = $state(false);
   let authStarted = $state(false);
+  let requirements = $state<ConnectorRequirements | null>(null);
+  let downloading = $state(false);
+  let downloadLabel = $state('');
+  let downloadDone = $state(0);
+  let downloadTotal = $state(0);
+  let signalAcknowledged = $state(false);
+  let installError = $state<string | null>(null);
+  let progressUnlisten: UnlistenFn | null = null;
+
+  onMount(() => {
+    onComponentInstallProgress((progress) => {
+      downloadLabel = progress.component_id;
+      downloadDone = progress.bytes_done;
+      downloadTotal = progress.bytes_total;
+    }).then((unlisten) => {
+      progressUnlisten = unlisten;
+    });
+    return () => {
+      progressUnlisten?.();
+    };
+  });
 
   const BRAND_META: Record<string, { gradient: string; tagline: string }> = {
     whatsapp: {
@@ -130,12 +160,20 @@
     );
   }
 
-  function startSetup(c: ConnectorInfo) {
+  async function startSetup(c: ConnectorInfo) {
     selectedConnector = c;
     accountName = c.name;
     authStarted = false;
     qrReady = false;
+    signalAcknowledged = false;
+    installError = null;
+    requirements = null;
     view = 'setup';
+    try {
+      requirements = await getConnectorRequirements(c.id);
+    } catch (e) {
+      installError = e instanceof Error ? e.message : String(e);
+    }
   }
 
   function collectCredentials(): Record<string, string> {
@@ -166,8 +204,28 @@
     return out;
   }
 
-  function beginAuth() {
+  async function beginAuth() {
     if (!selectedConnector || !accountName.trim()) return;
+    installError = null;
+    if (selectedConnector.id === 'signal' && !signalAcknowledged) {
+      installError = 'Please acknowledge the Signal GPL notice before continuing.';
+      return;
+    }
+    try {
+      if (requirements && requirements.total_download_bytes > 0) {
+        downloading = true;
+        downloadDone = 0;
+        downloadTotal = requirements.total_download_bytes;
+        downloadLabel = 'Preparing…';
+        await ensureConnectorComponents(selectedConnector.id);
+      }
+    } catch (e) {
+      installError = e instanceof Error ? e.message : String(e);
+      downloading = false;
+      return;
+    } finally {
+      downloading = false;
+    }
     oncreate(selectedConnector.id, accountName.trim(), collectCredentials());
     authStarted = true;
     qrReady = false;
@@ -196,9 +254,17 @@
     telegramApiHash = '';
     qrReady = false;
     authStarted = false;
+    signalAcknowledged = false;
+    requirements = null;
+    downloading = false;
+    downloadLabel = '';
+    downloadDone = 0;
+    downloadTotal = 0;
+    installError = null;
   }
 
   function handleClose() {
+    if (downloading) cancelComponentInstall();
     reset();
     onclose();
   }
@@ -320,9 +386,11 @@
       class="modal"
       class:modal-wide={view === 'setup' && authStarted}
       role="dialog"
+      tabindex="-1"
       aria-modal="true"
       aria-labelledby="setup-title"
       onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
       transition:fly={{ y: 8, duration: 180 }}
     >
       {#if view === 'list'}
@@ -388,6 +456,42 @@
             disabled={authStarted}
           />
           <p class="hint">{meta.tagline}</p>
+          {#if requirements && requirements.total_download_bytes > 0}
+            <p class="download-estimate">
+              First-time setup downloads about {formatBytes(requirements.total_download_bytes)} of connector files.
+            </p>
+          {/if}
+          {#if selectedConnector.id === 'signal'}
+            <div class="gpl-notice">
+              <p>
+                Signal support downloads <strong>signal-cli</strong> (GPL-3.0, ~350 MB). Source:
+                <a href="https://github.com/AsamK/signal-cli" target="_blank" rel="noreferrer">github.com/AsamK/signal-cli</a>
+              </p>
+              <label class="gpl-check">
+                <input type="checkbox" bind:checked={signalAcknowledged} disabled={authStarted || downloading} />
+                I understand signal-cli is GPL-3.0 and will be downloaded to this device.
+              </label>
+            </div>
+          {/if}
+          {#if installError}
+            <p class="auth-error">{installError}</p>
+          {/if}
+          {#if downloading}
+            <div class="download-panel">
+              <div class="download-bar">
+                <div
+                  class="download-fill"
+                  style="width: {downloadTotal > 0 ? Math.min(100, (downloadDone / downloadTotal) * 100) : 35}%"
+                ></div>
+              </div>
+              <p class="download-status">
+                Downloading {downloadLabel || 'components'}…
+                {#if downloadTotal > 0}
+                  ({formatBytes(downloadDone)} / {formatBytes(downloadTotal)})
+                {/if}
+              </p>
+            </div>
+          {/if}
           {#if authMessage}
             <p class="hint">{authMessage}</p>
           {/if}
@@ -428,8 +532,12 @@
           {/if}
 
           {#if !authStarted}
-            <button class="primary connect-action" onclick={beginAuth} disabled={!accountName.trim()}>
-              Connect
+            <button
+              class="primary connect-action"
+              onclick={beginAuth}
+              disabled={!accountName.trim() || downloading || (selectedConnector.id === 'signal' && !signalAcknowledged)}
+            >
+              {downloading ? 'Downloading…' : 'Connect'}
             </button>
           {:else}
             <div class="auth-section">
@@ -716,6 +824,59 @@
     margin-bottom: 16px;
   }
 
+  .download-estimate {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: -8px 0 12px;
+  }
+
+  .gpl-notice {
+    margin-bottom: 14px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-input);
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--text-muted);
+  }
+
+  .gpl-notice a {
+    color: var(--accent);
+  }
+
+  .gpl-check {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    margin-top: 10px;
+    color: var(--text);
+  }
+
+  .download-panel {
+    margin-bottom: 14px;
+  }
+
+  .download-bar {
+    height: 8px;
+    border-radius: 999px;
+    background: var(--bg-input);
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+
+  .download-fill {
+    height: 100%;
+    background: var(--accent);
+    transition: width 0.2s ease;
+  }
+
+  .download-status {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
   .connect-action {
     width: 100%;
     margin-top: 4px;
@@ -809,36 +970,6 @@
     gap: 10px;
   }
 
-  .phone-input-wrap {
-    display: flex;
-    align-items: stretch;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    overflow: hidden;
-    background: var(--bg-input);
-    transition: border-color 0.15s;
-  }
-
-  .phone-input-wrap:focus-within {
-    border-color: var(--accent);
-  }
-
-  .country-code {
-    display: flex;
-    align-items: center;
-    padding: 0 12px;
-    font-size: 15px;
-    font-weight: 500;
-    color: var(--text-muted);
-    background: var(--bg-active);
-    border-right: 1px solid var(--border);
-  }
-
-  .phone-input-wrap input {
-    border: none;
-    border-radius: 0;
-  }
-
   .full {
     width: 100%;
     margin-top: 4px;
@@ -899,16 +1030,6 @@
     border-top-color: var(--accent);
     border-radius: 50%;
     animation: spin 0.7s linear infinite;
-  }
-
-  .spinner.small {
-    width: 14px;
-    height: 14px;
-    border-width: 2px;
-  }
-
-  .spinner.inline {
-    display: inline-block;
   }
 
   @keyframes spin {

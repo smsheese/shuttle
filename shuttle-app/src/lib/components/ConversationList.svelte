@@ -1,7 +1,16 @@
 <script lang="ts">
-  import { avatarColor, formatTime, getInitials } from '$lib/api';
+  import {
+    avatarColor,
+    conversationAvatar,
+    createGroup,
+    formatTime,
+    getInitials,
+    listContacts,
+    startConversation,
+  } from '$lib/api';
+  import { listPreview } from '$lib/messageMedia';
   import NetworkIcon from '$lib/components/NetworkIcon.svelte';
-  import { CONNECTOR_COLORS, type Account, type Conversation } from '$lib/types';
+  import { CONNECTOR_COLORS, type Account, type Contact, type Conversation, type SearchMessageHit, type SearchScope } from '$lib/types';
 
   interface Props {
     conversations: Conversation[];
@@ -9,12 +18,20 @@
     selectedAccountId: string | null;
     selectedId: string | null;
     searchQuery: string;
+    searchScope?: SearchScope;
+    searchMessageHits?: SearchMessageHit[];
+    showArchived?: boolean;
     onsearch: (q: string) => void;
+    onsearchscope?: (scope: SearchScope) => void;
+    onsearchhit?: (hit: SearchMessageHit) => void;
     onselect: (id: string) => void;
     onaccountselect?: (id: string | null) => void;
     oncompose?: () => void;
+    onarchivedtoggle?: () => void;
+    onrefresh?: () => void;
     oncontext?: (conv: Conversation, x: number, y: number) => void;
     channelColor?: (connectorId: string) => string;
+    datetimeFormat?: string;
   }
 
   let {
@@ -23,17 +40,32 @@
     selectedAccountId,
     selectedId,
     searchQuery,
+    searchScope = 'global',
+    searchMessageHits = [],
+    showArchived = false,
     onsearch,
+    onsearchscope,
+    onsearchhit,
     onselect,
     onaccountselect,
     oncompose,
+    onarchivedtoggle,
+    onrefresh,
     oncontext,
     channelColor,
+    datetimeFormat = '12h_full',
   }: Props = $props();
 
   let searchExpanded = $state(false);
   let toastMessage = $state<string | null>(null);
   let searchInputEl = $state<HTMLInputElement | undefined>();
+  let newMenuOpen = $state(false);
+  let composeModal = $state<null | 'contact' | 'group'>(null);
+  let contacts = $state<Contact[]>([]);
+  let contactQuery = $state('');
+  let groupTitle = $state('');
+  let groupPicked = $state<string[]>([]);
+  let composeBusy = $state(false);
 
   const CONNECTOR_LABELS: Record<string, string> = {
     whatsapp: 'WhatsApp',
@@ -80,23 +112,121 @@
   const unpinnedConversations = $derived(sortedConversations.filter((c) => !c.pinned));
 
   const headerTitle = $derived(
-    selectedAccountId
-      ? (accounts.find((a) => a.id === selectedAccountId)?.name ?? 'Chats')
-      : 'All Chats'
+    showArchived
+      ? selectedAccountId
+        ? `${accounts.find((a) => a.id === selectedAccountId)?.name ?? 'Chats'} · Archived`
+        : 'Archived'
+      : selectedAccountId
+        ? (accounts.find((a) => a.id === selectedAccountId)?.name ?? 'Chats')
+        : 'All Chats'
   );
 
   const unreadInView = $derived(conversations.reduce((s, c) => s + c.unread_count, 0));
+  const accountActions = $derived(!!selectedAccountId);
+
+  const filteredContacts = $derived.by(() => {
+    const q = contactQuery.trim().toLowerCase();
+    if (!q) return contacts;
+    return contacts.filter(
+      (c) => c.display_name.toLowerCase().includes(q) || c.remote_id.toLowerCase().includes(q)
+    );
+  });
 
   function accountFor(conv: Conversation): Account | undefined {
     return accounts.find((a) => a.id === conv.account_id);
   }
 
-  function handleComposeClick() {
-    toastMessage = 'New chat coming soon';
+  function showToast(msg: string) {
+    toastMessage = msg;
     setTimeout(() => {
       toastMessage = null;
     }, 2500);
-    oncompose?.();
+  }
+
+  function handleComposeClick() {
+    if (!selectedAccountId) {
+      showToast('Select an account first');
+      oncompose?.();
+      return;
+    }
+    newMenuOpen = !newMenuOpen;
+  }
+
+  async function openCompose(kind: 'contact' | 'group') {
+    newMenuOpen = false;
+    if (!selectedAccountId) return;
+    composeBusy = false;
+    contactQuery = '';
+    groupTitle = '';
+    groupPicked = [];
+    composeModal = kind;
+    try {
+      contacts = await listContacts(selectedAccountId);
+    } catch {
+      contacts = [];
+    }
+  }
+
+  function closeCompose() {
+    composeModal = null;
+    composeBusy = false;
+  }
+
+  function toggleParticipant(remoteId: string) {
+    if (groupPicked.includes(remoteId)) {
+      groupPicked = groupPicked.filter((id) => id !== remoteId);
+    } else {
+      groupPicked = [...groupPicked, remoteId];
+    }
+  }
+
+  async function startChatWith(contact: Contact) {
+    if (!selectedAccountId) return;
+    composeBusy = true;
+    try {
+      const conv = await startConversation(selectedAccountId, contact.remote_id, contact.display_name);
+      closeCompose();
+      onrefresh?.();
+      onselect(conv.id);
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : 'Could not open chat');
+      composeBusy = false;
+    }
+  }
+
+  async function startChatFromQuery() {
+    if (!selectedAccountId) return;
+    const raw = contactQuery.trim();
+    if (!raw) return;
+    composeBusy = true;
+    try {
+      const conv = await startConversation(selectedAccountId, raw, raw);
+      closeCompose();
+      onrefresh?.();
+      onselect(conv.id);
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : 'Could not open chat');
+      composeBusy = false;
+    }
+  }
+
+  async function submitGroup() {
+    if (!selectedAccountId) return;
+    const title = groupTitle.trim();
+    if (!title || groupPicked.length === 0) {
+      showToast('Add a name and at least one contact');
+      return;
+    }
+    composeBusy = true;
+    try {
+      await createGroup(selectedAccountId, title, groupPicked);
+      closeCompose();
+      showToast('Creating group…');
+      onrefresh?.();
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : 'Could not create group');
+      composeBusy = false;
+    }
   }
 
   function openSearch() {
@@ -125,8 +255,15 @@
     }}
   >
     <div class="avatar-wrap">
-      <div class="avatar" style="background: {avatarColor(conv.title)}">
-        {getInitials(conv.title)}
+      {#if conv.unread_count > 0}
+        <span class="unread-dot" aria-hidden="true"></span>
+      {/if}
+      <div class="avatar" class:has-unread={conv.unread_count > 0} style="background: {avatarColor(conv.title)}">
+        {#if conversationAvatar(conv)}
+          <img class="avatar-img" src={conversationAvatar(conv) ?? ''} alt="" />
+        {:else}
+          {getInitials(conv.title)}
+        {/if}
       </div>
       {#if account}
         <span
@@ -148,12 +285,12 @@
           {/if}
           <span class="title">{conv.title}</span>
         </span>
-        <span class="time">{formatTime(conv.last_message_at)}</span>
+        <span class="time">{formatTime(conv.last_message_at, datetimeFormat)}</span>
       </div>
       <div class="row preview-row">
-        <span class="preview">{conv.last_message_preview ?? ''}</span>
+        <span class="preview">{listPreview(conv.last_message_preview)}</span>
         {#if conv.unread_count > 0}
-          <span class="unread-badge">{conv.unread_count > 99 ? '99+' : conv.unread_count}</span>
+          <span class="unread-badge unread-badge-pulse">{conv.unread_count > 99 ? '99+' : conv.unread_count}</span>
         {/if}
       </div>
     </div>
@@ -198,15 +335,33 @@
       <div class="header-title-row">
         <h1>{headerTitle}</h1>
         {#if unreadInView > 0}
-          <span class="header-badge">{unreadInView}</span>
+          <span class="header-badge header-badge-pulse">{unreadInView}</span>
         {/if}
       </div>
       <div class="header-actions">
-        <button class="compose-btn" onclick={handleComposeClick} aria-label="New message" type="button">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-          </svg>
-        </button>
+        {#if accountActions}
+          <button
+            class="header-text-btn"
+            class:active={showArchived}
+            onclick={() => onarchivedtoggle?.()}
+            type="button"
+          >
+            Archived
+          </button>
+          <div class="new-wrap">
+            <button class="compose-btn" onclick={handleComposeClick} aria-label="New" type="button">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+              </svg>
+            </button>
+            {#if newMenuOpen}
+              <div class="new-menu" role="menu">
+                <button type="button" role="menuitem" onclick={() => openCompose('group')}>Group</button>
+                <button type="button" role="menuitem" onclick={() => openCompose('contact')}>Contact</button>
+              </div>
+            {/if}
+          </div>
+        {/if}
         <button class="search-toggle" onclick={openSearch} aria-label="Search conversations" type="button">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
             <circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>
@@ -225,11 +380,15 @@
             onclick={() => onselect(conv.id)}
             type="button"
           >
-            <span class="pinned-chip-avatar" style="background: {avatarColor(conv.title)}">
-              {getInitials(conv.title)}
+            <span class="pinned-chip-avatar" class:has-unread={conv.unread_count > 0} style="background: {avatarColor(conv.title)}">
+              {#if conversationAvatar(conv)}
+                <img class="avatar-img" src={conversationAvatar(conv) ?? ''} alt="" />
+              {:else}
+                {getInitials(conv.title)}
+              {/if}
             </span>
             {#if conv.unread_count > 0}
-              <span class="pinned-chip-badge">{conv.unread_count > 99 ? '99+' : conv.unread_count}</span>
+              <span class="pinned-chip-badge pinned-chip-badge-pulse">{conv.unread_count > 99 ? '99+' : conv.unread_count}</span>
             {/if}
           </button>
         {/each}
@@ -265,9 +424,35 @@
         <div class="header-title-row">
           <h1>{headerTitle}</h1>
           {#if unreadInView > 0}
-            <span class="header-badge">{unreadInView}</span>
+            <span class="header-badge header-badge-pulse">{unreadInView}</span>
           {/if}
         </div>
+        {#if accountActions}
+          <div class="header-actions header-actions-desktop">
+            <button
+              class="header-text-btn"
+              class:active={showArchived}
+              onclick={() => onarchivedtoggle?.()}
+              type="button"
+            >
+              Archived
+            </button>
+            <div class="new-wrap">
+              <button class="header-text-btn new-btn" onclick={handleComposeClick} type="button">
+                New
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
+                  <path d="m6 9 6 6 6-6"/>
+                </svg>
+              </button>
+              {#if newMenuOpen}
+                <div class="new-menu" role="menu">
+                  <button type="button" role="menuitem" onclick={() => openCompose('group')}>Group</button>
+                  <button type="button" role="menuitem" onclick={() => openCompose('contact')}>Contact</button>
+                </div>
+              {/if}
+            </div>
+          </div>
+        {/if}
       </div>
       {@render filterChips('filters-desktop')}
       <div class="search" class:has-value={searchQuery.length > 0}>
@@ -294,11 +479,90 @@
           </button>
         {/if}
       </div>
+      {#if searchQuery}
+        <div class="search-scope">
+          <button type="button" class:active={searchScope === 'global'} onclick={() => onsearchscope?.('global')}>All</button>
+          <button type="button" class:active={searchScope === 'account'} onclick={() => onsearchscope?.('account')}>This network</button>
+        </div>
+      {/if}
     </div>
   </header>
 
   {#if toastMessage}
     <div class="toast" role="status" aria-live="polite">{toastMessage}</div>
+  {/if}
+
+  {#if newMenuOpen}
+    <button class="menu-dismiss" type="button" aria-label="Close menu" onclick={() => (newMenuOpen = false)}></button>
+  {/if}
+
+  {#if composeModal}
+    <div class="compose-overlay" role="dialog" aria-modal="true" aria-label={composeModal === 'group' ? 'New group' : 'New contact'}>
+      <div class="compose-card">
+        <div class="compose-head">
+          <h2>{composeModal === 'group' ? 'New group' : 'New chat'}</h2>
+          <button type="button" class="compose-close" onclick={closeCompose} aria-label="Close">×</button>
+        </div>
+        {#if composeModal === 'group'}
+          <input
+            class="compose-input"
+            type="text"
+            placeholder="Group name"
+            bind:value={groupTitle}
+            disabled={composeBusy}
+          />
+          <p class="compose-hint">Pick at least one contact</p>
+        {:else}
+          <input
+            class="compose-input"
+            type="text"
+            placeholder="Search contacts or enter a number"
+            bind:value={contactQuery}
+            disabled={composeBusy}
+          />
+        {/if}
+        <div class="compose-list">
+          {#each filteredContacts as contact (contact.id)}
+            {#if composeModal === 'group'}
+              <button
+                type="button"
+                class="compose-row"
+                class:picked={groupPicked.includes(contact.remote_id)}
+                onclick={() => toggleParticipant(contact.remote_id)}
+                disabled={composeBusy}
+              >
+                <span class="compose-name">{contact.display_name}</span>
+                <span class="compose-jid">{contact.remote_id}</span>
+              </button>
+            {:else}
+              <button
+                type="button"
+                class="compose-row"
+                onclick={() => startChatWith(contact)}
+                disabled={composeBusy}
+              >
+                <span class="compose-name">{contact.display_name}</span>
+                <span class="compose-jid">{contact.remote_id}</span>
+              </button>
+            {/if}
+          {/each}
+          {#if filteredContacts.length === 0}
+            <p class="compose-empty">No contacts yet. Sync the account, or type a phone number.</p>
+          {/if}
+        </div>
+        <div class="compose-footer">
+          {#if composeModal === 'group'}
+            <button type="button" class="compose-submit" onclick={submitGroup} disabled={composeBusy}>
+              Create group
+            </button>
+          {:else if contactQuery.trim()}
+            <button type="button" class="compose-submit" onclick={startChatFromQuery} disabled={composeBusy}>
+              Chat with {contactQuery.trim()}
+            </button>
+          {/if}
+        </div>
+      </div>
+    </div>
   {/if}
 
   <div class="list" role="list">
@@ -315,15 +579,25 @@
       {@render convRow(conv)}
     {/each}
 
-    {#if conversations.length === 0}
+    {#if searchMessageHits.length > 0}
+      <div class="section-label section-label-desktop">Messages</div>
+      {#each searchMessageHits as hit (hit.message.id)}
+        <button type="button" class="search-hit-row" onclick={() => onsearchhit?.(hit)}>
+          <span class="search-hit-title">{hit.conversation_title}</span>
+          <span class="search-hit-body">{hit.message.body.slice(0, 80)}</span>
+        </button>
+      {/each}
+    {/if}
+
+    {#if conversations.length === 0 && searchMessageHits.length === 0}
       <div class="empty">
         <div class="empty-icon">
           <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
             <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
           </svg>
         </div>
-        <p>No conversations yet</p>
-        <p class="hint">Connect an account to get started</p>
+        <p>{showArchived ? 'No archived chats' : 'No conversations yet'}</p>
+        <p class="hint">{showArchived ? 'Archived chats for this account will show up here' : 'Connect an account to get started'}</p>
       </div>
     {/if}
   </div>
@@ -340,6 +614,61 @@
     flex-direction: column;
     flex-shrink: 0;
     position: relative;
+  }
+
+  .search-scope {
+    display: flex;
+    gap: 6px;
+    padding: 0 4px 4px;
+  }
+
+  .search-scope button {
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-hover);
+    border-radius: 999px;
+    padding: 4px 10px;
+    font-size: 11px;
+    cursor: pointer;
+    color: var(--text-muted);
+  }
+
+  .search-scope button.active {
+    background: var(--accent, #3b82f6);
+    color: #fff;
+    border-color: transparent;
+  }
+
+  .search-hit-row {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    width: 100%;
+    padding: 10px 14px;
+    border: none;
+    border-bottom: 1px solid var(--border-subtle);
+    background: transparent;
+    cursor: pointer;
+    text-align: left;
+  }
+
+  .search-hit-row:hover {
+    background: var(--bg-hover);
+  }
+
+  .search-hit-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .search-hit-body {
+    font-size: 12px;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
   }
 
   .header {
@@ -376,8 +705,194 @@
   .header-actions {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 6px;
     flex-shrink: 0;
+  }
+
+  .header-text-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 32px;
+    padding: 0 10px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    background: var(--bg-hover);
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .header-text-btn.active {
+    background: var(--accent);
+    color: white;
+    border-color: transparent;
+  }
+
+  .header-text-btn.new-btn {
+    background: var(--accent);
+    color: white;
+    border-color: transparent;
+  }
+
+  .new-wrap {
+    position: relative;
+  }
+
+  .new-menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 20;
+    min-width: 140px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .new-menu button {
+    text-align: left;
+    border: none;
+    background: transparent;
+    color: var(--text-primary);
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+
+  .new-menu button:hover {
+    background: var(--bg-hover);
+  }
+
+  .menu-dismiss {
+    position: fixed;
+    inset: 0;
+    z-index: 15;
+    border: none;
+    background: transparent;
+    cursor: default;
+  }
+
+  .compose-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 30;
+    background: color-mix(in srgb, var(--bg-app, #111) 45%, transparent);
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 48px 16px 16px;
+  }
+
+  .compose-card {
+    width: 100%;
+    max-width: 360px;
+    background: var(--bg-panel);
+    border: 1px solid var(--border-subtle);
+    border-radius: 12px;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-height: calc(100% - 24px);
+  }
+
+  .compose-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .compose-head h2 {
+    margin: 0;
+    font-size: 16px;
+  }
+
+  .compose-close {
+    border: none;
+    background: transparent;
+    font-size: 22px;
+    line-height: 1;
+    cursor: pointer;
+    color: var(--text-muted);
+  }
+
+  .compose-input {
+    width: 100%;
+    height: 38px;
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 0 10px;
+    background: var(--bg-app, var(--bg-panel));
+    color: var(--text-primary);
+  }
+
+  .compose-hint,
+  .compose-empty {
+    margin: 0;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .compose-list {
+    overflow-y: auto;
+    flex: 1;
+    min-height: 120px;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .compose-row {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    border: none;
+    background: transparent;
+    padding: 8px 6px;
+    border-radius: 8px;
+    cursor: pointer;
+    text-align: left;
+    color: inherit;
+  }
+
+  .compose-row:hover,
+  .compose-row.picked {
+    background: var(--bg-hover);
+  }
+
+  .compose-name {
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .compose-jid {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .compose-submit {
+    height: 36px;
+    border: none;
+    border-radius: 8px;
+    background: var(--accent);
+    color: white;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .avatar-img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
   }
 
   .compose-btn,
@@ -495,6 +1010,69 @@
     display: flex;
     align-items: center;
     justify-content: center;
+  }
+
+  @keyframes unread-breathe {
+    0%,
+    100% {
+      transform: scale(1);
+      opacity: 1;
+    }
+    50% {
+      transform: scale(1.12);
+      opacity: 0.88;
+    }
+  }
+
+  @keyframes unread-ring-breathe {
+    0%,
+    100% {
+      box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent);
+    }
+    50% {
+      box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 0%, transparent);
+    }
+  }
+
+  @keyframes unread-dot-glow {
+    0%,
+    100% {
+      transform: scale(1);
+      box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 70%, transparent);
+    }
+    50% {
+      transform: scale(1.15);
+      box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 0%, transparent);
+    }
+  }
+
+  .header-badge-pulse,
+  .unread-badge-pulse,
+  .pinned-chip-badge-pulse {
+    animation: unread-breathe 1.8s ease-in-out infinite;
+  }
+
+  .unread-dot {
+    position: absolute;
+    top: -2px;
+    left: -2px;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--accent);
+    border: 2px solid var(--bg-panel);
+    z-index: 4;
+    pointer-events: none;
+    animation: unread-dot-glow 1.8s ease-in-out infinite;
+  }
+
+  .avatar.has-unread {
+    animation: unread-ring-breathe 2.4s ease-in-out infinite;
+  }
+
+  .conv-item.muted .unread-dot,
+  .conv-item.muted .unread-badge-pulse {
+    opacity: 0.72;
   }
 
   .search {
@@ -645,6 +1223,14 @@
     box-shadow: inset 0 0 0 1px var(--border-subtle);
   }
 
+  .conv-item.unread {
+    box-shadow: inset 3px 0 0 var(--accent);
+  }
+
+  .conv-item.unread.selected {
+    box-shadow: inset 3px 0 0 var(--accent), inset 0 0 0 1px var(--border-subtle);
+  }
+
   .avatar-wrap {
     position: relative;
     flex-shrink: 0;
@@ -661,6 +1247,7 @@
     font-weight: 600;
     color: white;
     letter-spacing: -0.02em;
+    overflow: hidden;
   }
 
   .network-badge {
@@ -710,7 +1297,7 @@
   }
 
   .title {
-    font-size: 14px;
+    font-size: 1rem;
     font-weight: 500;
     white-space: nowrap;
     overflow: hidden;
@@ -724,11 +1311,13 @@
   }
 
   .time {
-    font-size: 11px;
+    font-size: 10.5px;
     font-weight: 500;
     color: var(--text-muted);
     flex-shrink: 0;
     letter-spacing: 0.01em;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
   }
 
   .conv-item.unread .time {
@@ -740,7 +1329,7 @@
   }
 
   .preview {
-    font-size: 13px;
+    font-size: 0.93rem;
     color: var(--text-muted);
     white-space: nowrap;
     overflow: hidden;
@@ -772,6 +1361,7 @@
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 40%, transparent);
   }
 
   .empty {
@@ -871,6 +1461,10 @@
       transition: transform 0.1s ease;
     }
 
+    .pinned-chip-avatar.has-unread {
+      animation: unread-ring-breathe 2.4s ease-in-out infinite;
+    }
+
     .pinned-chip-badge {
       position: absolute;
       top: -2px;
@@ -894,9 +1488,13 @@
       margin-bottom: 10px;
     }
 
+    .pinned-chips-mobile {
+      display: none;
+    }
+
     .section-label-desktop,
     .conv-row-desktop {
-      display: none;
+      display: block;
     }
 
     .header-mobile-search {
@@ -971,6 +1569,17 @@
 
     .empty {
       padding: 48px 24px calc(24px + var(--safe-bottom));
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .header-badge-pulse,
+    .unread-badge-pulse,
+    .pinned-chip-badge-pulse,
+    .unread-dot,
+    .avatar.has-unread,
+    .pinned-chip-avatar.has-unread {
+      animation: none;
     }
   }
 

@@ -3,34 +3,51 @@
     addTodo,
     createReminder,
     deleteReminder,
+    deleteScheduledMessage,
     deleteTodo,
     listReminders,
     listTodos,
     setTodoDone,
     updateConversation,
+    updateScheduledMessage,
   } from '$lib/api';
-  import type { ChatTodo, Conversation, PriorityGroup, Reminder, Workspace } from '$lib/types';
+  import type { ChatTodo, Conversation, Reminder, ScheduledMessage } from '$lib/types';
 
   interface Props {
     conversation: Conversation;
-    workspaces: Workspace[];
-    priorityGroups: PriorityGroup[];
+    scheduledMessages: ScheduledMessage[];
+    placement?: 'side' | 'top';
     onupdated: () => void;
   }
 
-  let { conversation, workspaces, priorityGroups, onupdated }: Props = $props();
-  let notes = $state(conversation.notes ?? '');
+  let { conversation, scheduledMessages, placement = 'side', onupdated }: Props = $props();
+  let notes = $state('');
   let todos = $state<ChatTodo[]>([]);
   let reminders = $state<Reminder[]>([]);
   let todoDraft = $state('');
   let remindAt = $state('');
   let remindNote = $state('');
+  let editingId = $state<string | null>(null);
+  let editBody = $state('');
+  let editAt = $state('');
+
+  const queued = $derived(
+    scheduledMessages.filter((m) => m.dest_conversation_id === conversation.id && !m.sent)
+  );
 
   $effect(() => {
     notes = conversation.notes ?? '';
     listTodos(conversation.id).then((t) => (todos = t));
     listReminders(conversation.id).then((r) => (reminders = r.filter((x) => !x.fired)));
+    editingId = null;
   });
+
+  function toLocalInput(iso: string): string {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
 
   async function saveNotes() {
     await updateConversation(conversation.id, { notes });
@@ -44,18 +61,6 @@
     todos = await listTodos(conversation.id);
   }
 
-  async function setWorkspace(id: string) {
-    if (id === '') await updateConversation(conversation.id, { clear_workspace: true });
-    else await updateConversation(conversation.id, { workspace_id: id });
-    onupdated();
-  }
-
-  async function setPriority(id: string) {
-    if (id === '') await updateConversation(conversation.id, { clear_priority: true });
-    else await updateConversation(conversation.id, { priority_group: id });
-    onupdated();
-  }
-
   async function addReminder() {
     if (!remindAt) return;
     const iso = new Date(remindAt).toISOString();
@@ -64,31 +69,33 @@
     remindNote = '';
     reminders = (await listReminders(conversation.id)).filter((x) => !x.fired);
   }
+
+  function startEdit(msg: ScheduledMessage) {
+    editingId = msg.id;
+    editBody = msg.body;
+    editAt = toLocalInput(msg.send_at);
+  }
+
+  async function saveEdit() {
+    if (!editingId || !editAt) return;
+    await updateScheduledMessage(editingId, {
+      body: editBody.trim() || undefined,
+      send_at: new Date(editAt).toISOString(),
+    });
+    editingId = null;
+    onupdated();
+  }
+
+  async function cancelScheduled(id: string) {
+    await deleteScheduledMessage(id);
+    if (editingId === id) editingId = null;
+    onupdated();
+  }
 </script>
 
-<aside class="panel">
-  <h3>Organize</h3>
-  <label>
-    Workspace
-    <select value={conversation.workspace_id ?? ''} onchange={(e) => setWorkspace(e.currentTarget.value)}>
-      <option value="">Account default</option>
-      {#each workspaces as ws (ws.id)}
-        <option value={ws.id}>{ws.name}</option>
-      {/each}
-    </select>
-  </label>
-  <label>
-    Priority
-    <select value={conversation.priority_group ?? ''} onchange={(e) => setPriority(e.currentTarget.value)}>
-      <option value="">None</option>
-      {#each priorityGroups as g (g.id)}
-        <option value={g.id}>{g.name}</option>
-      {/each}
-    </select>
-  </label>
-
+<aside class="panel" class:top={placement === 'top'}>
   <h3>Notes</h3>
-  <textarea bind:value={notes} rows="5" placeholder="Local notes — never sent to the network" onblur={saveNotes}></textarea>
+  <textarea bind:value={notes} rows="4" placeholder="Local notes — never sent to the network" onblur={saveNotes}></textarea>
 
   <h3>Todos</h3>
   <ul>
@@ -138,6 +145,33 @@
       </li>
     {/each}
   </ul>
+
+  <h3>Send later</h3>
+  {#if queued.length === 0}
+    <p class="empty-hint">No scheduled messages for this chat</p>
+  {:else}
+    <ul class="sched-list">
+      {#each queued as msg (msg.id)}
+        <li class="sched-item">
+          {#if editingId === msg.id}
+            <textarea bind:value={editBody} rows="3"></textarea>
+            <input type="datetime-local" bind:value={editAt} />
+            <div class="row">
+              <button type="button" onclick={saveEdit}>Save</button>
+              <button type="button" class="tiny" onclick={() => (editingId = null)}>Cancel</button>
+            </div>
+          {:else}
+            <div class="sched-body">{msg.body}</div>
+            <div class="sched-when">{new Date(msg.send_at).toLocaleString()}</div>
+            <div class="row">
+              <button type="button" class="tiny" onclick={() => startEdit(msg)}>Edit</button>
+              <button type="button" class="tiny" onclick={() => cancelScheduled(msg.id)}>Cancel send</button>
+            </div>
+          {/if}
+        </li>
+      {/each}
+    </ul>
+  {/if}
 </aside>
 
 <style>
@@ -152,6 +186,15 @@
     flex-direction: column;
     gap: 8px;
   }
+
+  .panel.top {
+    width: 100%;
+    min-width: 0;
+    max-height: 38%;
+    border-left: none;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
   h3 {
     font-size: 11px;
     text-transform: uppercase;
@@ -159,16 +202,19 @@
     color: var(--text-muted);
     margin-top: 8px;
   }
-  label, select, textarea, input, button {
+  textarea, input, button {
     font: inherit;
     color: inherit;
   }
-  select, textarea, input, button {
+  textarea, input, button {
     width: 100%;
+    padding: 8px;
+  }
+  textarea, input:not([type='checkbox']) {
     background: var(--bg-input);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    padding: 8px;
+    color: var(--text);
   }
   button {
     cursor: pointer;
@@ -207,12 +253,28 @@
     width: auto;
     accent-color: var(--accent);
   }
-  @media (max-width: 768px) {
-    .panel {
-      width: 100%;
-      min-width: 0;
-      border-left: none;
-      border-top: 1px solid var(--border-subtle);
-    }
+  .empty-hint {
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .sched-list {
+    gap: 10px;
+  }
+  .sched-item {
+    flex-direction: column;
+    align-items: stretch;
+    padding: 8px;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-sm);
+    background: var(--bg-hover);
+  }
+  .sched-body {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 13px;
+  }
+  .sched-when {
+    font-size: 11px;
+    color: var(--text-muted);
   }
 </style>

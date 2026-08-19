@@ -10,6 +10,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=POSTHOG_HOST");
     println!("cargo:rerun-if-env-changed=SHUTTLE_BUILD_CHANNEL");
     println!("cargo:rerun-if-env-changed=SHUTTLE_GIT_COMMIT");
+    emit_embedded("SHUTTLE_COMPONENTS_BASE_URL", "SHUTTLE_COMPONENTS_BASE_URL");
+    println!("cargo:rerun-if-env-changed=SHUTTLE_COMPONENTS_BASE_URL");
     tauri_build::build()
 }
 

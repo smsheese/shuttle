@@ -134,8 +134,9 @@ else
   exit 1
 fi
 
-echo "Bootstrapping pip into bundled runtime"
-if [[ "$PYTHON_BIN" == *.exe ]] && [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* && "$(uname -s)" != CYGWIN* ]]; then
+if [[ "${SHUTTLE_PYTHON_SKIP_DEPS:-0}" != "1" ]]; then
+  echo "Bootstrapping pip into bundled runtime"
+  if [[ "$PYTHON_BIN" == *.exe ]] && [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* && "$(uname -s)" != CYGWIN* ]]; then
   SITE="$DEST/python/Lib/site-packages"
   mkdir -p "$SITE"
   echo "Cross-host Windows runtime: installing connector deps with host pip"
@@ -153,6 +154,9 @@ else
   "$PYTHON_BIN" -m ensurepip --upgrade >/dev/null 2>&1 || true
   "$PYTHON_BIN" -m pip install --upgrade pip setuptools wheel >/dev/null
   "$PYTHON_BIN" -m pip install --disable-pip-version-check -r "$ROOT/connectors/requirements.txt" >/dev/null
+fi
+else
+  echo "Skipping pip connector deps (SHUTTLE_PYTHON_SKIP_DEPS=1)"
 fi
 
 node - "$meta_file" "$asset_name" "$asset_url" <<'NODE'

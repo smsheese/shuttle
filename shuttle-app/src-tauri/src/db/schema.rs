@@ -99,14 +99,7 @@ pub fn migrate_catalog(conn: &Connection) -> rusqlite::Result<()> {
             ('matrix', 'Matrix', '1.0.0');
 
         INSERT OR IGNORE INTO workspaces (id, name, builtin, sort_order) VALUES
-            ('personal', 'Personal', 1, 0),
-            ('work', 'Work', 1, 1),
-            ('others', 'Others', 1, 2);
-
-        INSERT OR IGNORE INTO priority_groups (id, name, color, builtin, sort_order) VALUES
-            ('urgent', 'Urgent', '#ef4444', 1, 0),
-            ('waiting', 'Waiting', '#f59e0b', 1, 1),
-            ('later', 'Later', '#64748b', 1, 2);
+            ('default', 'Default', 1, 0);
 
         CREATE TABLE IF NOT EXISTS app_meta (
             key TEXT PRIMARY KEY,
@@ -124,6 +117,38 @@ pub fn migrate_catalog(conn: &Connection) -> rusqlite::Result<()> {
     add_column(conn, "accounts", "workspace_id TEXT")?;
     add_column(conn, "accounts", "notify_enabled INTEGER")?;
     add_column(conn, "accounts", "send_receipts INTEGER NOT NULL DEFAULT 0")?;
+    migrate_org_defaults(conn)?;
+    Ok(())
+}
+
+fn migrate_org_defaults(conn: &Connection) -> rusqlite::Result<()> {
+    let done: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM app_meta WHERE key = 'org_defaults_v2'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if done > 0 {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO workspaces (id, name, builtin, sort_order) VALUES ('default', 'Default', 1, 0)",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE accounts SET workspace_id = 'default' WHERE workspace_id IN ('personal', 'work', 'others')",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM workspaces WHERE id IN ('personal', 'work', 'others')",
+        [],
+    )?;
+    conn.execute("DELETE FROM priority_groups WHERE builtin = 1", [])?;
+    conn.execute(
+        "INSERT OR IGNORE INTO app_meta (key, value) VALUES ('org_defaults_v2', '1')",
+        [],
+    )?;
     Ok(())
 }
 
@@ -182,6 +207,20 @@ pub fn migrate_inbox(conn: &Connection) -> rusqlite::Result<()> {
     add_column(conn, "conversations", "notes TEXT NOT NULL DEFAULT ''")?;
     add_column(conn, "conversations", "notify_enabled INTEGER")?;
     add_column(conn, "conversations", "send_receipts INTEGER")?;
+    add_column(conn, "messages", "starred INTEGER NOT NULL DEFAULT 0")?;
+    add_column(conn, "messages", "pinned INTEGER NOT NULL DEFAULT 0")?;
+    migrate_jid_body_cleanup(conn)?;
+    Ok(())
+}
+
+fn migrate_jid_body_cleanup(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE messages SET body = ''
+         WHERE length(body) < 40
+           AND (body LIKE '%@lid' OR body LIKE '%@s.whatsapp.net')
+           AND (metadata IS NULL OR metadata = '{}' OR json_extract(metadata, '$.media_type') IS NULL)",
+        [],
+    )?;
     Ok(())
 }
 

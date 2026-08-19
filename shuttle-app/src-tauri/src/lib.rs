@@ -1,8 +1,10 @@
 mod commands;
+mod components;
 mod config;
 mod connectors;
 mod db;
 mod env;
+mod media_store;
 mod models;
 mod notifications;
 mod secrets;
@@ -22,6 +24,14 @@ pub fn run() {
             let state = init_state(app.handle());
             app.manage(state);
             *APP_HANDLE.lock() = Some(app.handle().clone());
+            // Set window icon explicitly so the taskbar/titlebar always shows the app icon
+            #[cfg(not(target_os = "macos"))]
+            if let Some(win) = app.get_webview_window("main") {
+                let icon_bytes = include_bytes!("../icons/icon.png");
+                if let Ok(img) = tauri::image::Image::from_bytes(icon_bytes) {
+                    let _ = win.set_icon(img);
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -31,12 +41,29 @@ pub fn run() {
             commands::delete_account,
             commands::update_account,
             commands::list_conversations,
+            commands::list_contacts,
+            commands::start_conversation,
+            commands::create_group,
+            commands::download_message_media,
+            commands::read_message_media,
+            commands::shuttle_files_root,
+            commands::fetch_conversation_avatar,
+            commands::sync_conversation,
             commands::get_messages,
             commands::send_message,
+            commands::send_attachment,
             commands::mark_read,
             commands::mark_unread,
             commands::update_conversation,
             commands::search_conversations,
+            commands::search_messages,
+            commands::star_message,
+            commands::pin_message,
+            commands::fetch_contact_profile,
+            commands::start_call,
+            commands::accept_call,
+            commands::reject_call,
+            commands::hangup_call,
             commands::total_unread,
             commands::connect_account,
             commands::submit_auth,
@@ -64,15 +91,22 @@ pub fn run() {
             commands::list_scheduled_messages,
             commands::schedule_message,
             commands::delete_scheduled_message,
+            commands::update_scheduled_message,
             commands::export_backup,
             commands::restore_backup,
             commands::open_external,
             commands::open_devtools,
             commands::forward_message,
+            commands::fetch_url_bytes,
             commands::telemetry_track,
             commands::telemetry_error,
             commands::telemetry_performance,
             commands::telemetry_set_foreground,
+            commands::fetch_tweakcn_theme,
+            commands::get_connector_requirements,
+            commands::get_installed_components,
+            commands::ensure_connector_components,
+            commands::cancel_component_install,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

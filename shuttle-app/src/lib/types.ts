@@ -37,6 +37,53 @@ export interface Conversation {
   send_receipts?: boolean | null;
 }
 
+export interface Contact {
+  id: string;
+  account_id: string;
+  remote_id: string;
+  display_name: string;
+  avatar_url: string | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface ContactProfile {
+  username?: string | null;
+  phone?: string | null;
+  about?: string | null;
+  business_name?: string | null;
+}
+
+export interface ContactProfileBundle {
+  profile: ContactProfile;
+  media: Message[];
+  docs: Message[];
+  links: Message[];
+  starred: Message[];
+}
+
+export type SearchScope = 'global' | 'account' | 'conversation';
+
+export interface SearchMessageHit {
+  message: Message;
+  conversation_title: string;
+  account_id: string;
+}
+
+export interface SearchResults {
+  conversations: Conversation[];
+  messages: SearchMessageHit[];
+}
+
+export interface CallState {
+  call_id: string;
+  conversation_id: string;
+  account_id: string;
+  direction: string;
+  mode: string;
+  status: string;
+  remote_name?: string | null;
+}
+
 export interface Message {
   id: string;
   conversation_id: string;
@@ -48,6 +95,32 @@ export interface Message {
   timestamp: string;
   status: 'pending' | 'sent' | 'delivered' | 'read' | 'failed';
   metadata: Record<string, unknown>;
+  starred?: boolean;
+  pinned?: boolean;
+}
+
+export type AttachmentKind =
+  | 'image'
+  | 'video'
+  | 'audio'
+  | 'ptt'
+  | 'document'
+  | 'location'
+  | 'poll'
+  | 'sticker'
+  | 'gif';
+
+export interface AttachmentPayload {
+  kind: AttachmentKind;
+  caption?: string;
+  filename?: string;
+  mime?: string;
+  data_base64?: string;
+  latitude?: number;
+  longitude?: number;
+  question?: string;
+  options?: string[];
+  max_answer?: number;
 }
 
 export interface ConnectorInfo {
@@ -56,6 +129,35 @@ export interface ConnectorInfo {
   description: string;
   auth_type: string;
   capabilities: string[];
+}
+
+export interface ComponentRequirement {
+  id: string;
+  label: string;
+  size: number;
+  installed: boolean;
+  optional: boolean;
+}
+
+export interface ConnectorRequirements {
+  connector_id: string;
+  components: ComponentRequirement[];
+  total_download_bytes: number;
+}
+
+export interface InstalledComponent {
+  id: string;
+  version?: string | null;
+  sha256?: string | null;
+  path: string;
+  source: string;
+}
+
+export interface ComponentInstallProgress {
+  component_id: string;
+  bytes_done: number;
+  bytes_total: number;
+  phase: string;
 }
 
 export interface ShuttleEvent {
@@ -191,10 +293,22 @@ export interface ChannelStyle {
   font?: string | null;
 }
 
+export interface MediaRetentionConfig {
+  images_days?: number | null;
+  videos_days?: number | null;
+  audio_days?: number | null;
+  documents_days?: number | null;
+  stickers_days?: number | null;
+  gifs_days?: number | null;
+  voice_days?: number | null;
+}
+
 export interface AppConfig {
   appearance: {
     color_scheme: 'system' | 'light' | 'dark' | string;
     theme_id: string;
+    datetime_format?: string;
+    font_scale?: number;
     tweakcn_css?: string | null;
   };
   notifications: {
@@ -208,6 +322,7 @@ export interface AppConfig {
     usage_diagnostics: boolean;
   };
   channel_styles: Record<string, ChannelStyle>;
+  media_retention: MediaRetentionConfig;
 }
 
 export interface AccountPatch {
@@ -266,6 +381,7 @@ export const CONNECTOR_ICONS: Record<string, string> = {
 };
 
 export const THEME_PRESETS = [
+  { id: 'cmlhfpjhw000004l4f4ax3m7z', label: 'Light Green (tweakcn)' },
   { id: 'shuttle', label: 'Shuttle' },
   { id: 'zinc', label: 'Zinc' },
   { id: 'ocean', label: 'Ocean' },

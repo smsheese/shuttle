@@ -2,6 +2,7 @@ mod protocol;
 
 pub use protocol::*;
 
+use crate::components::ComponentManager;
 use crate::config::ConfigStore;
 use crate::db::Database;
 use crate::models::*;
@@ -9,10 +10,12 @@ use crate::notifications;
 use crate::telemetry::TelemetryManager;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, mpsc};
@@ -27,6 +30,7 @@ pub struct AppEvent {
 struct RunningConnector {
     child: Child,
     tx: mpsc::UnboundedSender<String>,
+    generation: u64,
 }
 
 pub struct ConnectorManager {
@@ -34,8 +38,10 @@ pub struct ConnectorManager {
     config: Arc<ConfigStore>,
     telemetry: Arc<TelemetryManager>,
     processes: Mutex<HashMap<String, RunningConnector>>,
+    do_not_restart: Mutex<HashSet<String>>,
+    generation: AtomicU64,
     event_tx: broadcast::Sender<AppEvent>,
-    connectors_dir: PathBuf,
+    components: Arc<ComponentManager>,
     data_dir: PathBuf,
 }
 
@@ -43,18 +49,20 @@ impl ConnectorManager {
     pub fn new(
         db: Arc<Database>,
         config: Arc<ConfigStore>,
-        connectors_dir: PathBuf,
         data_dir: PathBuf,
         telemetry: Arc<TelemetryManager>,
+        components: Arc<ComponentManager>,
+        event_tx: broadcast::Sender<AppEvent>,
     ) -> Self {
-        let (event_tx, _) = broadcast::channel(256);
         Self {
             db,
             config,
             telemetry,
             processes: Mutex::new(HashMap::new()),
+            do_not_restart: Mutex::new(HashSet::new()),
+            generation: AtomicU64::new(0),
             event_tx,
-            connectors_dir,
+            components,
             data_dir,
         }
     }
@@ -65,6 +73,55 @@ impl ConnectorManager {
 
     pub fn data_dir(&self) -> &PathBuf {
         &self.data_dir
+    }
+
+    pub fn resume_saved_accounts(self: &Arc<Self>) {
+        let accounts = match self.db.list_accounts() {
+            Ok(accounts) => accounts,
+            Err(e) => {
+                tracing::warn!("resume accounts: {e}");
+                return;
+            }
+        };
+        for account in accounts {
+            if account.disabled {
+                continue;
+            }
+            let connectors = Arc::clone(self);
+            let connector_id = account.connector_id.clone();
+            let account_id = account.id.clone();
+            let creds = crate::secrets::load(&self.data_dir, &account_id);
+            let _ = self
+                .db
+                .update_account_status(&account_id, AccountStatus::Connecting);
+            self.emit(
+                "account.status",
+                serde_json::json!({
+                    "account_id": account_id,
+                    "status": "connecting",
+                }),
+            );
+            tracing::info!(
+                "resuming {} connector for account {}",
+                connector_id,
+                account.name
+            );
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = connectors.start_connector(&connector_id, &account_id, creds) {
+                    tracing::warn!("resume {account_id}: {e}");
+                    let _ = connectors
+                        .db
+                        .update_account_status(&account_id, AccountStatus::Error);
+                    connectors.emit(
+                        "account.error",
+                        serde_json::json!({
+                            "account_id": account_id,
+                            "message": e,
+                        }),
+                    );
+                }
+            });
+        }
     }
 
     pub fn emit(&self, kind: &str, payload: serde_json::Value) {
@@ -99,6 +156,7 @@ impl ConnectorManager {
                     "read_receipts".into(),
                     "groups".into(),
                     "channels".into(),
+                    "calls:audio".into(),
                 ],
             },
             ConnectorInfo {
@@ -106,7 +164,13 @@ impl ConnectorManager {
                 name: "Signal".into(),
                 description: "Register with your phone number".into(),
                 auth_type: "phone".into(),
-                capabilities: vec!["text".into(), "media".into(), "read_receipts".into(), "groups".into()],
+                capabilities: vec![
+                    "text".into(),
+                    "media".into(),
+                    "read_receipts".into(),
+                    "groups".into(),
+                    "calls:audio".into(),
+                ],
             },
             ConnectorInfo {
                 id: "messenger".into(),
@@ -139,31 +203,12 @@ impl ConnectorManager {
         ]
     }
 
-    pub fn connector_binary(&self, connector_id: &str) -> PathBuf {
-        self.connectors_dir.join(format!("{connector_id}-connector"))
+    pub fn components(&self) -> Arc<ComponentManager> {
+        self.components.clone()
     }
 
     fn connector_script(&self, connector_id: &str) -> Result<PathBuf, String> {
-        let script_name = format!("{connector_id}-connector.py");
-        let bundled = self.connectors_dir.join(&script_name);
-        if bundled.exists() {
-            return Ok(bundled);
-        }
-        let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../connectors")
-            .join(&script_name);
-        if dev.exists() {
-            return Ok(dev);
-        }
-        let legacy = self.connector_binary(connector_id);
-        if legacy.exists() {
-            return Ok(legacy);
-        }
-        Err(format!(
-            "Connector not found for {connector_id} (expected {} or {})",
-            bundled.display(),
-            legacy.display()
-        ))
+        self.components().connector_script(connector_id)
     }
 
     fn spawn_connector_process(
@@ -176,21 +221,17 @@ impl ConnectorManager {
             .extension()
             .is_some_and(|ext| ext == "py" || ext == "pyw");
         let mut command = if is_python {
-            let (python, extra_args) = self.python_launcher();
+            let (python, extra_args) = self.components.python_launcher();
             let mut cmd = Command::new(python);
             for arg in extra_args {
                 cmd.arg(arg);
             }
             if let Some(parent) = entry.parent() {
-                let existing = std::env::var_os("PYTHONPATH");
-                let merged = match existing {
-                    Some(path) => {
-                        let mut paths: Vec<PathBuf> = vec![parent.to_path_buf()];
-                        paths.extend(std::env::split_paths(&path));
-                        std::env::join_paths(paths).unwrap_or_else(|_| parent.as_os_str().into())
-                    }
-                    None => parent.as_os_str().into(),
-                };
+                let merged = self
+                    .components
+                    .pythonpath_for_connector(connector_id, parent)
+                    .or_else(|| std::env::var_os("PYTHONPATH"))
+                    .unwrap_or_else(|| parent.as_os_str().into());
                 cmd.env("PYTHONPATH", merged);
             }
             cmd.arg(&entry);
@@ -198,168 +239,40 @@ impl ConnectorManager {
         } else {
             Command::new(&entry)
         };
+        let files_dir = crate::media_store::account_files_root(account_id);
+        let _ = crate::media_store::ensure_account_dirs(account_id);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("SHUTTLE_ACCOUNT_ID", account_id)
             .env("SHUTTLE_DATA_DIR", &self.data_dir)
-            .env("SHUTTLE_GOWA_BIN", self.gowa_binary())
-            .env("SHUTTLE_TDLIB", self.tdlib_path())
-            .env("SHUTTLE_SIGNAL_CLI", self.signal_cli())
+            .env("SHUTTLE_FILES_DIR", &files_dir)
+            .env("SHUTTLE_GOWA_BIN", self.components.gowa_binary())
+            .env("SHUTTLE_TDLIB", self.components.tdlib_path())
+            .env("SHUTTLE_SIGNAL_CLI", self.components.signal_cli())
             .spawn()
             .map_err(|e| format!("Failed to spawn connector: {e}"))
     }
 
-    fn bundled_python_root(&self) -> PathBuf {
-        self.connectors_dir
-            .parent()
-            .unwrap_or(&self.connectors_dir)
-            .join("python-runtime")
-    }
-
-    fn find_bundled_python(&self) -> Option<PathBuf> {
-        let root = self.bundled_python_root();
-        let candidates: &[&[&str]] = if cfg!(windows) {
-            &[
-                &["python", "python.exe"],
-                &["python.exe"],
-                &["install", "python.exe"],
-                &["python", "install", "python.exe"],
-            ]
-        } else {
-            &[
-                &["python", "bin", "python3"],
-                &["python", "bin", "python"],
-                &["bin", "python3"],
-                &["bin", "python"],
-                &["install", "bin", "python3"],
-                &["python", "install", "bin", "python3"],
-            ]
-        };
-        for parts in candidates {
-            let mut path = root.clone();
-            for part in *parts {
-                path.push(part);
-            }
-            if path.exists() {
-                return Some(path);
-            }
-        }
-        None
-    }
-
-    fn python_launcher(&self) -> (String, Vec<String>) {
-        if let Ok(p) = std::env::var("SHUTTLE_PYTHON") {
-            return (p, Vec::new());
-        }
-        if let Some(bundled) = self.find_bundled_python() {
-            return (bundled.to_string_lossy().into_owned(), Vec::new());
-        }
-        if cfg!(windows) {
-            ("py".into(), vec!["-3".into()])
-        } else {
-            ("python3".into(), Vec::new())
-        }
-    }
-
-    fn gowa_binary(&self) -> PathBuf {
-        self.tool_path("SHUTTLE_GOWA_BIN", &["gowa", "whatsapp"])
-    }
-
-    fn tdlib_path(&self) -> PathBuf {
-        if let Ok(p) = std::env::var("SHUTTLE_TDLIB") {
-            return PathBuf::from(p);
-        }
-        let names: &[&str] = if cfg!(windows) {
-            &["tdjson.dll", "libtdjson.dll"]
-        } else if cfg!(target_os = "macos") {
-            &["libtdjson.dylib", "tdjson.dylib"]
-        } else {
-            &["libtdjson.so", "tdjson.so"]
-        };
-        for name in names {
-            let bundled = self.connectors_dir.join("tdlib").join(name);
-            if bundled.exists() {
-                return bundled;
-            }
-            let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../connectors/tdlib")
-                .join(name);
-            if repo.exists() {
-                return repo;
-            }
-        }
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../connectors/tdlib/libtdjson.so")
-    }
-
-    fn signal_cli(&self) -> PathBuf {
-        if let Ok(p) = std::env::var("SHUTTLE_SIGNAL_CLI") {
-            return PathBuf::from(p);
-        }
-        for rel in [
-            &["signal", "signal-cli"][..],
-            &["signal", "signal-cli.exe"][..],
-            &["signal", "signal-cli.bat"][..],
-            &["signal", "runtime", "bin", "signal-cli"][..],
-        ] {
-            let mut bundled = self.connectors_dir.clone();
-            for part in rel {
-                bundled.push(part);
-            }
-            if bundled.exists() {
-                return bundled;
-            }
-        }
-        self.tool_path("SHUTTLE_SIGNAL_CLI", &["signal", "signal-cli"])
-    }
-
-    fn tool_path(&self, env_key: &str, rel: &[&str]) -> PathBuf {
-        if let Ok(p) = std::env::var(env_key) {
-            return PathBuf::from(p);
-        }
-        let mut bundled = self.connectors_dir.clone();
-        for part in rel {
-            bundled.push(part);
-        }
-        if bundled.exists() {
-            return bundled;
-        }
-        if cfg!(windows) {
-            let with_exe = bundled.with_extension("exe");
-            if with_exe.exists() {
-                return with_exe;
-            }
-        }
-        let mut repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../connectors");
-        for part in rel {
-            repo.push(part);
-        }
-        if repo.exists() {
-            return repo;
-        }
-        if cfg!(windows) {
-            let with_exe = repo.with_extension("exe");
-            if with_exe.exists() {
-                return with_exe;
-            }
-        }
-        repo
-    }
-
-    pub async fn start_connector(
-        &self,
+    pub fn start_connector(
+        self: &Arc<Self>,
         connector_id: &str,
         account_id: &str,
         credentials: serde_json::Value,
     ) -> Result<String, String> {
-        if let Ok(account) = self.db.get_account(account_id) {
-            if account.disabled {
-                return Err("Account is disabled".into());
-            }
+        match self.db.get_account(account_id) {
+            Ok(account) if account.disabled => return Err("Account is disabled".into()),
+            Err(e) => return Err(e.to_string()),
+            Ok(_) => {}
         }
-        self.stop_connector(account_id);
+        self.do_not_restart.lock().remove(account_id);
+        self.components
+            .ensure_connector_installed(connector_id)
+            .map_err(|e| format!("Connector components not ready: {e}"))?;
+        self.kill_running(account_id);
         let mut child = self.spawn_connector_process(connector_id, account_id)?;
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
 
         let stdout = child.stdout.take().ok_or("No stdout")?;
         let mut stdin = child.stdin.take().ok_or("No stdin")?;
@@ -367,7 +280,7 @@ impl ConnectorManager {
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
-                    tracing::debug!(target: "connector", "{line}");
+                    tracing::info!(target: "connector", "{line}");
                 }
             });
         }
@@ -397,6 +310,17 @@ impl ConnectorManager {
         let event_tx = self.event_tx.clone();
         let account_id_owned = account_id.to_string();
         let stdin_tx = tx.clone();
+        let this = Arc::clone(self);
+        let connector_id_owned = connector_id.to_string();
+
+        self.processes.lock().insert(
+            account_id.to_string(),
+            RunningConnector {
+                child,
+                tx: tx.clone(),
+                generation,
+            },
+        );
 
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
@@ -475,16 +399,34 @@ impl ConnectorManager {
                                 }),
                             });
                         }
+                        ConnectorResponse::ContactProfile {
+                            conversation_id,
+                            profile,
+                            ..
+                        } => {
+                            if let Some(remote) = conversation_id.as_deref() {
+                                let _ = db.merge_conversation_metadata(
+                                    &account_id_owned,
+                                    remote,
+                                    &serde_json::json!({ "contact_profile": profile }),
+                                );
+                                let _ = event_tx.send(AppEvent {
+                                    kind: "contact.profile".into(),
+                                    payload: serde_json::json!({
+                                        "account_id": account_id_owned,
+                                        "remote_id": remote,
+                                        "profile": profile,
+                                    }),
+                                });
+                            }
+                        }
                         _ => {}
                     }
                 }
             }
+            this.on_connector_exit(&account_id_owned, &connector_id_owned, generation)
+                .await;
         });
-
-        self.processes.lock().insert(
-            account_id.to_string(),
-            RunningConnector { child, tx: tx.clone() },
-        );
 
         let auth_req = ConnectorRequest::Authenticate {
             account_id: account_id.to_string(),
@@ -544,8 +486,11 @@ impl ConnectorManager {
             timestamp: Utc::now(),
             status: MessageStatus::Pending,
             metadata: serde_json::json!({}),
+            starred: false,
+            pinned: false,
         };
         self.db.insert_message(&msg).map_err(|e| e.to_string())?;
+        let conv = self.db.get_conversation(conversation_id).unwrap_or(conv);
 
         let _ = self.send_to_connector(
             account_id,
@@ -561,6 +506,135 @@ impl ConnectorManager {
             serde_json::json!({
                 "account_id": account_id,
                 "conversation_id": conversation_id,
+                "conversation": conv,
+                "message": msg,
+            }),
+        );
+
+        Ok(msg)
+    }
+
+    pub async fn send_attachment(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        kind: &str,
+        caption: Option<&str>,
+        filename: Option<&str>,
+        mime: Option<&str>,
+        data_base64: Option<&str>,
+        latitude: Option<f64>,
+        longitude: Option<f64>,
+        question: Option<&str>,
+        options: Vec<String>,
+        max_answer: Option<i32>,
+    ) -> Result<Message, String> {
+        let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
+        let body = match kind {
+            "location" => caption
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| "[Location]".into()),
+            "poll" => question
+                .filter(|s| !s.is_empty())
+                .or(caption)
+                .map(str::to_string)
+                .unwrap_or_else(|| "[Poll]".into()),
+            "ptt" | "audio" => caption
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| "[Audio]".into()),
+            "image" | "gif" => caption
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| "[Image]".into()),
+            "video" => caption
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| "[Video]".into()),
+            "sticker" => "[Sticker]".into(),
+            _ => caption
+                .filter(|s| !s.is_empty())
+                .or(filename)
+                .map(str::to_string)
+                .unwrap_or_else(|| "[Document]".into()),
+        };
+        let mut metadata = serde_json::json!({
+            "media_type": kind,
+        });
+        let resolved_filename = filename.map(str::to_string).or_else(|| {
+            mime.map(|m| format!("file{}", crate::media_store::mime_to_ext(m)))
+        });
+        if let Some(name) = resolved_filename.as_deref() {
+            metadata["filename"] = serde_json::Value::String(name.to_string());
+        }
+        if let Some(m) = mime {
+            metadata["mime"] = serde_json::Value::String(m.to_string());
+        }
+        if let (Some(lat), Some(lng)) = (latitude, longitude) {
+            metadata["latitude"] = serde_json::json!(lat);
+            metadata["longitude"] = serde_json::json!(lng);
+        }
+        if kind == "poll" {
+            if let Some(q) = question {
+                metadata["question"] = serde_json::Value::String(q.to_string());
+            }
+            metadata["options"] = serde_json::json!(options.clone());
+        }
+        if let Some(b64) = data_base64.filter(|s| !s.is_empty()) {
+            let mime_type = mime.unwrap_or("application/octet-stream");
+            metadata["media_data"] = serde_json::Value::String(format!(
+                "data:{mime_type};base64,{b64}"
+            ));
+        }
+        let msg = Message {
+            id: Uuid::new_v4().to_string(),
+            conversation_id: conversation_id.to_string(),
+            remote_id: None,
+            sender_id: None,
+            sender_name: Some("You".into()),
+            direction: MessageDirection::Outbound,
+            body,
+            timestamp: Utc::now(),
+            status: MessageStatus::Pending,
+            metadata,
+            starred: false,
+            pinned: false,
+        };
+        self.db.insert_message(&msg).map_err(|e| e.to_string())?;
+        let conv = self.db.get_conversation(conversation_id).unwrap_or(conv);
+
+        let b64_len = data_base64.map(|s| s.len()).unwrap_or(0);
+        tracing::info!("[send_attachment] kind={kind} mime={} b64_len={b64_len} filename={:?} remote_id={}",
+            mime.unwrap_or("none"), resolved_filename, conv.remote_id);
+        if let Err(e) = self.send_to_connector(
+            account_id,
+            &ConnectorRequest::SendAttachment {
+                account_id: account_id.to_string(),
+                conversation_id: conv.remote_id.clone(),
+                kind: kind.to_string(),
+                caption: caption.map(str::to_string),
+                text: caption.map(str::to_string),
+                filename: resolved_filename,
+                mime: mime.map(str::to_string),
+                data_base64: data_base64.map(str::to_string),
+                path: None,
+                latitude,
+                longitude,
+                question: question.map(str::to_string),
+                options,
+                max_answer,
+            },
+        ) {
+            tracing::error!("[send_attachment] send_to_connector failed: {e}");
+        }
+
+        self.emit(
+            "message.sent",
+            serde_json::json!({
+                "account_id": account_id,
+                "conversation_id": conversation_id,
+                "conversation": conv,
                 "message": msg,
             }),
         );
@@ -579,13 +653,259 @@ impl ConnectorManager {
         )
     }
 
+    pub fn download_message_media(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<(), String> {
+        let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
+        let msg = self
+            .db
+            .get_message(conversation_id, message_id)
+            .map_err(|e| e.to_string())?;
+        let remote_id = msg
+            .remote_id
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "Message has no remote id".to_string())?;
+        if self.send_to_connector(
+            account_id,
+            &ConnectorRequest::DownloadMedia {
+                account_id: account_id.to_string(),
+                conversation_id: conv.remote_id.clone(),
+                message_id: remote_id.clone(),
+            },
+        ).is_err() {
+            let _ = self.db.mark_message_media_error(conversation_id, &msg.id, "connector unavailable");
+            return Err("Connector is not running for this account".into());
+        }
+        Ok(())
+    }
+
+    pub fn fetch_conversation_avatar(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), String> {
+        let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
+        self.send_to_connector(
+            account_id,
+            &ConnectorRequest::FetchAvatar {
+                account_id: account_id.to_string(),
+                conversation_id: conv.remote_id,
+            },
+        )
+    }
+
+    pub fn sync_conversation(&self, account_id: &str, conversation_id: &str) -> Result<(), String> {
+        let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
+        let since_message_id = self.db.last_inbound_remote_id(conversation_id).ok().flatten();
+        self.send_to_connector(
+            account_id,
+            &ConnectorRequest::SyncChat {
+                account_id: account_id.to_string(),
+                conversation_id: conv.remote_id,
+                since_message_id,
+            },
+        )
+    }
+
+    pub fn fetch_contact_profile(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), String> {
+        let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
+        self.send_to_connector(
+            account_id,
+            &ConnectorRequest::FetchContactProfile {
+                account_id: account_id.to_string(),
+                conversation_id: conv.remote_id,
+            },
+        )
+    }
+
+    pub fn start_call(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        mode: &str,
+        share_screen: bool,
+    ) -> Result<CallState, String> {
+        let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
+        let call_id = Uuid::new_v4().to_string();
+        self.send_to_connector(
+            account_id,
+            &ConnectorRequest::StartCall {
+                account_id: account_id.to_string(),
+                conversation_id: conv.remote_id.clone(),
+                mode: mode.to_string(),
+                share_screen,
+            },
+        )?;
+        let state = CallState {
+            call_id,
+            conversation_id: conversation_id.to_string(),
+            account_id: account_id.to_string(),
+            direction: "outbound".into(),
+            mode: mode.to_string(),
+            status: "ringing".into(),
+            remote_name: Some(conv.title.clone()),
+        };
+        self.emit("call.ringing", serde_json::to_value(&state).unwrap_or_default());
+        Ok(state)
+    }
+
+    pub fn accept_call(&self, account_id: &str, call_id: &str) -> Result<(), String> {
+        self.send_to_connector(
+            account_id,
+            &ConnectorRequest::AcceptCall {
+                account_id: account_id.to_string(),
+                call_id: call_id.to_string(),
+            },
+        )
+    }
+
+    pub fn reject_call(&self, account_id: &str, call_id: &str) -> Result<(), String> {
+        self.send_to_connector(
+            account_id,
+            &ConnectorRequest::RejectCall {
+                account_id: account_id.to_string(),
+                call_id: call_id.to_string(),
+            },
+        )
+    }
+
+    pub fn hangup_call(&self, account_id: &str, call_id: &str) -> Result<(), String> {
+        self.send_to_connector(
+            account_id,
+            &ConnectorRequest::HangupCall {
+                account_id: account_id.to_string(),
+                call_id: call_id.to_string(),
+            },
+        )
+    }
+
+    pub fn create_group(
+        &self,
+        account_id: &str,
+        title: &str,
+        participants: Vec<String>,
+    ) -> Result<(), String> {
+        self.send_to_connector(
+            account_id,
+            &ConnectorRequest::CreateGroup {
+                account_id: account_id.to_string(),
+                title: title.to_string(),
+                participants,
+            },
+        )
+    }
+
+    pub fn start_conversation(
+        &self,
+        account_id: &str,
+        remote_id: &str,
+        title: &str,
+    ) -> Result<Conversation, String> {
+        let remote = normalize_remote_id(remote_id);
+        let ctype = if remote.ends_with("@g.us") {
+            ConversationType::Group
+        } else {
+            ConversationType::Direct
+        };
+        let label = if title.trim().is_empty() {
+            remote.clone()
+        } else {
+            title.trim().to_string()
+        };
+        self.db
+            .upsert_conversation(account_id, &remote, &label, ctype, None, None, None, None, false)
+            .map_err(|e| e.to_string())
+    }
+
     pub fn stop_connector(&self, account_id: &str) {
+        self.do_not_restart.lock().insert(account_id.to_string());
+        self.kill_running(account_id);
+    }
+
+    fn kill_running(&self, account_id: &str) {
         if let Some(mut running) = self.processes.lock().remove(account_id) {
             let _ = running.tx.send(
                 encode_line(&ConnectorRequest::Shutdown).unwrap_or_else(|_| "{\"type\":\"shutdown\"}\n".into()),
             );
             let _ = running.child.start_kill();
         }
+    }
+
+    async fn on_connector_exit(self: &Arc<Self>, account_id: &str, connector_id: &str, generation: u64) {
+        {
+            let mut map = self.processes.lock();
+            match map.get(account_id) {
+                Some(running) if running.generation == generation => {
+                    map.remove(account_id);
+                }
+                _ => return,
+            }
+        }
+        if self.do_not_restart.lock().contains(account_id) {
+            return;
+        }
+        let account = match self.db.get_account(account_id) {
+            Ok(account) if !account.disabled => account,
+            _ => return,
+        };
+        let _ = self
+            .db
+            .update_account_status(account_id, AccountStatus::Connecting);
+        self.emit(
+            "account.status",
+            serde_json::json!({
+                "account_id": account_id,
+                "status": "connecting",
+            }),
+        );
+        tracing::warn!(
+            "connector for {} exited; restarting in 2s",
+            account.name
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if self.do_not_restart.lock().contains(account_id) {
+            return;
+        }
+        if self
+            .processes
+            .lock()
+            .get(account_id)
+            .is_some_and(|running| running.generation != generation)
+        {
+            return;
+        }
+        let creds = crate::secrets::load(&self.data_dir, account_id);
+        if let Err(e) = self.start_connector(connector_id, account_id, creds) {
+            tracing::warn!("restart {account_id}: {e}");
+            let _ = self.db.update_account_status(account_id, AccountStatus::Error);
+            self.emit(
+                "account.error",
+                serde_json::json!({
+                    "account_id": account_id,
+                    "message": e,
+                }),
+            );
+        }
+    }
+}
+
+fn normalize_remote_id(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.contains('@') {
+        return trimmed.to_string();
+    }
+    let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        trimmed.to_string()
+    } else {
+        format!("{digits}@s.whatsapp.net")
     }
 }
 
@@ -633,7 +953,14 @@ fn unix_to_utc(n: i64) -> DateTime<Utc> {
 fn ts_str(value: Option<&serde_json::Value>) -> Option<String> {
     match value {
         None | Some(serde_json::Value::Null) => None,
-        other => Some(parse_ts_value(other).to_rfc3339()),
+        other => {
+            let s = parse_ts_value(other).to_rfc3339();
+            if s.starts_with("0001-") || s.starts_with("0000-") {
+                None
+            } else {
+                Some(s)
+            }
+        }
     }
 }
 
@@ -651,10 +978,36 @@ async fn handle_connector_event(
             if remote_id.is_empty() {
                 return;
             }
-            let title = payload
+            let mut title = payload
                 .get("title")
                 .and_then(|v| v.as_str())
-                .unwrap_or(remote_id.as_str());
+                .unwrap_or(remote_id.as_str())
+                .to_string();
+            if let Ok(account) = db.get_account(account_id) {
+                if let Some(identity) = account.identity.as_deref() {
+                    if crate::media_store::jids_same(&remote_id, identity) {
+                        if let Ok(contacts) = db.list_contacts(account_id) {
+                            for contact in contacts {
+                                if crate::media_store::jids_same(&contact.remote_id, &remote_id) {
+                                    title = format!("{} (You)", contact.display_name);
+                                    break;
+                                }
+                            }
+                        }
+                        if !title.ends_with("(You)") {
+                            if let Some(name) = payload
+                                .get("title")
+                                .and_then(|v| v.as_str())
+                                .filter(|t| !t.chars().all(|c| c.is_ascii_digit() || "+- ()".contains(c)))
+                            {
+                                if !name.is_empty() && !crate::media_store::jids_same(name, &remote_id) {
+                                    title = format!("{name} (You)");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let ctype = match payload.get("conversation_type").and_then(|v| v.as_str()) {
                 Some("group") => ConversationType::Group,
                 Some("channel") => ConversationType::Channel,
@@ -663,20 +1016,41 @@ async fn handle_connector_event(
             let last_at = ts_str(payload.get("last_message_at"));
             let last_at = last_at.as_deref();
             let preview = payload.get("preview").and_then(|v| v.as_str());
-            let archived = payload.get("archived").and_then(|v| v.as_bool()).unwrap_or(false);
+            let archived = payload.get("archived").and_then(|v| v.as_bool());
+            let pinned = payload.get("pinned").and_then(|v| v.as_bool());
+            let force_recency = payload
+                .get("force_recency")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if let Ok(conv) = db.upsert_conversation(
                 account_id,
                 &remote_id,
-                title,
+                &title,
                 ctype,
                 last_at,
                 preview,
                 archived,
+                pinned,
+                force_recency,
             ) {
-                let _ = event_tx.send(AppEvent {
-                    kind: "conversation.updated".into(),
-                    payload: serde_json::json!({ "account_id": account_id, "conversation": conv }),
-                });
+                if let Some(rank) = payload.get("list_rank").and_then(|v| v.as_i64()) {
+                    let _ = db.merge_conversation_metadata(
+                        account_id,
+                        &remote_id,
+                        &serde_json::json!({ "list_rank": rank }),
+                    );
+                }
+                if let Some(unread) = payload.get("unread_count").and_then(|v| v.as_i64()) {
+                    let _ = db.set_unread_count(&conv.id, unread.max(0));
+                }
+                let conv = db.get_conversation(&conv.id).unwrap_or(conv);
+                let history = payload.get("history").and_then(|v| v.as_bool()).unwrap_or(false);
+                if !history {
+                    let _ = event_tx.send(AppEvent {
+                        kind: "conversation.updated".into(),
+                        payload: serde_json::json!({ "account_id": account_id, "conversation": conv }),
+                    });
+                }
             }
         }
         "message.received" | "message.sent" => {
@@ -694,6 +1068,7 @@ async fn handle_connector_event(
             let body = msg_obj
                 .get("text")
                 .and_then(|t| t.as_str())
+                .or_else(|| msg_obj.get("body").and_then(|t| t.as_str()))
                 .unwrap_or("")
                 .to_string();
             let title = msg_obj
@@ -712,13 +1087,35 @@ async fn handle_connector_event(
                 .flatten()
                 .map(|c| c.title)
                 .unwrap_or_else(|| title.to_string());
+            let preview = msg_obj
+                .get("preview")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| {
+                    let mut meta = msg_obj.clone();
+                    if meta.get("media_type").is_none() {
+                        if let Some(obj) = meta.as_object_mut() {
+                            if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
+                                if t.starts_with('[') && t.ends_with(']') {
+                                    obj.insert(
+                                        "media_type".into(),
+                                        serde_json::Value::String(t[1..t.len() - 1].to_string()),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    crate::db::message_preview(&body, &meta)
+                });
             let conv = match db.upsert_conversation(
                 account_id,
                 &remote_jid,
                 &title,
                 ctype,
                 Some(&ts.to_rfc3339()),
-                Some(body.as_str()),
+                Some(preview.as_str()),
+                None,
+                None,
                 false,
             ) {
                 Ok(c) => c,
@@ -750,6 +1147,8 @@ async fn handle_connector_event(
                     MessageStatus::Delivered
                 },
                 metadata: msg_obj.clone(),
+                starred: false,
+                pinned: false,
             };
             let inserted = db.insert_message(&msg).unwrap_or(false);
             if inserted && !from_me && !history {
@@ -764,15 +1163,25 @@ async fn handle_connector_event(
                 apply_forward_rules(db, &conv, &msg);
             }
             if !history {
+                let conv = db.get_conversation(&conv.id).unwrap_or(conv);
+                let unread_total = db.total_unread().unwrap_or(0);
                 let _ = event_tx.send(AppEvent {
                     kind: event.to_string(),
                     payload: serde_json::json!({
                         "account_id": account_id,
                         "conversation_id": conv.id,
+                        "conversation": conv,
                         "message": msg,
+                        "unread_total": unread_total,
                     }),
                 });
             }
+        }
+        "inbox.catchup" => {
+            let _ = event_tx.send(AppEvent {
+                kind: "inbox.catchup".into(),
+                payload: serde_json::json!({ "account_id": account_id }),
+            });
         }
         "account.connected" => {
             let _ = db.update_account_status(account_id, AccountStatus::Connected);
@@ -786,6 +1195,118 @@ async fn handle_connector_event(
             let _ = event_tx.send(AppEvent {
                 kind: "history.sync.started".into(),
                 payload: serde_json::json!({ "account_id": account_id }),
+            });
+        }
+        "history.sync.completed" => {
+            let _ = db.refresh_conversation_previews(account_id);
+            if let Ok(account) = db.get_account(account_id) {
+                if let Some(identity) = account.identity.as_deref() {
+                    let _ = db.fix_self_conversation_titles(account_id, identity);
+                }
+            }
+            let _ = event_tx.send(AppEvent {
+                kind: "history.sync.completed".into(),
+                payload: serde_json::json!({ "account_id": account_id }),
+            });
+        }
+        "avatar.updated" => {
+            let remote_id = value_to_string(payload.get("remote_id")).unwrap_or_default();
+            if remote_id.is_empty() {
+                return;
+            }
+            let mut patch = serde_json::Map::new();
+            if let Some(data) = payload.get("avatar_data").and_then(|v| v.as_str()) {
+                if !data.is_empty() {
+                    patch.insert("avatar_data".into(), serde_json::Value::String(data.to_string()));
+                }
+            }
+            if patch.is_empty() {
+                return;
+            }
+            if let Ok(Some(conv)) =
+                db.merge_conversation_metadata(account_id, &remote_id, &serde_json::Value::Object(patch))
+            {
+                let _ = event_tx.send(AppEvent {
+                    kind: "avatar.updated".into(),
+                    payload: serde_json::json!({
+                        "account_id": account_id,
+                        "conversation_id": conv.id,
+                        "remote_id": remote_id,
+                        "avatar_data": conv.metadata.get("avatar_data"),
+                    }),
+                });
+            }
+        }
+        "media.downloaded" => {
+            let jid = value_to_string(payload.get("conversation_id")).unwrap_or_default();
+            let message_id = value_to_string(payload.get("message_id")).unwrap_or_default();
+            if message_id.is_empty() {
+                return;
+            }
+            let mut patch = serde_json::Map::new();
+            if let Some(mt) = payload.get("media_type").cloned() {
+                patch.insert("media_type".into(), mt);
+            }
+            if let Some(path) = payload.get("media_path").and_then(|v| v.as_str()) {
+                if !path.is_empty() {
+                    patch.insert("media_path".into(), serde_json::Value::String(path.to_string()));
+                }
+            }
+            if let Some(data) = payload.get("media_data").cloned() {
+                patch.insert("media_data".into(), data);
+            }
+            if let Some(err) = payload.get("error").cloned() {
+                patch.insert("media_error".into(), err);
+            }
+            let merged = serde_json::Value::Object(patch);
+            let msg = if !jid.is_empty() {
+                db.merge_message_metadata_by_remote(account_id, &jid, &message_id, &merged)
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let msg = if msg.is_some() {
+                msg
+            } else {
+                db.merge_message_metadata_by_remote_id(account_id, &message_id, &merged)
+                    .ok()
+                    .flatten()
+            };
+            if let Some(msg) = msg {
+                let _ = event_tx.send(AppEvent {
+                    kind: "media.downloaded".into(),
+                    payload: serde_json::json!({
+                        "account_id": account_id,
+                        "conversation_id": msg.conversation_id,
+                        "message": msg,
+                    }),
+                });
+            }
+        }
+        "contacts.synced" => {
+            if let Some(rows) = payload.get("contacts").and_then(|v| v.as_array()) {
+                for row in rows {
+                    let remote_id = value_to_string(row.get("remote_id")).unwrap_or_default();
+                    let name = row
+                        .get("display_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if remote_id.is_empty() || name.is_empty() {
+                        continue;
+                    }
+                    let _ = db.upsert_contact(account_id, &remote_id, name);
+                }
+            }
+            let _ = event_tx.send(AppEvent {
+                kind: "contacts.synced".into(),
+                payload: serde_json::json!({ "account_id": account_id }),
+            });
+        }
+        e if e.starts_with("call.") => {
+            let _ = event_tx.send(AppEvent {
+                kind: e.to_string(),
+                payload: payload,
             });
         }
         _ => {

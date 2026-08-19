@@ -85,10 +85,6 @@ jobs:
             libjavascriptcoregtk-4.1-dev libsoup-3.0-dev librsvg2-dev \
             libdbus-1-dev libssl-dev libayatana-appindicator3-dev libxdo-dev
 
-      - name: Stage release assets
-        shell: bash
-        run: ./scripts/stage-release-assets.sh
-
       - name: Install frontend
         working-directory: shuttle-app
         run: npm ci
@@ -102,6 +98,7 @@ jobs:
           POSTHOG_HOST: ${{ secrets.POSTHOG_HOST }}
           SHUTTLE_BUILD_CHANNEL: ${{ needs.resolve-environment.outputs.channel }}
           SHUTTLE_GIT_COMMIT: ${{ github.sha }}
+          SHUTTLE_COMPONENTS_BASE_URL: ${{ secrets.SHUTTLE_COMPONENTS_BASE_URL }}
         run: |
           if [[ "${{ matrix.rust_target }}" == "universal-apple-darwin" ]]; then
             npm run tauri build -- --target universal-apple-darwin

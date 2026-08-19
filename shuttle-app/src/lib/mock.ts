@@ -2,9 +2,11 @@ import type {
   Account,
   AccountPatch,
   AppConfig,
+  AttachmentPayload,
   ChatTodo,
   ConnectorInfo,
   Conversation,
+  Contact,
   ConversationPatch,
   ForwardRule,
   ForwardRuleDraft,
@@ -313,22 +315,14 @@ const CONNECTORS: ConnectorInfo[] = [
 let accounts = [...DEMO_ACCOUNTS];
 let conversations = [...DEMO_CONVERSATIONS];
 const messages = { ...DEMO_MESSAGES };
-let workspaces: Workspace[] = [
-  { id: 'personal', name: 'Personal', builtin: true, sort_order: 0 },
-  { id: 'work', name: 'Work', builtin: true, sort_order: 1 },
-  { id: 'others', name: 'Others', builtin: true, sort_order: 2 },
-];
-let priorityGroups: PriorityGroup[] = [
-  { id: 'urgent', name: 'Urgent', color: '#ef4444', builtin: true, sort_order: 0 },
-  { id: 'waiting', name: 'Waiting', color: '#f59e0b', builtin: true, sort_order: 1 },
-  { id: 'later', name: 'Later', color: '#64748b', builtin: true, sort_order: 2 },
-];
+let workspaces: Workspace[] = [{ id: 'default', name: 'Default', builtin: true, sort_order: 0 }];
+let priorityGroups: PriorityGroup[] = [];
 let todos: ChatTodo[] = [];
 let reminders: Reminder[] = [];
 let forwardRules: ForwardRule[] = [];
 let scheduledMessages: ScheduledMessage[] = [];
 let appConfig: AppConfig = {
-  appearance: { color_scheme: 'system', theme_id: 'shuttle', tweakcn_css: null },
+  appearance: { color_scheme: 'light', theme_id: 'cmlhfpjhw000004l4f4ax3m7z', datetime_format: '12h_full', font_scale: 1, tweakcn_css: null },
   notifications: {
     enabled: true,
     quiet_hours_enabled: false,
@@ -348,6 +342,7 @@ let appConfig: AppConfig = {
     email: { tag: '#EA4335' },
     matrix: { tag: '#0DBD8B' },
   },
+  media_retention: {},
 };
 
 export const mockApi = {
@@ -379,11 +374,67 @@ export const mockApi = {
     return accounts.find((a) => a.id === id)!;
   },
   connectAccount: async (_accountId?: string) => 'ok',
-  listConversations: async (accountId?: string, workspaceId?: string, priorityGroup?: string) => {
+  listConversations: async (
+    accountId?: string,
+    workspaceId?: string,
+    priorityGroup?: string,
+    archivedOnly?: boolean
+  ) => {
     let list = accountId ? conversations.filter((c) => c.account_id === accountId) : conversations;
+    list = list.filter((c) => (archivedOnly ? c.archived : !c.archived));
     if (workspaceId) list = list.filter((c) => (c.workspace_id ?? 'others') === workspaceId);
     if (priorityGroup) list = list.filter((c) => c.priority_group === priorityGroup);
     return list;
+  },
+  listContacts: async (accountId: string): Promise<Contact[]> =>
+    conversations
+      .filter((c) => c.account_id === accountId && c.conversation_type === 'direct')
+      .map((c) => ({
+        id: c.id,
+        account_id: c.account_id,
+        remote_id: c.remote_id,
+        display_name: c.title,
+        avatar_url: null,
+        metadata: {},
+      })),
+  startConversation: async (accountId: string, remoteId: string, title: string) => {
+    const existing = conversations.find((c) => c.account_id === accountId && c.remote_id === remoteId);
+    if (existing) return existing;
+    const conv: Conversation = {
+      id: crypto.randomUUID(),
+      account_id: accountId,
+      remote_id: remoteId,
+      contact_id: null,
+      title: title || remoteId,
+      conversation_type: 'direct',
+      unread_count: 0,
+      last_message_at: new Date().toISOString(),
+      last_message_preview: '',
+      pinned: false,
+      archived: false,
+      muted: false,
+      metadata: {},
+    };
+    conversations = [conv, ...conversations];
+    return conv;
+  },
+  createGroup: async (accountId: string, title: string, _participants: string[]) => {
+    const conv: Conversation = {
+      id: crypto.randomUUID(),
+      account_id: accountId,
+      remote_id: `g-${crypto.randomUUID()}`,
+      contact_id: null,
+      title,
+      conversation_type: 'group',
+      unread_count: 0,
+      last_message_at: new Date().toISOString(),
+      last_message_preview: '',
+      pinned: false,
+      archived: false,
+      muted: false,
+      metadata: {},
+    };
+    conversations = [conv, ...conversations];
   },
   updateConversation: async (id: string, patch: ConversationPatch) => {
     conversations = conversations.map((c) => (c.id === id ? { ...c, ...patch } : c));
@@ -410,6 +461,14 @@ export const mockApi = {
         : c
     );
     return msg;
+  },
+  sendAttachment: async (accountId: string, conversationId: string, attachment: AttachmentPayload) => {
+    const body =
+      attachment.caption ||
+      attachment.question ||
+      attachment.filename ||
+      `[${attachment.kind}]`;
+    return mockApi.sendMessage(accountId, conversationId, body);
   },
   markRead: async (conversationId: string) => {
     conversations = conversations.map((c) =>
@@ -567,6 +626,18 @@ export const mockApi = {
   },
   deleteScheduledMessage: async (id: string) => {
     scheduledMessages = scheduledMessages.filter((msg) => msg.id !== id);
+  },
+  updateScheduledMessage: async (id: string, patch: { body?: string; send_at?: string }) => {
+    scheduledMessages = scheduledMessages.map((msg) =>
+      msg.id === id && !msg.sent
+        ? {
+            ...msg,
+            body: patch.body ?? msg.body,
+            send_at: patch.send_at ?? msg.send_at,
+          }
+        : msg
+    );
+    return scheduledMessages.find((msg) => msg.id === id)!;
   },
   exportBackup: async (_path: string, _password: string, includeMessages = true) =>
     ({

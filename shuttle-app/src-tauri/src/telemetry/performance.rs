@@ -78,7 +78,7 @@ impl PerformanceSampler {
         cpu.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         mem.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         Some(PerformanceSnapshot {
-            foreground: *self.foreground.lock(),
+            foreground: self.is_foreground(),
             sample_count: ring.len() as u64,
             cpu_avg: avg(&cpu),
             cpu_p95: percentile(&cpu, 0.95),

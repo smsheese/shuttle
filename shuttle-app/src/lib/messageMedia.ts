@@ -160,6 +160,10 @@ export function previewFromMessage(msg: Message): string {
   return messagePreview(msg.body, msg.metadata);
 }
 
+export function isDownloadableMedia(msg: Message): boolean {
+  return shouldDownloadMedia(mediaKindFromMessage(msg));
+}
+
 export function shouldDownloadMedia(kind: string | null): boolean {
   if (!kind) return false;
   return DOWNLOADABLE.has(kind) || kind === 'sticker';

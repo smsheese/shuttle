@@ -24,6 +24,7 @@ from shuttle_ipc import (
     log,
     now_iso,
     read_line,
+    req_account_id,
     send,
     to_rfc3339,
 )
@@ -457,14 +458,16 @@ class TelegramSession:
 
 
 def main() -> None:
-    session: Optional[TelegramSession] = None
-    account_id = os.environ.get("SHUTTLE_ACCOUNT_ID")
+    sessions: dict[str, TelegramSession] = {}
+    fallback_id = os.environ.get("SHUTTLE_ACCOUNT_ID")
 
     while True:
         req = read_line()
         if req is None:
             break
         rtype = req.get("type")
+        account_id = req_account_id(req, fallback_id)
+        session = sessions.get(account_id) if account_id else None
         if rtype == "handshake":
             send(
                 {
@@ -475,21 +478,24 @@ def main() -> None:
                 }
             )
         elif rtype in {"authenticate", "connect"}:
-            account_id = req.get("account_id") or account_id
             if not account_id:
                 emit_error("missing account_id")
                 continue
             try:
+                old = sessions.pop(account_id, None)
+                if old:
+                    old.shutdown()
                 session = TelegramSession(account_id, creds(req))
+                sessions[account_id] = session
                 session.start()
             except Exception as e:
                 log(CONNECTOR_ID, str(e))
-                emit_error(str(e))
+                emit_error(str(e), account_id)
         elif rtype == "submit_auth":
             if session:
                 session.submit(creds(req))
             else:
-                emit_error("not connected")
+                emit_error("not connected", account_id)
         elif rtype == "sync_history":
             if session and session.ready and session.td:
                 session.td.send(
@@ -509,7 +515,7 @@ def main() -> None:
             send({"type": "ok", "request_id": None})
         elif rtype == "send_message":
             if not session:
-                emit_error("not connected")
+                emit_error("not connected", account_id)
                 continue
             session.send_text(req.get("conversation_id") or "", req.get("text") or "")
         elif rtype == "mark_read":
@@ -518,12 +524,12 @@ def main() -> None:
             if session:
                 session.fetch_contact_profile(req.get("conversation_id") or "")
             else:
-                emit_error("not connected")
+                emit_error("not connected", account_id)
         elif rtype == "start_call":
             if session:
                 session.start_call(req.get("conversation_id") or "", req.get("mode") or "audio")
             else:
-                emit_error("not connected")
+                emit_error("not connected", account_id)
         elif rtype == "accept_call":
             if session:
                 session.accept_call(req.get("call_id") or "")
@@ -533,9 +539,15 @@ def main() -> None:
         elif rtype == "hangup_call":
             if session:
                 session.hangup_call(req.get("call_id") or "")
-        elif rtype in {"shutdown", "disconnect"}:
-            if session:
-                session.shutdown()
+        elif rtype == "disconnect":
+            if account_id:
+                old = sessions.pop(account_id, None)
+                if old:
+                    old.shutdown()
+        elif rtype == "shutdown":
+            for old in sessions.values():
+                old.shutdown()
+            sessions.clear()
             break
 
 

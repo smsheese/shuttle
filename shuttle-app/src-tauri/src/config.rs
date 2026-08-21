@@ -14,6 +14,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub privacy: PrivacyConfig,
     #[serde(default)]
+    pub sleep: SleepConfig,
+    #[serde(default)]
     pub channel_styles: HashMap<String, ChannelStyle>,
     #[serde(default)]
     pub media_retention: MediaRetentionConfig,
@@ -25,6 +27,7 @@ impl Default for AppConfig {
             appearance: AppearanceConfig::default(),
             notifications: NotificationConfig::default(),
             privacy: PrivacyConfig::default(),
+            sleep: SleepConfig::default(),
             channel_styles: default_channel_styles(),
             media_retention: MediaRetentionConfig::default(),
         }
@@ -126,6 +129,36 @@ pub struct NotificationConfig {
     pub quiet_hours_start: String,
     #[serde(default = "default_quiet_end")]
     pub quiet_hours_end: String,
+}
+
+/// Ferdium-style hibernation: stop idle sidecars, optionally wake to poll.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SleepConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Idle minutes before a non-active account is stopped.
+    #[serde(default = "default_sleep_after")]
+    pub after_minutes: u32,
+    /// While sleeping, wake this often to sync. `0` = only when the user opens the account.
+    #[serde(default = "default_sleep_check")]
+    pub check_minutes: u32,
+}
+
+impl Default for SleepConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            after_minutes: default_sleep_after(),
+            check_minutes: default_sleep_check(),
+        }
+    }
+}
+
+fn default_sleep_after() -> u32 {
+    5
+}
+fn default_sleep_check() -> u32 {
+    15
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

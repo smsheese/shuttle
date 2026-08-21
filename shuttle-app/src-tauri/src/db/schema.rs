@@ -117,6 +117,12 @@ pub fn migrate_catalog(conn: &Connection) -> rusqlite::Result<()> {
     add_column(conn, "accounts", "workspace_id TEXT")?;
     add_column(conn, "accounts", "notify_enabled INTEGER")?;
     add_column(conn, "accounts", "send_receipts INTEGER NOT NULL DEFAULT 0")?;
+    add_column(conn, "accounts", "sleep_enabled INTEGER")?;
+    add_column(conn, "accounts", "sleep_after_minutes INTEGER")?;
+    add_column(conn, "accounts", "sleep_check_minutes INTEGER")?;
+    add_column(conn, "scheduled_messages", "attempts INTEGER NOT NULL DEFAULT 0")?;
+    add_column(conn, "scheduled_messages", "last_error TEXT")?;
+    add_column(conn, "scheduled_messages", "failed INTEGER NOT NULL DEFAULT 0")?;
     migrate_org_defaults(conn)?;
     Ok(())
 }

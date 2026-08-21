@@ -36,7 +36,6 @@ shuttle/
 │   ├── instagram/<account>/ # instagrapi session (0600)
 │   └── email/               # no extra files; password is in the keyring
 ├── gowa/                    # WhatsApp GOWA process state + WhatsApp session DB
-├── attachments/             # reserved for media files (not SQLite blobs)
 ├── cache/
 └── logs/
 ```
@@ -54,6 +53,7 @@ shuttle/
 | Signal identity keys | signal-cli files | `connectors/signal/<account>/config/` |
 | Messenger / Instagram sessions | pickle / JSON | `connectors/<network>/<account>/` mode `0600` |
 | Email | none on disk besides keyring | IMAP/SMTP over TLS |
+| Downloaded media and avatars | files on disk | **`~/Documents/shuttle/<account-id>/media` and `avatars`** (override with `SHUTTLE_FILES_DIR`). Message rows store path + MIME in `metadata`, not blobs. |
 
 Credentials are **never** written to SQLite, **never** written to `config.json`, and **never** sent to the Svelte UI. The frontend only submits them through Tauri `invoke`; the Rust core puts persistable fields in the keyring and passes the blob to the sidecar on stdin.
 
@@ -93,7 +93,7 @@ This file is **not encrypted**. It must not hold API keys.
 
 **Catalog** (`app.sqlite`)
 
-- `connectors`, `accounts` (including `disabled`, `muted`, `workspace_id`, `notify_enabled`, `send_receipts`)
+- `connectors`, `accounts` (including `disabled`, `muted`, `workspace_id`, `notify_enabled`, `send_receipts`, `sleep_enabled`, `sleep_after_minutes`, `sleep_check_minutes`)
 - `workspaces` — seeded `personal` / `work` / `others`
 - `priority_groups` — seeded `urgent` / `waiting` / `later`
 - `chat_todos`, `reminders` — local organization; keyed by `conversation_id` + `account_id` but stored here so they are not duplicated per inbox connection

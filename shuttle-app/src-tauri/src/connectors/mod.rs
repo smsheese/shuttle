@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, mpsc};
@@ -31,14 +31,22 @@ struct RunningConnector {
     child: Child,
     tx: mpsc::UnboundedSender<String>,
     generation: u64,
+    /// Shuttle account ids attached to this one sidecar process.
+    accounts: HashSet<String>,
 }
 
 pub struct ConnectorManager {
     db: Arc<Database>,
     config: Arc<ConfigStore>,
     telemetry: Arc<TelemetryManager>,
+    /// Keyed by `connector_id` (whatsapp, telegram, …), not account id.
     processes: Mutex<HashMap<String, RunningConnector>>,
     do_not_restart: Mutex<HashSet<String>>,
+    sleeping: Mutex<HashSet<String>>,
+    last_activity: Mutex<HashMap<String, Instant>>,
+    last_check: Mutex<HashMap<String, Instant>>,
+    active_account: Mutex<Option<String>>,
+    start_lock: Mutex<()>,
     generation: AtomicU64,
     event_tx: broadcast::Sender<AppEvent>,
     components: Arc<ComponentManager>,
@@ -60,6 +68,11 @@ impl ConnectorManager {
             telemetry,
             processes: Mutex::new(HashMap::new()),
             do_not_restart: Mutex::new(HashSet::new()),
+            sleeping: Mutex::new(HashSet::new()),
+            last_activity: Mutex::new(HashMap::new()),
+            last_check: Mutex::new(HashMap::new()),
+            active_account: Mutex::new(None),
+            start_lock: Mutex::new(()),
             generation: AtomicU64::new(0),
             event_tx,
             components,
@@ -156,7 +169,6 @@ impl ConnectorManager {
                     "read_receipts".into(),
                     "groups".into(),
                     "channels".into(),
-                    "calls:audio".into(),
                 ],
             },
             ConnectorInfo {
@@ -169,7 +181,6 @@ impl ConnectorManager {
                     "media".into(),
                     "read_receipts".into(),
                     "groups".into(),
-                    "calls:audio".into(),
                 ],
             },
             ConnectorInfo {
@@ -177,14 +188,14 @@ impl ConnectorManager {
                 name: "Messenger".into(),
                 description: "Log in with Facebook email and password".into(),
                 auth_type: "password".into(),
-                capabilities: vec!["text".into(), "media".into(), "groups".into()],
+                capabilities: vec!["text".into(), "groups".into()],
             },
             ConnectorInfo {
                 id: "instagram".into(),
                 name: "Instagram".into(),
                 description: "Log in to Instagram DMs".into(),
                 auth_type: "password".into(),
-                capabilities: vec!["text".into(), "media".into()],
+                capabilities: vec!["text".into()],
             },
             ConnectorInfo {
                 id: "email".into(),
@@ -267,10 +278,17 @@ impl ConnectorManager {
             Ok(_) => {}
         }
         self.do_not_restart.lock().remove(account_id);
+        self.sleeping.lock().remove(account_id);
+        self.touch_activity(account_id);
         self.components
             .ensure_connector_installed(connector_id)
             .map_err(|e| format!("Connector components not ready: {e}"))?;
-        self.kill_running(account_id);
+
+        let _start_guard = self.start_lock.lock();
+        if self.attach_to_running(connector_id, account_id, credentials.clone())? {
+            return Ok("Connector attached".into());
+        }
+
         let mut child = self.spawn_connector_process(connector_id, account_id)?;
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -314,11 +332,12 @@ impl ConnectorManager {
         let connector_id_owned = connector_id.to_string();
 
         self.processes.lock().insert(
-            account_id.to_string(),
+            connector_id.to_string(),
             RunningConnector {
                 child,
                 tx: tx.clone(),
                 generation,
+                accounts: HashSet::from([account_id.to_string()]),
             },
         );
 
@@ -344,6 +363,9 @@ impl ConnectorManager {
                             let _ = stdin_tx.send(sync_line);
                         }
                     }
+                    if event == "message.received" || event == "message.sent" {
+                        this.touch_activity(&account_id);
+                    }
                     handle_connector_event(&db, &config, &event_tx, &event, &account_id, payload).await;
                 } else if let Ok(resp) = decode_line::<ConnectorResponse>(&line) {
                     match resp {
@@ -352,11 +374,13 @@ impl ConnectorManager {
                             qr_data,
                             url,
                             message,
+                            account_id: resp_account,
                         } => {
+                            let aid = resp_account.unwrap_or_else(|| account_id_owned.clone());
                             let _ = event_tx.send(AppEvent {
                                 kind: "auth.required".into(),
                                 payload: serde_json::json!({
-                                    "account_id": account_id_owned,
+                                    "account_id": aid,
                                     "method": method,
                                     "qr_data": qr_data,
                                     "url": url,
@@ -374,6 +398,7 @@ impl ConnectorManager {
                                 "connecting" => AccountStatus::Connecting,
                                 "error" => AccountStatus::Error,
                                 "awaiting_auth" => AccountStatus::AwaitingAuth,
+                                "sleeping" => AccountStatus::Sleeping,
                                 _ => AccountStatus::Disconnected,
                             };
                             let _ = db.update_account_status(&account_id, st);
@@ -389,12 +414,13 @@ impl ConnectorManager {
                                 }),
                             });
                         }
-                        ConnectorResponse::Error { message } => {
-                            let _ = db.update_account_status(&account_id_owned, AccountStatus::Error);
+                        ConnectorResponse::Error { message, account_id: resp_account } => {
+                            let aid = resp_account.unwrap_or_else(|| account_id_owned.clone());
+                            let _ = db.update_account_status(&aid, AccountStatus::Error);
                             let _ = event_tx.send(AppEvent {
                                 kind: "account.error".into(),
                                 payload: serde_json::json!({
-                                    "account_id": account_id_owned,
+                                    "account_id": aid,
                                     "message": message,
                                 }),
                             });
@@ -402,18 +428,20 @@ impl ConnectorManager {
                         ConnectorResponse::ContactProfile {
                             conversation_id,
                             profile,
+                            account_id: resp_account,
                             ..
                         } => {
+                            let aid = resp_account.unwrap_or_else(|| account_id_owned.clone());
                             if let Some(remote) = conversation_id.as_deref() {
                                 let _ = db.merge_conversation_metadata(
-                                    &account_id_owned,
+                                    &aid,
                                     remote,
                                     &serde_json::json!({ "contact_profile": profile }),
                                 );
                                 let _ = event_tx.send(AppEvent {
                                     kind: "contact.profile".into(),
                                     payload: serde_json::json!({
-                                        "account_id": account_id_owned,
+                                        "account_id": aid,
                                         "remote_id": remote,
                                         "profile": profile,
                                     }),
@@ -424,7 +452,7 @@ impl ConnectorManager {
                     }
                 }
             }
-            this.on_connector_exit(&account_id_owned, &connector_id_owned, generation)
+            this.on_connector_exit(&connector_id_owned, generation)
                 .await;
         });
 
@@ -463,17 +491,195 @@ impl ConnectorManager {
         let line = encode_line(req).map_err(|e| e.to_string())?;
         let map = self.processes.lock();
         let proc = map
-            .get(account_id)
+            .values()
+            .find(|p| p.accounts.contains(account_id))
             .ok_or_else(|| "Connector is not running for this account".to_string())?;
         proc.tx.send(line).map_err(|e| e.to_string())
     }
 
-    pub async fn send_message(
+    fn attach_to_running(
         &self,
+        connector_id: &str,
+        account_id: &str,
+        credentials: serde_json::Value,
+    ) -> Result<bool, String> {
+        let tx = {
+            let mut map = self.processes.lock();
+            let Some(running) = map.get_mut(connector_id) else {
+                return Ok(false);
+            };
+            running.accounts.insert(account_id.to_string());
+            running.tx.clone()
+        };
+        let auth_req = ConnectorRequest::Authenticate {
+            account_id: account_id.to_string(),
+            credentials,
+        };
+        let line = encode_line(&auth_req).map_err(|e| e.to_string())?;
+        tx.send(line).map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
+    pub fn touch_activity(&self, account_id: &str) {
+        self.last_activity
+            .lock()
+            .insert(account_id.to_string(), Instant::now());
+    }
+
+    pub fn set_active_account(&self, account_id: Option<String>) {
+        if let Some(ref id) = account_id {
+            self.touch_activity(id);
+            self.sleeping.lock().remove(id);
+            self.do_not_restart.lock().remove(id);
+        }
+        *self.active_account.lock() = account_id;
+    }
+
+    pub fn wake_account(self: &Arc<Self>, account_id: &str) -> Result<String, String> {
+        self.set_active_account(Some(account_id.to_string()));
+        self.ensure_running(account_id)
+    }
+
+    fn ensure_running(self: &Arc<Self>, account_id: &str) -> Result<String, String> {
+        let account = self.db.get_account(account_id).map_err(|e| e.to_string())?;
+        if account.disabled {
+            return Err("Account is disabled".into());
+        }
+        self.sleeping.lock().remove(account_id);
+        self.do_not_restart.lock().remove(account_id);
+        if self.is_running(account_id) {
+            return Ok("already running".into());
+        }
+        let creds = crate::secrets::load(&self.data_dir, account_id);
+        let _ = self
+            .db
+            .update_account_status(account_id, AccountStatus::Connecting);
+        self.emit(
+            "account.status",
+            serde_json::json!({
+                "account_id": account_id,
+                "status": "connecting",
+            }),
+        );
+        self.start_connector(&account.connector_id, account_id, creds)
+    }
+
+    pub fn sleep_account(&self, account_id: &str) {
+        if self.active_account.lock().as_deref() == Some(account_id) {
+            return;
+        }
+        self.sleeping.lock().insert(account_id.to_string());
+        self.do_not_restart.lock().insert(account_id.to_string());
+        self.detach_account(account_id, false);
+        let _ = self
+            .db
+            .update_account_status(account_id, AccountStatus::Sleeping);
+        self.emit(
+            "account.status",
+            serde_json::json!({
+                "account_id": account_id,
+                "status": "sleeping",
+            }),
+        );
+    }
+
+    pub fn spawn_sleep_loop(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                tick.tick().await;
+                this.tick_sleep();
+            }
+        });
+    }
+
+    fn resolved_sleep(&self, account: &Account) -> (bool, u32, u32) {
+        let cfg = self.config.get().sleep;
+        let enabled = account.sleep_enabled.unwrap_or(cfg.enabled);
+        let after = account.sleep_after_minutes.unwrap_or(cfg.after_minutes).max(1);
+        let check = account.sleep_check_minutes.unwrap_or(cfg.check_minutes);
+        (enabled, after, check)
+    }
+
+    fn is_running(&self, account_id: &str) -> bool {
+        self.processes
+            .lock()
+            .values()
+            .any(|p| p.accounts.contains(account_id))
+    }
+
+    fn tick_sleep(self: &Arc<Self>) {
+        let accounts = match self.db.list_accounts() {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let active = self.active_account.lock().clone();
+        let now = Instant::now();
+        for account in accounts {
+            if account.disabled {
+                continue;
+            }
+            if matches!(
+                account.status,
+                AccountStatus::AwaitingAuth | AccountStatus::Connecting | AccountStatus::Error
+            ) {
+                continue;
+            }
+            let (enabled, after_min, check_min) = self.resolved_sleep(&account);
+            if !enabled {
+                continue;
+            }
+            if active.as_deref() == Some(account.id.as_str()) {
+                continue;
+            }
+            let running = self.is_running(&account.id);
+            let last = *self
+                .last_activity
+                .lock()
+                .entry(account.id.clone())
+                .or_insert(now);
+            if running && last.elapsed() >= Duration::from_secs(u64::from(after_min) * 60) {
+                tracing::info!("hibernating account {}", account.name);
+                self.sleep_account(&account.id);
+                continue;
+            }
+            if !running
+                && self.sleeping.lock().contains(&account.id)
+                && check_min > 0
+            {
+                let due = self
+                    .last_check
+                    .lock()
+                    .get(&account.id)
+                    .map(|t| t.elapsed() >= Duration::from_secs(u64::from(check_min) * 60))
+                    .unwrap_or(true);
+                if due {
+                    self.last_check
+                        .lock()
+                        .insert(account.id.clone(), Instant::now());
+                    tracing::info!("hibernation check for {}", account.name);
+                    let this = Arc::clone(self);
+                    let id = account.id.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = this.ensure_running(&id);
+                        tokio::time::sleep(Duration::from_secs(45)).await;
+                        if this.active_account.lock().as_deref() != Some(id.as_str()) {
+                            this.sleep_account(&id);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    pub async fn send_message(
+        self: &Arc<Self>,
         account_id: &str,
         conversation_id: &str,
         text: &str,
     ) -> Result<Message, String> {
+        let _ = self.ensure_running(account_id);
         let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
         let msg = Message {
             id: Uuid::new_v4().to_string(),
@@ -490,6 +696,7 @@ impl ConnectorManager {
             pinned: false,
         };
         self.db.insert_message(&msg).map_err(|e| e.to_string())?;
+        self.touch_activity(account_id);
         let conv = self.db.get_conversation(conversation_id).unwrap_or(conv);
 
         let _ = self.send_to_connector(
@@ -515,7 +722,7 @@ impl ConnectorManager {
     }
 
     pub async fn send_attachment(
-        &self,
+        self: &Arc<Self>,
         account_id: &str,
         conversation_id: &str,
         kind: &str,
@@ -529,6 +736,7 @@ impl ConnectorManager {
         options: Vec<String>,
         max_answer: Option<i32>,
     ) -> Result<Message, String> {
+        let _ = self.ensure_running(account_id);
         let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
         let body = match kind {
             "location" => caption
@@ -602,6 +810,7 @@ impl ConnectorManager {
             pinned: false,
         };
         self.db.insert_message(&msg).map_err(|e| e.to_string())?;
+        self.touch_activity(account_id);
         let conv = self.db.get_conversation(conversation_id).unwrap_or(conv);
 
         let b64_len = data_base64.map(|s| s.len()).unwrap_or(0);
@@ -826,72 +1035,110 @@ impl ConnectorManager {
 
     pub fn stop_connector(&self, account_id: &str) {
         self.do_not_restart.lock().insert(account_id.to_string());
-        self.kill_running(account_id);
+        self.sleeping.lock().remove(account_id);
+        self.detach_account(account_id, true);
     }
 
-    fn kill_running(&self, account_id: &str) {
-        if let Some(mut running) = self.processes.lock().remove(account_id) {
+    /// Drop one account from a shared sidecar. If it was the last account, kill the process.
+    fn detach_account(&self, account_id: &str, send_shutdown_if_last: bool) {
+        let mut map = self.processes.lock();
+        let Some(key) = map
+            .iter()
+            .find(|(_, p)| p.accounts.contains(account_id))
+            .map(|(k, _)| k.clone())
+        else {
+            return;
+        };
+        let empty = {
+            let Some(running) = map.get_mut(&key) else {
+                return;
+            };
+            running.accounts.remove(account_id);
             let _ = running.tx.send(
-                encode_line(&ConnectorRequest::Shutdown).unwrap_or_else(|_| "{\"type\":\"shutdown\"}\n".into()),
+                encode_line(&ConnectorRequest::Disconnect {
+                    account_id: account_id.to_string(),
+                })
+                .unwrap_or_else(|_| format!("{{\"type\":\"disconnect\",\"account_id\":\"{account_id}\"}}\n")),
             );
-            let _ = running.child.start_kill();
+            running.accounts.is_empty()
+        };
+        if empty {
+            if let Some(mut running) = map.remove(&key) {
+                if send_shutdown_if_last {
+                    let _ = running.tx.send(
+                        encode_line(&ConnectorRequest::Shutdown)
+                            .unwrap_or_else(|_| "{\"type\":\"shutdown\"}\n".into()),
+                    );
+                }
+                let _ = running.child.start_kill();
+            }
         }
     }
 
-    async fn on_connector_exit(self: &Arc<Self>, account_id: &str, connector_id: &str, generation: u64) {
-        {
+    async fn on_connector_exit(self: &Arc<Self>, connector_id: &str, generation: u64) {
+        let accounts: Vec<String> = {
             let mut map = self.processes.lock();
-            match map.get(account_id) {
+            match map.get(connector_id) {
                 Some(running) if running.generation == generation => {
-                    map.remove(account_id);
+                    let ids: Vec<String> = running.accounts.iter().cloned().collect();
+                    map.remove(connector_id);
+                    ids
                 }
                 _ => return,
             }
-        }
-        if self.do_not_restart.lock().contains(account_id) {
+        };
+        let restart: Vec<String> = accounts
+            .into_iter()
+            .filter(|id| {
+                !self.do_not_restart.lock().contains(id)
+                    && !self.sleeping.lock().contains(id)
+                    && self
+                        .db
+                        .get_account(id)
+                        .ok()
+                        .is_some_and(|a| !a.disabled)
+            })
+            .collect();
+        if restart.is_empty() {
             return;
         }
-        let account = match self.db.get_account(account_id) {
-            Ok(account) if !account.disabled => account,
-            _ => return,
-        };
-        let _ = self
-            .db
-            .update_account_status(account_id, AccountStatus::Connecting);
-        self.emit(
-            "account.status",
-            serde_json::json!({
-                "account_id": account_id,
-                "status": "connecting",
-            }),
-        );
         tracing::warn!(
-            "connector for {} exited; restarting in 2s",
-            account.name
+            "sidecar {} exited; restarting {} account(s) in 2s",
+            connector_id,
+            restart.len()
         );
         tokio::time::sleep(Duration::from_secs(2)).await;
-        if self.do_not_restart.lock().contains(account_id) {
-            return;
-        }
-        if self
-            .processes
-            .lock()
-            .get(account_id)
-            .is_some_and(|running| running.generation != generation)
-        {
-            return;
-        }
-        let creds = crate::secrets::load(&self.data_dir, account_id);
-        if let Err(e) = self.start_connector(connector_id, account_id, creds) {
-            tracing::warn!("restart {account_id}: {e}");
-            let _ = self.db.update_account_status(account_id, AccountStatus::Error);
+        for account_id in restart {
+            if self.do_not_restart.lock().contains(&account_id)
+                || self.sleeping.lock().contains(&account_id)
+            {
+                continue;
+            }
+            if self.is_running(&account_id) {
+                continue;
+            }
+            let _ = self
+                .db
+                .update_account_status(&account_id, AccountStatus::Connecting);
             self.emit(
-                "account.error",
+                "account.status",
                 serde_json::json!({
                     "account_id": account_id,
-                    "message": e,
+                    "status": "connecting",
                 }),
             );
+            let creds = crate::secrets::load(&self.data_dir, &account_id);
+            if let Err(e) = self.start_connector(connector_id, &account_id, creds) {
+                tracing::warn!("restart {account_id}: {e}");
+                let _ = self.db.update_account_status(&account_id, AccountStatus::Error);
+                self.emit(
+                    "account.error",
+                    serde_json::json!({
+                        "account_id": account_id,
+                        "message": e,
+                    }),
+                );
+            }
         }
     }
 }
@@ -1327,7 +1574,7 @@ fn apply_forward_rules(db: &Database, conv: &Conversation, msg: &Message) {
         .workspace_id
         .as_deref()
         .or_else(|| account.as_ref().and_then(|a| a.workspace_id.as_deref()))
-        .unwrap_or("others");
+        .unwrap_or("default");
     let already_forwarded = msg
         .metadata
         .get("forwarded_from")

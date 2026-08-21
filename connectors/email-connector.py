@@ -27,6 +27,7 @@ from shuttle_ipc import (
     log,
     now_iso,
     read_line,
+    req_account_id,
     send,
     to_rfc3339,
 )
@@ -253,13 +254,15 @@ class EmailSession:
 
 
 def main() -> None:
-    session: Optional[EmailSession] = None
-    account_id = os.environ.get("SHUTTLE_ACCOUNT_ID")
+    sessions: dict[str, EmailSession] = {}
+    fallback_id = os.environ.get("SHUTTLE_ACCOUNT_ID")
     while True:
         req = read_line()
         if req is None:
             break
         rtype = req.get("type")
+        account_id = req_account_id(req, fallback_id)
+        session = sessions.get(account_id) if account_id else None
         if rtype == "handshake":
             send(
                 {
@@ -270,13 +273,19 @@ def main() -> None:
                 }
             )
         elif rtype in {"authenticate", "connect"}:
-            account_id = req.get("account_id") or account_id
+            if not account_id:
+                emit_error("missing account_id")
+                continue
             try:
+                old = sessions.pop(account_id, None)
+                if old:
+                    old.shutdown()
                 session = EmailSession(account_id, creds(req))
+                sessions[account_id] = session
                 session.start()
             except Exception as e:
                 log(CONNECTOR_ID, str(e))
-                emit_error(str(e))
+                emit_error(str(e), account_id)
         elif rtype == "submit_auth":
             if session:
                 session.submit(creds(req))
@@ -288,12 +297,18 @@ def main() -> None:
             if session:
                 session.send_text(req.get("conversation_id") or "", req.get("text") or "")
             else:
-                emit_error("not connected")
+                emit_error("not connected", account_id)
         elif rtype == "mark_read":
             send({"type": "ok", "request_id": None})
-        elif rtype in {"shutdown", "disconnect"}:
-            if session:
-                session.shutdown()
+        elif rtype == "disconnect":
+            if account_id:
+                old = sessions.pop(account_id, None)
+                if old:
+                    old.shutdown()
+        elif rtype == "shutdown":
+            for old in sessions.values():
+                old.shutdown()
+            sessions.clear()
             break
 
 

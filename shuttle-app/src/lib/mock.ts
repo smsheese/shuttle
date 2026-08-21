@@ -333,6 +333,11 @@ let appConfig: AppConfig = {
     crash_reports: false,
     usage_diagnostics: false,
   },
+  sleep: {
+    enabled: true,
+    after_minutes: 5,
+    check_minutes: 15,
+  },
   channel_styles: {
     whatsapp: { tag: '#25D366' },
     telegram: { tag: '#2AABEE' },
@@ -373,6 +378,8 @@ export const mockApi = {
     accounts = accounts.map((a) => (a.id === id ? { ...a, ...patch } : a));
     return accounts.find((a) => a.id === id)!;
   },
+  wakeAccount: async (_accountId: string) => 'already running',
+  setActiveAccount: async (_accountId: string | null) => {},
   connectAccount: async (_accountId?: string) => 'ok',
   listConversations: async (
     accountId?: string,
@@ -382,7 +389,7 @@ export const mockApi = {
   ) => {
     let list = accountId ? conversations.filter((c) => c.account_id === accountId) : conversations;
     list = list.filter((c) => (archivedOnly ? c.archived : !c.archived));
-    if (workspaceId) list = list.filter((c) => (c.workspace_id ?? 'others') === workspaceId);
+    if (workspaceId) list = list.filter((c) => (c.workspace_id ?? 'default') === workspaceId);
     if (priorityGroup) list = list.filter((c) => c.priority_group === priorityGroup);
     return list;
   },
@@ -488,7 +495,13 @@ export const mockApi = {
         (c.last_message_preview?.toLowerCase().includes(q) ?? false)
     );
   },
-  totalUnread: async () => conversations.reduce((s, c) => s + c.unread_count, 0),
+  totalUnread: async () =>
+    conversations.reduce((s, c) => {
+      if (c.archived || c.muted) return s;
+      const account = accounts.find((a) => a.id === c.account_id);
+      if (account?.muted) return s;
+      return s + c.unread_count;
+    }, 0),
   getAppConfig: async () => appConfig,
   saveAppConfig: async (cfg: AppConfig) => {
     appConfig = cfg;
@@ -620,6 +633,9 @@ export const mockApi = {
       send_at: draft.send_at,
       sent: false,
       created_at: new Date().toISOString(),
+      attempts: 0,
+      last_error: null,
+      failed: false,
     };
     scheduledMessages = [...scheduledMessages, msg];
     return msg;
@@ -639,10 +655,11 @@ export const mockApi = {
     );
     return scheduledMessages.find((msg) => msg.id === id)!;
   },
-  exportBackup: async (_path: string, _password: string, includeMessages = true) =>
+  exportBackup: async (_path: string, _password: string, includeMessages = true, includeMedia = false) =>
     ({
       exported_at: new Date().toISOString(),
       includes_messages: includeMessages,
+      includes_media: includeMedia,
     }) satisfies BackupManifest,
   restoreBackup: async (_path?: string, _password?: string) => {},
   onShuttleEvent: async () => () => {},

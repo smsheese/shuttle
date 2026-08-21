@@ -14,6 +14,7 @@
     deletePriorityGroup,
     deleteScheduledMessage,
     deleteWorkspace,
+    downloadMessageMedia,
     exportBackup,
     fetchConversationAvatar,
     fetchContactProfile,
@@ -44,6 +45,9 @@
     syncConversation,
     totalUnread,
     updateAccount,
+    updateTrayUnread,
+    wakeAccount,
+    setActiveAccount,
     updateConversation,
     updateForwardRule,
   } from '$lib/api';
@@ -54,10 +58,13 @@
   import ContextMenu from '$lib/components/ContextMenu.svelte';
   import ConversationList from '$lib/components/ConversationList.svelte';
   import RemindModal from '$lib/components/RemindModal.svelte';
+  import QuickSwitch from '$lib/components/QuickSwitch.svelte';
   import SettingsPanel from '$lib/components/SettingsPanel.svelte';
   import Sidebar from '$lib/components/Sidebar.svelte';
   import ThreadView from '$lib/components/ThreadView.svelte';
+  import { isModKey, isTypingTarget } from '$lib/shortcuts';
   import { normalizeRichText } from '$lib/richText';
+  import { isDownloadableMedia, mediaFilename, mediaKindFromMessage, resolveMediaUrl } from '$lib/messageMedia';
   import { applyAppConfig } from '$lib/theme';
   import { initTelemetry, markAppReady } from '$lib/telemetry';
   import { selectionContext, urlsIn } from '$lib/structuredText';
@@ -102,6 +109,11 @@
       crash_reports: false,
       usage_diagnostics: false,
     },
+    sleep: {
+      enabled: true,
+      after_minutes: 5,
+      check_minutes: 15,
+    },
     channel_styles: {},
     media_retention: {},
   });
@@ -138,6 +150,9 @@
   let forwardSendAt = $state('');
   let remindOpen = $state(false);
   let remindNoteSeed = $state('');
+  let quickSwitchOpen = $state(false);
+  let focusSearchNonce = $state(0);
+  let listFocusId = $state<string | null>(null);
 
   const setupOnly = $derived(page.url.searchParams.get('setup') === '1');
   const settingsOpen = $derived(mobileTab === 'settings');
@@ -280,20 +295,37 @@
     );
   }
 
+  async function activateAccount(accountId: string | null) {
+    await setActiveAccount(accountId);
+    if (!accountId) return;
+    const account = accounts.find((a) => a.id === accountId);
+    if (!account || account.disabled || account.status !== 'sleeping') return;
+    try {
+      await wakeAccount(accountId);
+    } catch (e) {
+      console.error('wake account failed', e);
+    }
+  }
+
   async function selectConversation(id: string) {
     selectedConversationId = id;
+    listFocusId = id;
     mobileView = 'thread';
     contactOpen = false;
+    const conv = conversations.find((c) => c.id === id);
+    if (conv) await activateAccount(conv.account_id);
     await loadMessages(id);
   }
 
   async function selectAccount(id: string | null) {
     selectedAccountId = id;
     selectedConversationId = null;
+    listFocusId = null;
     showArchived = false;
     messages = [];
     mobileView = 'list';
     mobileTab = 'inbox';
+    await activateAccount(id);
     await refresh();
   }
 
@@ -336,6 +368,7 @@
   async function jumpToSearchHit(hit: SearchMessageHit) {
     selectedConversationId = hit.message.conversation_id;
     mobileView = 'thread';
+    await activateAccount(hit.account_id);
     messages = await getMessages(hit.message.conversation_id);
     searchQuery = '';
     searchMessageHits = [];
@@ -431,6 +464,8 @@
         { id: 'pin', label: conv.pinned ? 'Unpin' : 'Pin' },
         { id: 'mute', label: conv.muted ? 'Unmute' : 'Mute' },
         { id: 'archive', label: conv.archived ? 'Unarchive' : 'Archive' },
+        { id: 'notes', label: 'Notes' },
+        { id: 'remind', label: 'Remind' },
         { id: 'unread', label: 'Mark unread' },
         { id: 'sep1', label: '', separator: true },
         ...workspaces.map((w) => ({ id: `ws:${w.id}`, label: `Workspace: ${w.name}` })),
@@ -449,7 +484,14 @@
         else if (id === 'pin') await updateConversation(conv.id, { pinned: !conv.pinned });
         else if (id === 'mute') await updateConversation(conv.id, { muted: !conv.muted });
         else if (id === 'archive') await updateConversation(conv.id, { archived: !conv.archived });
-        else if (id === 'unread') await markUnread(conv.id);
+        else if (id === 'notes') {
+          if (selectedConversation?.id !== conv.id) await selectConversation(conv.id);
+          panelOpen = true;
+        } else if (id === 'remind') {
+          await selectConversation(conv.id);
+          remindNoteSeed = conv.title ?? '';
+          remindOpen = true;
+        } else if (id === 'unread') await markUnread(conv.id);
         else if (id.startsWith('ws:')) await updateConversation(conv.id, { workspace_id: id.slice(3) });
         else if (id.startsWith('pg:')) await updateConversation(conv.id, { priority_group: id.slice(3) });
         else if (id === 'clear-pg') await updateConversation(conv.id, { clear_priority: true });
@@ -471,13 +513,28 @@
       [
         { id: 'mute', label: account.muted ? 'Unmute account' : 'Mute account' },
         { id: 'disable', label: account.disabled ? 'Enable account' : 'Disable account' },
+        ...(account.status === 'sleeping' && !account.disabled
+          ? [{ id: 'wake', label: 'Wake account' }]
+          : []),
         { id: 'receipts', label: account.send_receipts ? 'Disable read receipts' : 'Enable read receipts' },
+        { id: 'sep-ws', label: '', separator: true },
+        ...workspaces.map((w) => ({ id: `ws:${w.id}`, label: `Workspace: ${w.name}` })),
         { id: 'sep', label: '', separator: true },
         { id: 'remove', label: 'Remove account', danger: true },
       ],
       async (id) => {
         if (id === 'disable') {
           await handleAccount(account.id, account.disabled ? 'enable' : 'disable');
+        } else if (id === 'wake') {
+          if (account.disabled || account.status !== 'sleeping') return;
+          try {
+            await wakeAccount(account.id);
+            await refresh();
+          } catch (e) {
+            console.error('wake account failed', e);
+          }
+        } else if (id.startsWith('ws:')) {
+          await handleAccount(account.id, 'workspace', id.slice(3));
         } else {
           await handleAccount(account.id, id as 'mute' | 'remove' | 'receipts');
         }
@@ -508,6 +565,31 @@
     await refresh();
   }
 
+  async function saveMessageMedia(msg: Message) {
+    if (!selectedConversation) return;
+    if (!isDownloadableMedia(msg)) return;
+    let url = await resolveMediaUrl(msg);
+    if (!url) {
+      try {
+        await downloadMessageMedia(
+          selectedConversation.account_id,
+          selectedConversation.id,
+          msg.id
+        );
+        url = await resolveMediaUrl(msg);
+      } catch {
+        return;
+      }
+    }
+    if (!url) return;
+    const kind = mediaKindFromMessage(msg);
+    const name = mediaFilename(msg) ?? `${kind ?? 'media'}-${msg.id.slice(0, 8)}`;
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    a.click();
+  }
+
   function msgMenu(msg: Message, x: number, y: number) {
     const urls = urlsIn(msg.body);
     openMenu(
@@ -521,6 +603,7 @@
         { id: msg.pinned ? 'unpin' : 'pin', label: msg.pinned ? 'Unpin' : 'Pin' },
         { id: 'todo', label: 'Add to todo list' },
         { id: 'remind', label: 'Remind me about this chat' },
+        ...(isDownloadableMedia(msg) ? [{ id: 'save-media', label: 'Save media' }] : []),
         ...urls.map((u, i) => ({ id: `url:${i}`, label: `Open ${u.slice(0, 40)}` })),
       ],
       async (id) => {
@@ -543,6 +626,8 @@
         } else if (id === 'remind' && selectedConversation) {
           remindNoteSeed = msg.body.trim();
           remindOpen = true;
+        } else if (id === 'save-media') {
+          await saveMessageMedia(msg);
         } else if (id.startsWith('url:')) {
           const u = urls[Number(id.slice(4))];
           if (u) await openExternal(u);
@@ -581,6 +666,128 @@
     });
   }
 
+  function focusedConversation(): Conversation | null {
+    const id = listFocusId ?? selectedConversationId;
+    if (!id) return null;
+    return conversations.find((c) => c.id === id) ?? null;
+  }
+
+  function moveListFocus(delta: number) {
+    if (conversations.length === 0) return;
+    const currentId = listFocusId ?? selectedConversationId;
+    let idx = currentId ? conversations.findIndex((c) => c.id === currentId) : -1;
+    if (idx < 0) idx = delta > 0 ? -1 : conversations.length;
+    const next = (idx + delta + conversations.length) % conversations.length;
+    listFocusId = conversations[next]?.id ?? null;
+  }
+
+  async function toggleFocusedArchive() {
+    const conv = focusedConversation();
+    if (!conv) return;
+    await updateConversation(conv.id, { archived: !conv.archived });
+    await refresh();
+  }
+
+  async function toggleFocusedMute() {
+    const conv = focusedConversation();
+    if (!conv) return;
+    await updateConversation(conv.id, { muted: !conv.muted });
+    await refresh();
+  }
+
+  async function markFocusedUnread() {
+    const conv = focusedConversation();
+    if (!conv) return;
+    await markUnread(conv.id);
+    await refresh();
+  }
+
+  function handleGlobalKeydown(e: KeyboardEvent) {
+    const typing = isTypingTarget(e.target);
+    const key = e.key.toLowerCase();
+
+    if (isModKey(e) && key === 'k') {
+      e.preventDefault();
+      quickSwitchOpen = true;
+      return;
+    }
+
+    if (key === 'escape') {
+      if (quickSwitchOpen) {
+        e.preventDefault();
+        quickSwitchOpen = false;
+        return;
+      }
+      if (contactOpen) {
+        e.preventDefault();
+        contactOpen = false;
+        return;
+      }
+      if (panelOpen) {
+        e.preventDefault();
+        panelOpen = false;
+        return;
+      }
+      return;
+    }
+
+    if (typing || quickSwitchOpen || settingsOpen || showSetup) return;
+
+    if (key === '/') {
+      e.preventDefault();
+      focusSearchNonce += 1;
+      return;
+    }
+
+    if (key === 'j' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      moveListFocus(1);
+      return;
+    }
+
+    if (key === 'k' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      moveListFocus(-1);
+      return;
+    }
+
+    if (e.key === 'Enter') {
+      const id = listFocusId ?? selectedConversationId;
+      if (id && id !== selectedConversationId) {
+        e.preventDefault();
+        void selectConversation(id);
+      }
+      return;
+    }
+
+    if (key === 'e') {
+      e.preventDefault();
+      void toggleFocusedArchive();
+      return;
+    }
+
+    if (key === 'm') {
+      e.preventDefault();
+      void toggleFocusedMute();
+      return;
+    }
+
+    if (key === 'u') {
+      e.preventDefault();
+      void markFocusedUnread();
+    }
+  }
+
+  $effect(() => {
+    void updateTrayUnread(unreadTotal);
+  });
+
+  $effect(() => {
+    if (selectedConversationId && !listFocusId) {
+      listFocusId = selectedConversationId;
+    }
+  });
+
   onMount(() => {
     const startedAt = performance.now();
     void initTelemetry();
@@ -590,6 +797,7 @@
     };
     measureExtras();
     window.addEventListener('resize', measureExtras);
+    window.addEventListener('keydown', handleGlobalKeydown);
     listConnectors().then((c) => (connectors = c));
     getAppConfig().then((cfg) => {
       appConfig = cfg;
@@ -670,6 +878,7 @@
 
     return () => {
       window.removeEventListener('resize', measureExtras);
+      window.removeEventListener('keydown', handleGlobalKeydown);
       unsub.then((fn) => fn());
     };
   });
@@ -743,6 +952,8 @@
         oncontext={convMenu}
         {channelColor}
         datetimeFormat={appConfig.appearance.datetime_format || '12h_full'}
+        {focusSearchNonce}
+        highlightId={listFocusId}
       />
     </div>
 
@@ -759,6 +970,10 @@
         onadd={() => (showSetup = true)}
         onconfig={persistConfig}
         onaccount={handleAccount}
+        onaccountpatch={async (id, patch) => {
+          await updateAccount(id, patch);
+          await refresh();
+        }}
         onworkspace={async (name: string) => {
           await createWorkspace(name);
           workspaces = await listWorkspaces();
@@ -796,12 +1011,17 @@
           await deleteScheduledMessage(id);
           scheduledMessages = await listScheduledMessages();
         }}
-        onexportbackup={async (path: string, password: string, includeMessages: boolean) => {
-          if (!path.trim() || !password) return;
-          await exportBackup(path.trim(), password, includeMessages);
+        onexportbackup={async (
+          path: string,
+          password: string,
+          includeMessages: boolean,
+          includeMedia: boolean
+        ) => {
+          if (!path.trim() || !password) throw new Error('Export path and password are required.');
+          await exportBackup(path.trim(), password, includeMessages, includeMedia);
         }}
         onrestorebackup={async (path: string, password: string) => {
-          if (!path.trim() || !password) return;
+          if (!path.trim() || !password) throw new Error('Restore path and password are required.');
           await restoreBackup(path.trim(), password);
         }}
         onaccountmenu={accountMenu}
@@ -927,6 +1147,27 @@
 />
 
 <CallPanel call={activeCall} onclose={() => (activeCall = null)} />
+
+<QuickSwitch
+  open={quickSwitchOpen}
+  {conversations}
+  {accounts}
+  {workspaces}
+  onclose={() => (quickSwitchOpen = false)}
+  onpickConversation={async (id) => {
+    quickSwitchOpen = false;
+    await selectConversation(id);
+  }}
+  onpickAccount={async (id) => {
+    quickSwitchOpen = false;
+    await selectAccount(id);
+  }}
+  onpickWorkspace={async (id) => {
+    quickSwitchOpen = false;
+    selectedWorkspace = id;
+    await refresh();
+  }}
+/>
 
 <AccountSetup
   open={showSetup || setupOnly}

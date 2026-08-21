@@ -9,9 +9,10 @@ mod models;
 mod notifications;
 mod secrets;
 mod telemetry;
+mod tray;
 
 use commands::{init_state, APP_HANDLE};
-use tauri::Manager;
+use tauri::{Manager, WindowEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -19,6 +20,7 @@ pub fn run() {
     tracing_subscriber::fmt::init();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let state = init_state(app.handle());
@@ -32,7 +34,17 @@ pub fn run() {
                     let _ = win.set_icon(img);
                 }
             }
+            tray::setup_tray(app)?;
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_accounts,
@@ -94,6 +106,7 @@ pub fn run() {
             commands::update_scheduled_message,
             commands::export_backup,
             commands::restore_backup,
+            commands::restart_app,
             commands::open_external,
             commands::open_devtools,
             commands::forward_message,
@@ -102,11 +115,14 @@ pub fn run() {
             commands::telemetry_error,
             commands::telemetry_performance,
             commands::telemetry_set_foreground,
+            commands::wake_account,
+            commands::set_active_account,
             commands::fetch_tweakcn_theme,
             commands::get_connector_requirements,
             commands::get_installed_components,
             commands::ensure_connector_components,
             commands::cancel_component_install,
+            tray::update_tray_unread,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

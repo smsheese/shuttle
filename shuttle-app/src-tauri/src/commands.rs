@@ -131,6 +131,17 @@ pub fn update_account(
 }
 
 #[tauri::command]
+pub fn wake_account(state: State<'_, AppState>, account_id: String) -> Result<String, String> {
+    state.connectors.wake_account(&account_id)
+}
+
+#[tauri::command]
+pub fn set_active_account(state: State<'_, AppState>, account_id: Option<String>) -> Result<(), String> {
+    state.connectors.set_active_account(account_id);
+    Ok(())
+}
+
+#[tauri::command]
 pub fn list_conversations(
     state: State<'_, AppState>,
     account_id: Option<String>,
@@ -786,9 +797,17 @@ pub fn export_backup(
     path: String,
     password: String,
     include_messages: Option<bool>,
+    include_media: Option<bool>,
 ) -> Result<BackupManifest, String> {
     let includes_messages = include_messages.unwrap_or(true);
-    export_backup_bundle(state.connectors.data_dir(), &path, &password, includes_messages)
+    let includes_media = include_media.unwrap_or(false);
+    export_backup_bundle(
+        state.connectors.data_dir(),
+        &path,
+        &password,
+        includes_messages,
+        includes_media,
+    )
 }
 
 #[tauri::command]
@@ -798,6 +817,12 @@ pub fn restore_backup(
     password: String,
 ) -> Result<(), String> {
     restore_backup_bundle(state.connectors.data_dir(), &path, &password)
+}
+
+#[tauri::command]
+pub fn restart_app(app: AppHandle) -> Result<(), String> {
+    app.request_restart();
+    Ok(())
 }
 
 #[tauri::command]
@@ -887,22 +912,39 @@ fn spawn_scheduled_message_loop(app: AppHandle, db: Arc<Database>, connectors: A
                 continue;
             };
             for msg in due {
-                let sent = connectors
+                match connectors
                     .send_message(&msg.dest_account_id, &msg.dest_conversation_id, &msg.body)
-                    .await;
-                if sent.is_ok() {
-                    let _ = db.mark_scheduled_message_sent(&msg.id);
-                    let _ = app.emit(
-                        "shuttle-event",
-                        AppEvent {
-                            kind: "scheduled_message.sent".into(),
-                            payload: serde_json::json!({
-                                "scheduled_message_id": msg.id,
-                                "conversation_id": msg.dest_conversation_id,
-                                "account_id": msg.dest_account_id,
-                            }),
-                        },
-                    );
+                    .await
+                {
+                    Ok(_) => {
+                        let _ = db.mark_scheduled_message_sent(&msg.id);
+                        let _ = app.emit(
+                            "shuttle-event",
+                            AppEvent {
+                                kind: "scheduled_message.sent".into(),
+                                payload: serde_json::json!({
+                                    "scheduled_message_id": msg.id,
+                                    "conversation_id": msg.dest_conversation_id,
+                                    "account_id": msg.dest_account_id,
+                                }),
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        let _ = db.mark_scheduled_message_attempt(&msg.id, &e, false);
+                        let _ = app.emit(
+                            "shuttle-event",
+                            AppEvent {
+                                kind: "scheduled_message.failed".into(),
+                                payload: serde_json::json!({
+                                    "scheduled_message_id": msg.id,
+                                    "conversation_id": msg.dest_conversation_id,
+                                    "account_id": msg.dest_account_id,
+                                    "error": e,
+                                }),
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -947,6 +989,7 @@ pub fn init_state(app: &AppHandle) -> AppState {
     spawn_event_forwarder(app.clone(), connectors.clone());
     spawn_reminder_loop(app.clone(), db.clone());
     spawn_scheduled_message_loop(app.clone(), db.clone(), connectors.clone());
+    connectors.spawn_sleep_loop();
     connectors.resume_saved_accounts();
 
     AppState {
@@ -965,15 +1008,24 @@ fn export_backup_bundle(
     output_path: &str,
     password: &str,
     include_messages: bool,
+    include_media: bool,
 ) -> Result<BackupManifest, String> {
     let temp = tempdir().map_err(|e| e.to_string())?;
     let root = temp.path().join("shuttle-backup");
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     copy_backup_subset(data_dir, &root, include_messages).map_err(|e| e.to_string())?;
+    if include_media {
+        let media_root = crate::media_store::shuttle_documents_root();
+        if media_root.exists() {
+            copy_dir_recursive(&media_root, &root.join("user-media"))
+                .map_err(|e| e.to_string())?;
+        }
+    }
 
     let manifest = BackupManifest {
         exported_at: chrono::Utc::now().to_rfc3339(),
         includes_messages: include_messages,
+        includes_media: include_media,
     };
     fs::write(
         root.join("manifest.json"),
@@ -1016,7 +1068,16 @@ fn restore_backup_bundle(data_dir: &Path, input_path: &str, password: &str) -> R
     if !unpacked.exists() {
         return Err("Backup archive missing shuttle-backup root".into());
     }
-    merge_backup_tree(&unpacked, data_dir).map_err(|e| e.to_string())
+    let user_media = unpacked.join("user-media");
+    let has_user_media = user_media.is_dir();
+    merge_backup_tree(&unpacked, data_dir, has_user_media.then_some("user-media"))
+        .map_err(|e| e.to_string())?;
+    if has_user_media {
+        let dest = crate::media_store::shuttle_documents_root();
+        fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+        merge_backup_tree(&user_media, &dest, None).map_err(|e| e.to_string())?;
+    }
+    restrict_restored_secrets(data_dir).map_err(|e| e.to_string())
 }
 
 fn copy_backup_subset(src: &Path, dest: &Path, include_messages: bool) -> std::io::Result<()> {
@@ -1049,12 +1110,16 @@ fn copy_backup_subset(src: &Path, dest: &Path, include_messages: bool) -> std::i
     Ok(())
 }
 
-fn merge_backup_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
+fn merge_backup_tree(src: &Path, dest: &Path, skip_dir: Option<&str>) -> std::io::Result<()> {
     for entry in fs::read_dir(src)? {
         let entry = entry?;
+        let name = entry.file_name();
+        if skip_dir.is_some_and(|skip| name == skip) {
+            continue;
+        }
         let file_type = entry.file_type()?;
         let from = entry.path();
-        let to = dest.join(entry.file_name());
+        let to = dest.join(&name);
         if file_type.is_dir() {
             copy_dir_recursive(&from, &to)?;
         } else {
@@ -1062,6 +1127,25 @@ fn merge_backup_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
                 fs::create_dir_all(parent)?;
             }
             fs::copy(from, to)?;
+        }
+    }
+    Ok(())
+}
+
+fn restrict_restored_secrets(data_dir: &Path) -> std::io::Result<()> {
+    let secrets_dir = data_dir.join("secrets");
+    if !secrets_dir.is_dir() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&secrets_dir, fs::Permissions::from_mode(0o700));
+        for entry in fs::read_dir(&secrets_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                let _ = fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o600));
+            }
         }
     }
     Ok(())

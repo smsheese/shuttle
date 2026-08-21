@@ -1,5 +1,9 @@
 # Shuttle — Agent notes
 
+## Product north star
+
+Prefer designs that keep Shuttle the **obvious low-resource** messaging hub: lightweight and responsive, cross-platform, strong QoL — without making connectors harder to write. Do not trade idle RSS or wake latency for Electron-style webview parity. Details and the Ferdium resource bar: [`docs/roadmap.md`](docs/roadmap.md), principles in [`docs/overview.md`](docs/overview.md).
+
 ## Changelog
 
 Update [`CHANGELOG.md`](CHANGELOG.md) in the same change set whenever you:

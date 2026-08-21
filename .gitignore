@@ -77,3 +77,6 @@ connectors/signal/*.zip
 screenshots/
 progress.html
 progress.json
+
+# Accidental local media dumps under the repo root (account UUID dirs)
+/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*/

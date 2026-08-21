@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { acceptCall, hangupCall, rejectCall } from '$lib/api';
+  import { rejectCall } from '$lib/api';
   import type { CallState } from '$lib/types';
 
   interface Props {
@@ -9,36 +9,19 @@
 
   let { call, onclose }: Props = $props();
 
-  let muted = $state(false);
-  let videoOn = $state(true);
-  let shareScreen = $state(false);
-
   const isIncoming = $derived(call?.direction === 'inbound');
-  const isVideo = $derived(call?.mode === 'video');
+  const isRinging = $derived(call?.status === 'ringing');
   const statusLabel = $derived(
-    call?.status === 'connected'
-      ? 'Connected'
-      : call?.status === 'ringing'
-        ? isIncoming
-          ? 'Incoming call'
-          : 'Calling…'
-        : call?.status ?? ''
+    isRinging
+      ? isIncoming
+        ? 'Incoming call'
+        : 'Calling…'
+      : call?.status ?? ''
   );
 
-  async function accept() {
-    if (!call) return;
-    await acceptCall(call.account_id, call.call_id);
-  }
-
-  async function reject() {
+  async function decline() {
     if (!call) return;
     await rejectCall(call.account_id, call.call_id);
-    onclose();
-  }
-
-  async function hangup() {
-    if (!call) return;
-    await hangupCall(call.account_id, call.call_id);
     onclose();
   }
 </script>
@@ -46,35 +29,17 @@
 {#if call}
   <div class="overlay" role="dialog" aria-modal="true" aria-label="Call">
     <div class="panel">
-      <div class="status">{statusLabel}</div>
-      <div class="name">{call.remote_name ?? 'Call'}</div>
-      <div class="mode">{isVideo ? 'Video call' : 'Voice call'}</div>
-
-      {#if isVideo}
-        <div class="preview">
-          <div class="preview-box local">You</div>
-          <div class="preview-box remote">{call.remote_name ?? 'Remote'}</div>
-        </div>
+      {#if statusLabel}
+        <div class="status">{statusLabel}</div>
       {/if}
+      <div class="name">{call.remote_name ?? 'Call'}</div>
+      <p class="notice">Calling isn't available in this build.</p>
 
       <div class="controls">
-        {#if isIncoming && call.status === 'ringing'}
-          <button type="button" class="ctrl accept" onclick={accept}>Accept</button>
-          <button type="button" class="ctrl reject" onclick={reject}>Decline</button>
-        {:else}
-          <button type="button" class="ctrl" class:active={muted} onclick={() => (muted = !muted)}>
-            {muted ? 'Unmute' : 'Mute'}
-          </button>
-          {#if isVideo}
-            <button type="button" class="ctrl" class:active={!videoOn} onclick={() => (videoOn = !videoOn)}>
-              {videoOn ? 'Video off' : 'Video on'}
-            </button>
-            <button type="button" class="ctrl" class:active={shareScreen} onclick={() => (shareScreen = !shareScreen)}>
-              Share screen
-            </button>
-          {/if}
-          <button type="button" class="ctrl hangup" onclick={hangup}>Hang up</button>
+        {#if isIncoming && isRinging}
+          <button type="button" class="ctrl decline" onclick={decline}>Decline</button>
         {/if}
+        <button type="button" class="ctrl dismiss" onclick={onclose}>Dismiss</button>
       </div>
     </div>
   </div>
@@ -93,15 +58,16 @@
   }
 
   .panel {
-    width: min(420px, 100%);
+    width: min(360px, 100%);
     background: var(--bg-panel);
     border-radius: 16px;
     padding: 24px;
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 10px;
     align-items: center;
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+    text-align: center;
   }
 
   .status {
@@ -116,27 +82,11 @@
     font-weight: 600;
   }
 
-  .mode {
-    font-size: 13px;
+  .notice {
+    margin: 0;
+    font-size: 14px;
     color: var(--text-muted);
-  }
-
-  .preview {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-    width: 100%;
-  }
-
-  .preview-box {
-    aspect-ratio: 4/3;
-    border-radius: 10px;
-    background: var(--bg-hover);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 12px;
-    color: var(--text-muted);
+    line-height: 1.4;
   }
 
   .controls {
@@ -149,7 +99,7 @@
   }
 
   .ctrl {
-    padding: 10px 14px;
+    padding: 10px 18px;
     border-radius: 999px;
     border: 1px solid var(--border-subtle);
     background: var(--bg-hover);
@@ -157,22 +107,13 @@
     font-size: 13px;
   }
 
-  .ctrl.active {
-    background: var(--accent, #3b82f6);
-    color: #fff;
-    border-color: transparent;
-  }
-
-  .ctrl.accept {
-    background: #22c55e;
-    color: #fff;
-    border-color: transparent;
-  }
-
-  .ctrl.reject,
-  .ctrl.hangup {
+  .ctrl.decline {
     background: #ef4444;
     color: #fff;
     border-color: transparent;
+  }
+
+  .ctrl.dismiss {
+    min-width: 100px;
   }
 </style>

@@ -34,16 +34,23 @@ An account binds a user-facing label to a connector implementation.
 | `connector_id` | string | `whatsapp`, `telegram`, `signal`, `messenger`, `instagram`, `email`, `matrix` |
 | `name` | string | Display name chosen by the user |
 | `identity` | string? | Phone, @handle, etc. after auth |
-| `status` | enum | `disconnected`, `connecting`, `connected`, `error`, `awaiting_auth` |
+| `status` | enum | `disconnected`, `connecting`, `connected`, `error`, `awaiting_auth`, `sleeping` |
 | `metadata` | JSON object | Connector-specific state |
 | `created_at`, `updated_at` | datetime | |
 | `disabled` | bool | Stop sidecar, keep history, skip reconnect |
+| `sleep_enabled` | bool? | `NULL` inherits app hibernation default; `0` always on; `1` hibernate |
+| `sleep_after_minutes` | u32? | Idle minutes before hibernate; `NULL` inherits default (5) |
+| `sleep_check_minutes` | u32? | Periodic wake while asleep; `0` = only on user action; `NULL` inherits (15) |
 | `muted` | bool | Suppress notifications; still sync |
 | `workspace_id` | string? | Default workspace for chats without an override |
 | `notify_enabled` | bool? | `NULL` inherits app-wide; `0`/`1` force off/on |
 | `send_receipts` | bool | Default **false** — do not send remote read receipts until opted in |
 
 Disabled accounts cannot be started (`connect_account` / `start_connector` return an error). Enabling an account from the UI patches `disabled=false` and respawns the sidecar.
+
+Hibernating is distinct from disable: the account stays enabled, local history remains, and Shuttle may wake it on chat open, send, or a periodic check. Status is `sleeping`.
+
+`config.json` / app settings `sleep`: `enabled` (default true), `after_minutes` (5), `check_minutes` (15).
 
 ### Conversations (`accounts/<id>/inbox.sqlite`)
 
@@ -59,7 +66,7 @@ Disabled accounts cannot be started (`connect_account` / `start_connector` retur
 | `last_message_at` | datetime? | Sort key (message timestamp) |
 | `last_message_preview` | string? | Inbox snippet |
 | `pinned`, `archived`, `muted` | bool | UI flags; mute always wins over notify prefs |
-| `workspace_id` | string? | Chat override; else account workspace; else `others` |
+| `workspace_id` | string? | Chat override; else account workspace; else `default` |
 | `priority_group` | string? | e.g. `urgent`, `waiting`, `later`, or user-defined |
 | `notes` | string | Local-only freeform notes |
 | `notify_enabled` | bool? | Chat override of account / app notify |
@@ -94,9 +101,9 @@ Defined in `models.rs` and schema; populated by connectors during sync (not yet 
 
 ### Workspaces (`app.sqlite`)
 
-Named buckets. Seeded: `personal`, `work`, `others` (`builtin = 1`). Users can add more. Builtin rows cannot be deleted. Deleting a custom workspace nulls `accounts.workspace_id` and `conversations.workspace_id` that pointed at it.
+Named buckets. Seeded: `default` (`builtin = 1`). Users can add more. Builtin rows cannot be deleted. Deleting a custom workspace nulls `accounts.workspace_id` and `conversations.workspace_id` that pointed at it.
 
-A chat’s **effective workspace** is `conversation.workspace_id` → else `account.workspace_id` → else `others`.
+A chat’s **effective workspace** is `conversation.workspace_id` → else `account.workspace_id` → else `default`.
 
 ### Priority groups (`app.sqlite`)
 
@@ -136,7 +143,7 @@ Protocol version: **1** (`PROTOCOL_VERSION` in `connectors/protocol.rs`).
 
 ### Lifecycle
 
-1. Core spawns the connector (`python` + `*-connector.py`, or `{connector_id}-connector` in dev) with `SHUTTLE_ACCOUNT_ID` and `SHUTTLE_DATA_DIR` set.
+1. Core spawns **one sidecar process per connector type** (`python` + `*-connector.py`). Further accounts of the same network attach to that process with `authenticate` / `account_id`.
 2. Core sends `handshake` → sidecar replies `handshake_ok`.
 3. Core sends `authenticate` with `account_id` and stored `credentials` (from the keyring).
 4. Sidecar may reply `auth_required` (QR, phone, etc.) then `status` updates. Extra codes go through `submit_auth`.
@@ -242,7 +249,9 @@ All commands are registered in `lib.rs` and implemented in `commands.rs`.
 | `list_connectors` | — | `ConnectorInfo[]` | Static catalog |
 | `create_account` | `connector_id`, `name` | `Account` | Status `awaiting_auth` |
 | `delete_account` | `account_id` | `()` | Stops sidecar, wipes inbox dir + session + keyring |
-| `update_account` | `account_id`, `patch` | `Account` | Mute / disable / workspace / notify / receipts. Disable stops sidecar; enable respawns it |
+| `update_account` | `account_id`, `patch` | `Account` | Mute / disable / workspace / notify / receipts / hibernation. Disable stops sidecar; enable respawns it |
+| `wake_account` | `account_id` | `string` | Mark account active and start its sidecar if sleeping |
+| `set_active_account` | `account_id?` | `()` | Account the user is looking at; skipped by the hibernation timer |
 | `connect_account` | `account_id`, `credentials?` | `string` | Merges secrets, spawns sidecar. Fails if disabled |
 | `submit_auth` | `account_id`, `credentials` | `()` | SMS/2FA/etc. Persists persistable fields then forwards to sidecar |
 | `list_conversations` | `account_id?`, `workspace_id?`, `priority_group?` | `Conversation[]` | Omits archived |
@@ -257,7 +266,7 @@ All commands are registered in `lib.rs` and implemented in `commands.rs`.
 | `mark_read` | `conversation_id`, `send_remote?` | `()` | Always clears local unread. Remote receipt only if `send_remote` or policy (`should_send_receipt`) |
 | `mark_unread` | `conversation_id` | `()` | Local badge only |
 | `search_conversations` | `query` | `Conversation[]` | Title + body search |
-| `total_unread` | — | `number` | Sum of non-archived unreads |
+| `total_unread` | — | `number` | Sum of non-archived, non-muted unreads (muted accounts excluded) |
 | `get_app_config` | — | `AppConfig` | From `config.json` |
 | `save_app_config` | `config` | `AppConfig` | Writes `config.json` |
 | `list_workspaces` / `create_workspace` / `rename_workspace` / `delete_workspace` | | | Builtin workspaces cannot be deleted |

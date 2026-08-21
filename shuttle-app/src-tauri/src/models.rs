@@ -9,6 +9,7 @@ pub enum AccountStatus {
     Connected,
     Error,
     AwaitingAuth,
+    Sleeping,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +32,14 @@ pub struct Account {
     pub notify_enabled: Option<bool>,
     #[serde(default)]
     pub send_receipts: bool,
+    /// `None` inherits the app-wide hibernation default.
+    #[serde(default)]
+    pub sleep_enabled: Option<bool>,
+    #[serde(default)]
+    pub sleep_after_minutes: Option<u32>,
+    /// Periodic wake while hibernated. `0` = only wake on user action. `None` inherits default.
+    #[serde(default)]
+    pub sleep_check_minutes: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -243,6 +252,12 @@ pub struct ScheduledMessage {
     pub send_at: String,
     pub sent: bool,
     pub created_at: String,
+    #[serde(default)]
+    pub attempts: i64,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub failed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -301,6 +316,8 @@ pub struct ScheduleMessageDraft {
 pub struct BackupManifest {
     pub exported_at: String,
     pub includes_messages: bool,
+    #[serde(default)]
+    pub includes_media: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -313,6 +330,12 @@ pub struct AccountPatch {
     pub notify_enabled: Option<bool>,
     pub clear_notify: Option<bool>,
     pub send_receipts: Option<bool>,
+    pub sleep_enabled: Option<bool>,
+    pub clear_sleep_enabled: Option<bool>,
+    pub sleep_after_minutes: Option<u32>,
+    pub clear_sleep_after: Option<bool>,
+    pub sleep_check_minutes: Option<u32>,
+    pub clear_sleep_check: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

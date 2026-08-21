@@ -1052,6 +1052,7 @@ class WhatsAppSession:
                 "method": "qr",
                 "qr_data": qr_data,
                 "url": qr_link,
+                "account_id": self.account_id,
             }
         )
         send(
@@ -1856,14 +1857,20 @@ class WhatsAppSession:
 
 
 def main() -> None:
-    session: Optional[WhatsAppSession] = None
-    account_id = os.environ.get("SHUTTLE_ACCOUNT_ID")
+    sessions: dict[str, WhatsAppSession] = {}
+    fallback_id = os.environ.get("SHUTTLE_ACCOUNT_ID")
+
+    def pick(req: dict[str, Any]) -> tuple[Optional[str], Optional[WhatsAppSession]]:
+        aid = req.get("account_id") or fallback_id
+        aid = str(aid) if aid else None
+        return aid, sessions.get(aid) if aid else None
 
     while True:
         req = read_line()
         if req is None:
             break
         rtype = req.get("type")
+        account_id, session = pick(req)
         if rtype == "handshake":
             send(
                 {
@@ -1873,28 +1880,23 @@ def main() -> None:
                     "capabilities": CAPABILITIES,
                 }
             )
-        elif rtype == "authenticate":
-            account_id = req.get("account_id") or account_id
+        elif rtype in {"authenticate", "connect"}:
             if not account_id:
                 send({"type": "error", "message": "missing account_id"})
                 continue
+            send({"type": "status", "account_id": account_id, "status": "connecting", "identity": None})
             try:
+                old = sessions.pop(account_id, None)
+                if old:
+                    old.shutdown()
                 session = WhatsAppSession(account_id)
+                sessions[account_id] = session
                 session.connect()
             except FileNotFoundError as e:
-                send({"type": "error", "message": str(e)})
+                send({"type": "error", "message": str(e), "account_id": account_id})
             except Exception as e:
                 log(f"authenticate failed: {e}")
-                send({"type": "error", "message": str(e)})
-        elif rtype == "connect":
-            account_id = req.get("account_id") or account_id
-            send({"type": "status", "account_id": account_id, "status": "connecting", "identity": None})
-            if session is None and account_id:
-                try:
-                    session = WhatsAppSession(account_id)
-                    session.connect()
-                except Exception as e:
-                    send({"type": "error", "message": str(e)})
+                send({"type": "error", "message": str(e), "account_id": account_id})
         elif rtype == "sync_history":
             if session and session._connected:
                 try:
@@ -1913,7 +1915,7 @@ def main() -> None:
             if session:
                 session.download_media(req.get("conversation_id") or "", req.get("message_id") or "")
             else:
-                send({"type": "error", "message": "not connected"})
+                send({"type": "error", "message": "not connected", "account_id": account_id})
         elif rtype == "fetch_avatar":
             if session:
                 session.emit_avatar(req.get("conversation_id") or "")
@@ -1922,10 +1924,10 @@ def main() -> None:
             if session:
                 session.fetch_contact_profile(req.get("conversation_id") or "")
             else:
-                send({"type": "error", "message": "not connected"})
+                send({"type": "error", "message": "not connected", "account_id": account_id})
         elif rtype == "create_group":
             if not session:
-                send({"type": "error", "message": "not connected"})
+                send({"type": "error", "message": "not connected", "account_id": account_id})
                 continue
             parts = req.get("participants") or []
             if not isinstance(parts, list):
@@ -1933,12 +1935,12 @@ def main() -> None:
             session.create_group(req.get("title") or "", [str(p) for p in parts])
         elif rtype == "send_message":
             if not session:
-                send({"type": "error", "message": "not connected"})
+                send({"type": "error", "message": "not connected", "account_id": account_id})
                 continue
             session.send_text(req.get("conversation_id") or "", req.get("text") or "")
         elif rtype == "send_attachment":
             if not session:
-                send({"type": "error", "message": "not connected"})
+                send({"type": "error", "message": "not connected", "account_id": account_id})
                 continue
             session.send_attachment(req.get("conversation_id") or "", req)
         elif rtype == "mark_read":
@@ -1962,9 +1964,15 @@ def main() -> None:
                 send({"type": "status", "account_id": account_id, "status": "disconnected", "identity": None})
         elif rtype == "submit_auth":
             send({"type": "ok", "request_id": None})
-        elif rtype == "shutdown" or rtype == "disconnect":
-            if session:
-                session.shutdown()
+        elif rtype == "disconnect":
+            if account_id:
+                old = sessions.pop(account_id, None)
+                if old:
+                    old.shutdown()
+        elif rtype == "shutdown":
+            for old in sessions.values():
+                old.shutdown()
+            sessions.clear()
             break
 
 

@@ -1,6 +1,6 @@
 {
   "name": "shuttle-app",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Local-first unified messaging desktop app",
   "type": "module",
   "scripts": {
@@ -15,6 +15,7 @@
   "dependencies": {
     "@giphy/js-fetch-api": "^5.8.0",
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "emoji-picker-element": "^1.29.1"
   },

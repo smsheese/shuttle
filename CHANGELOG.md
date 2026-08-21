@@ -9,6 +9,32 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-21
+
+### Added
+
+- Account **hibernation**: idle sidecars stop after a configurable timeout (default 5 minutes), with optional periodic wake to sync (default 15 minutes). Opening a chat or sending wakes that account. Per-account overrides in Settings (use default, always on, or custom times). Sleeping is distinct from permanent disable.
+- One sidecar **process per network**, not per account: multiple WhatsApp / Telegram / … accounts share a Python process. `disconnect` detaches one account; `shutdown` exits when the last account leaves.
+- System tray with close-to-tray, unread tooltip, Ctrl/Cmd+K quick switch, and documented keyboard shortcuts (Settings → Keyboard).
+- In-thread media lightbox (images, video, PDF attempt), canvas image editor on photo attach (crop, rotate, pen, arrow, pixelate), and Save media from the message menu.
+- Backup file pickers, optional downloaded media in the export bundle, and a restart prompt after restore.
+- Account workspace assignment in Settings and the account context menu; conversation Notes and Remind menu items.
+- `scripts/rss-sample.sh` to sample Shuttle + child RSS the same way as the Ferdium reference run.
+
+### Changed
+
+- Product north star documented across README, overview, and roadmap: lightweight + responsive as the no-thought answer for resource use, plus cross-platform QoL and contributor-friendly sidecars; Ferdium ~2.7 GiB idle benchmark remains the 50–70% RSS bar to beat (~0.8–1.35 GiB on 4 WhatsApp + 1 Telegram).
+- Unread totals skip muted accounts and muted chats.
+- Connector capability flags match reality (no fake `calls:audio`; Messenger and Instagram no media cap). Call UI is an honest notice rather than a fake in-call mixer.
+- Live notifications pause while an account is asleep.
+
+### Fixed
+
+- Workspace fallback uses seeded `default` instead of stale `others`.
+- Reminder `datetime-local` shows local time.
+- Backup export/restore surfaces errors in Settings.
+- Scheduled sends stop retrying after repeated failures.
+
 ## [0.2.1] - 2026-08-19
 
 ### Fixed

@@ -1,4 +1,4 @@
-export type AccountStatus = 'disconnected' | 'connecting' | 'connected' | 'error' | 'awaiting_auth';
+export type AccountStatus = 'disconnected' | 'connecting' | 'connected' | 'error' | 'awaiting_auth' | 'sleeping';
 
 export interface Account {
   id: string;
@@ -14,6 +14,9 @@ export interface Account {
   workspace_id?: string | null;
   notify_enabled?: boolean | null;
   send_receipts?: boolean;
+  sleep_enabled?: boolean | null;
+  sleep_after_minutes?: number | null;
+  sleep_check_minutes?: number | null;
 }
 
 export interface Conversation {
@@ -270,6 +273,9 @@ export interface ScheduledMessage {
   send_at: string;
   sent: boolean;
   created_at: string;
+  attempts?: number;
+  last_error?: string | null;
+  failed?: boolean;
 }
 
 export interface ScheduleMessageDraft {
@@ -285,6 +291,7 @@ export interface ScheduleMessageDraft {
 export interface BackupManifest {
   exported_at: string;
   includes_messages: boolean;
+  includes_media?: boolean;
 }
 
 export interface ChannelStyle {
@@ -321,6 +328,11 @@ export interface AppConfig {
     crash_reports: boolean;
     usage_diagnostics: boolean;
   };
+  sleep: {
+    enabled: boolean;
+    after_minutes: number;
+    check_minutes: number;
+  };
   channel_styles: Record<string, ChannelStyle>;
   media_retention: MediaRetentionConfig;
 }
@@ -334,6 +346,12 @@ export interface AccountPatch {
   notify_enabled?: boolean;
   clear_notify?: boolean;
   send_receipts?: boolean;
+  sleep_enabled?: boolean | null;
+  clear_sleep_enabled?: boolean;
+  sleep_after_minutes?: number | null;
+  clear_sleep_after?: boolean;
+  sleep_check_minutes?: number | null;
+  clear_sleep_check?: boolean;
 }
 
 export interface ConversationPatch {

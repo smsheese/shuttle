@@ -1,6 +1,9 @@
 <script lang="ts">
   import NetworkIcon from '$lib/components/NetworkIcon.svelte';
-  import { DATETIME_FORMATS, fetchTweakcnTheme, formatTime, openExternal, saveAppConfig } from '$lib/api';
+  import { DATETIME_FORMATS, fetchTweakcnTheme, formatTime, openExternal, restartApp, saveAppConfig } from '$lib/api';
+  import { isTauri } from '$lib/mock';
+  import { save, open } from '@tauri-apps/plugin-dialog';
+  import { shortcutModKey } from '$lib/shortcuts';
   import {
     ATTRIBUTION_SECTIONS,
     SHUTTLE_LICENSE,
@@ -16,6 +19,7 @@
   import {
     CONNECTOR_COLORS,
     type Account,
+    type AccountPatch,
     type AppConfig,
     type Conversation,
     type ConnectorInfo,
@@ -34,6 +38,7 @@
     | 'accounts'
     | 'routing'
     | 'backup'
+    | 'keyboard'
     | 'about';
 
   interface Props {
@@ -48,6 +53,7 @@
     onadd: () => void;
     onconfig: (cfg: AppConfig) => void;
     onaccount: (id: string, action: 'mute' | 'disable' | 'enable' | 'remove' | 'receipts' | 'workspace', extra?: string) => void;
+    onaccountpatch?: (id: string, patch: AccountPatch) => void;
     onworkspace: (name: string) => void;
     ondeleteworkspace: (id: string) => void;
     oncreatepriority: (name: string) => void;
@@ -65,7 +71,12 @@
     ontoggleforwardrule: (id: string, enabled: boolean) => void;
     ondeleteforwardrule: (id: string) => void;
     ondeletescheduled: (id: string) => void;
-    onexportbackup: (path: string, password: string, includeMessages: boolean) => Promise<void>;
+    onexportbackup: (
+      path: string,
+      password: string,
+      includeMessages: boolean,
+      includeMedia: boolean
+    ) => Promise<void>;
     onrestorebackup: (path: string, password: string) => Promise<void>;
     onaccountmenu?: (account: Account, x: number, y: number) => void;
   }
@@ -82,6 +93,7 @@
     onadd,
     onconfig,
     onaccount,
+    onaccountpatch,
     onworkspace,
     ondeleteworkspace,
     oncreatepriority,
@@ -110,9 +122,29 @@
   let backupPath = $state('');
   let backupPassword = $state('');
   let includeMessages = $state(true);
+  let includeMedia = $state(false);
   let restorePath = $state('');
   let restorePassword = $state('');
   let backupStatus = $state<string | null>(null);
+  let restoreNeedsRestart = $state(false);
+
+  async function browseExportPath() {
+    if (!isTauri()) return;
+    const picked = await save({
+      defaultPath: 'shuttle-backup.age',
+      filters: [{ name: 'Age backup', extensions: ['age'] }],
+    });
+    if (picked) backupPath = picked;
+  }
+
+  async function browseRestorePath() {
+    if (!isTauri()) return;
+    const picked = await open({
+      filters: [{ name: 'Age backup', extensions: ['age'] }],
+      multiple: false,
+    });
+    if (typeof picked === 'string') restorePath = picked;
+  }
 
   const tabs: { id: SettingsTab; label: string }[] = [
     { id: 'appearance', label: 'Appearance' },
@@ -123,8 +155,11 @@
     { id: 'accounts', label: 'Accounts' },
     { id: 'routing', label: 'Routing' },
     { id: 'backup', label: 'Backup' },
+    { id: 'keyboard', label: 'Keyboard' },
     { id: 'about', label: 'About' },
   ];
+
+  const modKey = shortcutModKey();
 
   function patchAppearance(partial: Partial<AppConfig['appearance']>) {
     onconfig({
@@ -181,11 +216,43 @@
     });
   }
 
+  const sleepDefaults = { enabled: true, after_minutes: 5, check_minutes: 15 };
+
+  const sleepCfg = $derived(config.sleep ?? sleepDefaults);
+
+  function patchSleep(partial: Partial<AppConfig['sleep']>) {
+    onconfig({
+      ...config,
+      sleep: { ...(config.sleep ?? sleepDefaults), ...partial },
+    });
+  }
+
   function patchPrivacy(partial: Partial<AppConfig['privacy']>) {
     onconfig({
       ...config,
       privacy: { ...config.privacy, ...partial },
     });
+  }
+
+  function accountSleepMode(account: Account): 'default' | 'always' | 'custom' {
+    if (account.sleep_enabled === false) return 'always';
+    if (account.sleep_enabled === true) return 'custom';
+    return 'default';
+  }
+
+  function setAccountSleepMode(account: Account, mode: string) {
+    if (!onaccountpatch) return;
+    if (mode === 'default') {
+      onaccountpatch(account.id, { clear_sleep_enabled: true, clear_sleep_after: true, clear_sleep_check: true });
+    } else if (mode === 'always') {
+      onaccountpatch(account.id, { sleep_enabled: false });
+    } else {
+      onaccountpatch(account.id, {
+        sleep_enabled: true,
+        sleep_after_minutes: account.sleep_after_minutes ?? config.sleep?.after_minutes ?? 5,
+        sleep_check_minutes: account.sleep_check_minutes ?? config.sleep?.check_minutes ?? 15,
+      });
+    }
   }
 
   function setChannelTag(id: string, tag: string) {
@@ -368,6 +435,42 @@
               </label>
             </div>
           {/if}
+          <h3 class="privacy-subhead">Account sleep</h3>
+          <label class="check">
+            <input
+              type="checkbox"
+              checked={sleepCfg.enabled}
+              onchange={(e) => patchSleep({ enabled: e.currentTarget.checked })}
+            />
+            Sleep idle accounts
+          </label>
+          {#if sleepCfg.enabled}
+            <label>
+              Idle timeout
+              <select
+                value={sleepCfg.after_minutes}
+                onchange={(e) => patchSleep({ after_minutes: Number(e.currentTarget.value) })}
+              >
+                <option value={5}>5 minutes</option>
+                <option value={15}>15 minutes</option>
+                <option value={30}>30 minutes</option>
+              </select>
+            </label>
+          {/if}
+          <label>
+            Check while asleep
+            <select
+              value={sleepCfg.check_minutes}
+              onchange={(e) => patchSleep({ check_minutes: Number(e.currentTarget.value) })}
+            >
+              <option value={0}>Never</option>
+              <option value={15}>Every 15 minutes</option>
+              <option value={30}>Every 30 minutes</option>
+            </select>
+          </label>
+          <p class="hint">
+            Sleeping accounts stop their connector to save RAM. They will not get live notifications until Shuttle wakes them (you open the account, or the periodic check).
+          </p>
           <p class="hint">Muted chats and accounts never notify. Read receipts stay off until you opt in per account or chat.</p>
         </section>
       {:else if activeTab === 'privacy'}
@@ -466,6 +569,7 @@
       {:else if activeTab === 'accounts'}
         <section>
           <h2>Accounts</h2>
+          <p class="hint">Global hibernation is under Notifications. Each account can stay always on or use a custom idle/check interval.</p>
           <ul class="account-list">
             {#each accounts as account (account.id)}
               <li
@@ -480,12 +584,60 @@
                   <NetworkIcon connectorId={account.connector_id} size={18} />
                 </span>
                 <div class="account-info">
-                  <span class="account-name">{account.name}{account.muted ? ' (muted)' : ''}{account.disabled ? ' (disabled)' : ''}</span>
+                  <span class="account-name">{account.name}{account.muted ? ' (muted)' : ''}{account.disabled ? ' (disabled)' : ''}{account.status === 'sleeping' ? ' (asleep)' : ''}</span>
                   {#if account.identity}
                     <span class="account-identity">{account.identity}</span>
                   {/if}
+                  <label class="sleep-mode">
+                    Hibernate
+                    <select
+                      value={accountSleepMode(account)}
+                      onchange={(e) => setAccountSleepMode(account, e.currentTarget.value)}
+                    >
+                      <option value="default">Use default</option>
+                      <option value="always">Always on</option>
+                      <option value="custom">Custom</option>
+                    </select>
+                  </label>
+                  {#if accountSleepMode(account) === 'custom'}
+                    <div class="row">
+                      <label>
+                        After
+                        <input
+                          type="number"
+                          min="1"
+                          value={account.sleep_after_minutes ?? config.sleep?.after_minutes ?? 5}
+                          onchange={(e) =>
+                            onaccountpatch?.(account.id, {
+                              sleep_after_minutes: Math.max(1, Number(e.currentTarget.value) || 5),
+                            })}
+                        />
+                      </label>
+                      <label>
+                        Check
+                        <input
+                          type="number"
+                          min="0"
+                          value={account.sleep_check_minutes ?? config.sleep?.check_minutes ?? 15}
+                          onchange={(e) =>
+                            onaccountpatch?.(account.id, {
+                              sleep_check_minutes: Math.max(0, Number(e.currentTarget.value) || 0),
+                            })}
+                        />
+                      </label>
+                    </div>
+                  {/if}
                 </div>
                 <div class="acct-actions">
+                  <select
+                    class="workspace-select"
+                    value={account.workspace_id ?? 'default'}
+                    onchange={(e) => onaccount(account.id, 'workspace', e.currentTarget.value)}
+                  >
+                    {#each workspaces as ws (ws.id)}
+                      <option value={ws.id}>{ws.name}</option>
+                    {/each}
+                  </select>
                   <button type="button" onclick={() => onaccount(account.id, 'mute')}>{account.muted ? 'Unmute' : 'Mute'}</button>
                   <button type="button" onclick={() => onaccount(account.id, account.disabled ? 'enable' : 'disable')}>
                     {account.disabled ? 'Enable' : 'Disable'}
@@ -594,6 +746,9 @@
                   <strong>{conversationLabel(msg.dest_conversation_id)}</strong>
                   <span>{new Date(msg.send_at).toLocaleString()}</span>
                   <span class="account-identity">{msg.body}</span>
+                  {#if msg.last_error}
+                    <span class="account-identity">{msg.last_error}</span>
+                  {/if}
                 </div>
                 <div class="acct-actions">
                   <button type="button" class="danger" onclick={() => ondeletescheduled(msg.id)}>Delete</button>
@@ -607,41 +762,95 @@
           <h2>Backup</h2>
           <label>
             Export path
-            <input bind:value={backupPath} placeholder="/path/to/shuttle-backup.age" />
+            <div class="path-row">
+              <input bind:value={backupPath} placeholder="/path/to/shuttle-backup.age" />
+              {#if isTauri()}
+                <button type="button" class="tiny" onclick={() => void browseExportPath()}>Browse</button>
+              {/if}
+            </div>
           </label>
           <label>
             Password
-            <input bind:value={backupPassword} type="password" placeholder="Backup password" />
+            <input bind:value={backupPassword} type="password" placeholder="Backup password" autocomplete="new-password" />
           </label>
           <label class="check">
             <input type="checkbox" bind:checked={includeMessages} />
             Include inbox databases
           </label>
+          <label class="check">
+            <input type="checkbox" bind:checked={includeMedia} />
+            Include downloaded media
+          </label>
           <button
             type="button"
+            disabled={!backupPath.trim() || !backupPassword}
             onclick={async () => {
-              await onexportbackup(backupPath, backupPassword, includeMessages);
-              backupStatus = 'Backup exported.';
+              restoreNeedsRestart = false;
+              try {
+                await onexportbackup(backupPath, backupPassword, includeMessages, includeMedia);
+                backupStatus = 'Backup exported.';
+              } catch (e) {
+                backupStatus = e instanceof Error ? e.message : String(e);
+              }
             }}>Export backup</button
           >
           <label>
             Restore path
-            <input bind:value={restorePath} placeholder="/path/to/shuttle-backup.age" />
+            <div class="path-row">
+              <input bind:value={restorePath} placeholder="/path/to/shuttle-backup.age" />
+              {#if isTauri()}
+                <button type="button" class="tiny" onclick={() => void browseRestorePath()}>Browse</button>
+              {/if}
+            </div>
           </label>
           <label>
             Restore password
-            <input bind:value={restorePassword} type="password" placeholder="Backup password" />
+            <input bind:value={restorePassword} type="password" placeholder="Backup password" autocomplete="current-password" />
           </label>
           <button
             type="button"
+            disabled={!restorePath.trim() || !restorePassword}
             onclick={async () => {
-              await onrestorebackup(restorePath, restorePassword);
-              backupStatus = 'Backup restored. Restart Shuttle to reload databases safely.';
+              restoreNeedsRestart = false;
+              try {
+                await onrestorebackup(restorePath, restorePassword);
+                backupStatus = 'Backup restored. Databases and files were merged into place.';
+                restoreNeedsRestart = true;
+              } catch (e) {
+                backupStatus = e instanceof Error ? e.message : String(e);
+              }
             }}>Restore backup</button
           >
           {#if backupStatus}
             <p class="hint">{backupStatus}</p>
           {/if}
+          {#if restoreNeedsRestart}
+            <button type="button" class="restart-btn" onclick={() => void restartApp()}>Restart Shuttle now</button>
+          {/if}
+        </section>
+      {:else if activeTab === 'keyboard'}
+        <section>
+          <h2>Keyboard shortcuts</h2>
+          <p class="hint">Shortcuts are disabled while typing in a text field, except quick switch and Escape.</p>
+          <table class="shortcut-table">
+            <thead>
+              <tr>
+                <th scope="col">Shortcut</th>
+                <th scope="col">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td><kbd>{modKey}+K</kbd></td><td>Open quick switch</td></tr>
+              <tr><td><kbd>/</kbd></td><td>Focus conversation search</td></tr>
+              <tr><td><kbd>j</kbd> / <kbd>↓</kbd></td><td>Next conversation</td></tr>
+              <tr><td><kbd>k</kbd> / <kbd>↑</kbd></td><td>Previous conversation</td></tr>
+              <tr><td><kbd>Enter</kbd></td><td>Open highlighted conversation</td></tr>
+              <tr><td><kbd>e</kbd></td><td>Archive or unarchive conversation</td></tr>
+              <tr><td><kbd>m</kbd></td><td>Mute or unmute conversation</td></tr>
+              <tr><td><kbd>u</kbd></td><td>Mark conversation unread</td></tr>
+              <tr><td><kbd>Esc</kbd></td><td>Close quick switch, contact details, or chat panel</td></tr>
+            </tbody>
+          </table>
         </section>
       {:else if activeTab === 'about'}
         <section>
@@ -947,11 +1156,33 @@
     font-size: 12px;
     color: var(--text-muted);
   }
+  .sleep-mode {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .sleep-mode select {
+    flex: 1;
+  }
+  .network.sleeping {
+    opacity: 0.7;
+  }
   .acct-actions {
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
     width: 100%;
+  }
+  .workspace-select {
+    border: 1px solid var(--border);
+    background: transparent;
+    border-radius: var(--radius-sm);
+    padding: 6px 10px;
+    font-size: 12px;
+    color: var(--text-primary);
   }
   .acct-actions button, .add-account-btn, .tiny, .stack > button {
     border: 1px solid var(--border);
@@ -1039,11 +1270,52 @@
   .linkish:hover {
     text-decoration: underline;
   }
+  .path-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .path-row input {
+    flex: 1;
+    min-width: 0;
+  }
+  .restart-btn {
+    margin-top: 8px;
+  }
   .trademark {
     margin-top: 4px;
   }
   code {
     font-size: 0.92em;
+  }
+  .shortcut-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  .shortcut-table th,
+  .shortcut-table td {
+    text-align: left;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border-subtle);
+    vertical-align: top;
+  }
+  .shortcut-table th {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+  }
+  .shortcut-table kbd {
+    display: inline-block;
+    padding: 2px 6px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-input);
+    font-family: inherit;
+    font-size: 12px;
+    line-height: 1.3;
   }
 
   @media (max-width: 768px) {

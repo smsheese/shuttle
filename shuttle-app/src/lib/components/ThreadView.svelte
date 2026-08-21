@@ -3,6 +3,8 @@
   import NetworkIcon from '$lib/components/NetworkIcon.svelte';
   import EmojiPickerPop from '$lib/components/EmojiPickerPop.svelte';
   import GiphyPicker from '$lib/components/GiphyPicker.svelte';
+  import ImageEditor from '$lib/components/ImageEditor.svelte';
+  import MediaLightbox, { type LightboxItem } from '$lib/components/MediaLightbox.svelte';
   import { giphyUrlToBase64, type GiphyItem } from '$lib/giphy';
   import {
     captionText,
@@ -81,6 +83,14 @@
   let chatSearchOpen = $state(false);
   let chatSearchQuery = $state('');
   let messagesEl = $state<HTMLDivElement | null>(null);
+  let lightboxOpen = $state(false);
+  let lightboxIndex = $state(0);
+  let lightboxItems = $state<LightboxItem[]>([]);
+  let editorOpen = $state(false);
+  let editorSrc = $state('');
+  let editorFilename = $state('');
+  let editorMime = $state('');
+  let editorOriginal = $state<null | { kind: AttachmentKind; filename: string; mime: string; data_base64: string }>(null);
 
   const displayMessages = $derived(
     [...messages].sort((a, b) => {
@@ -96,10 +106,8 @@
   const connectorCaps = $derived(
     account ? connectors.find((c) => c.id === account.connector_id)?.capabilities ?? [] : []
   );
-  const whatsappCallsDisabled = $derived(account?.connector_id === 'whatsapp');
   const canCall = $derived(
     conversation?.conversation_type === 'direct' &&
-      !whatsappCallsDisabled &&
       connectorCaps.some((c) => c.startsWith('calls:'))
   );
 
@@ -315,6 +323,90 @@
     });
   }
 
+  function fileToDataUrl(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result ?? ''));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function lightboxKind(kind: string | null): LightboxItem['kind'] | null {
+    if (!kind) return null;
+    if (kind === 'image' || kind === 'sticker') return 'image';
+    if (kind === 'video') return 'video';
+    if (kind === 'audio') return 'audio';
+    if (kind === 'document') return 'document';
+    return null;
+  }
+
+  function buildThreadLightboxItems(): LightboxItem[] {
+    const items: LightboxItem[] = [];
+    for (const msg of displayMessages) {
+      const kind = mediaKindFromMessage(msg);
+      const lbKind = lightboxKind(kind);
+      if (!lbKind) continue;
+      const url = mediaUrlFor(msg);
+      if (!url) continue;
+      const mime = msg.metadata?.mime;
+      items.push({
+        id: msg.id,
+        url,
+        kind: lbKind,
+        filename: mediaFilename(msg),
+        mime: typeof mime === 'string' ? mime : null,
+      });
+    }
+    return items;
+  }
+
+  function openLightboxForMessage(msg: Message) {
+    const items = buildThreadLightboxItems();
+    const idx = items.findIndex((i) => i.id === msg.id);
+    if (idx < 0) return;
+    lightboxItems = items;
+    lightboxIndex = idx;
+    lightboxOpen = true;
+  }
+
+  function saveLightboxItem(item: LightboxItem) {
+    const a = document.createElement('a');
+    a.href = item.url;
+    a.download = item.filename ?? `media-${item.id.slice(0, 8)}`;
+    a.click();
+  }
+
+  function editLightboxItem(item: LightboxItem) {
+    if (item.kind !== 'image') return;
+    lightboxOpen = false;
+    editorSrc = item.url;
+    editorFilename = item.filename ?? 'edited.jpg';
+    editorMime = item.mime ?? 'image/jpeg';
+    editorOriginal = null;
+    editorOpen = true;
+  }
+
+  function closeEditor() {
+    editorOpen = false;
+    editorOriginal = null;
+  }
+
+  function onEditorSend(result: { data_base64: string; mime: string; filename: string }) {
+    sendPayload({
+      kind: 'image',
+      ...result,
+      caption: draft.trim() || undefined,
+    });
+    ondraft('');
+    closeEditor();
+  }
+
+  function onEditorSkip() {
+    if (editorOriginal) pendingFile = { ...editorOriginal };
+    closeEditor();
+  }
+
   async function stageFile(kind: AttachmentKind, file: File) {
     pendingFile = {
       kind,
@@ -330,6 +422,20 @@
     const file = input.files?.[0];
     input.value = '';
     if (!file) return;
+    if (kind === 'image' && file.type.startsWith('image/') && file.type !== 'image/gif') {
+      editorOriginal = {
+        kind,
+        filename: file.name,
+        mime: file.type || 'image/jpeg',
+        data_base64: await fileToBase64(file),
+      };
+      editorSrc = await fileToDataUrl(file);
+      editorFilename = file.name;
+      editorMime = file.type || 'image/jpeg';
+      editorOpen = true;
+      picker = null;
+      return;
+    }
     await stageFile(kind, file);
   }
 
@@ -524,7 +630,6 @@
         {@const caption = captionText(msg)}
         {@const filename = mediaFilename(msg)}
         {@const hasContent = !!kind || !!caption}
-        {@const unsupported = false}
         {@const searchHit = chatSearchQuery.trim() && (msg.body || '').toLowerCase().includes(chatSearchQuery.trim().toLowerCase())}
         {#if hasContent && !(chatSearchQuery.trim() && !searchHit)}
         {#if showDate}
@@ -553,7 +658,9 @@
             {/if}
             {#if kind === 'image' || kind === 'sticker'}
               {#if media}
-                <img class="msg-media" class:sticker={kind === 'sticker'} src={media} alt={caption || mediaIconLabel(kind)} />
+                <button type="button" class="media-open" onclick={() => openLightboxForMessage(msg)} aria-label="View {mediaIconLabel(kind)}">
+                  <img class="msg-media" class:sticker={kind === 'sticker'} src={media} alt={caption || mediaIconLabel(kind)} />
+                </button>
               {:else}
                 <div class="media-fallback" class:failed={mediaUnavailable(msg)}>
                   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
@@ -566,8 +673,11 @@
               {/if}
             {:else if kind === 'video'}
               {#if media}
-                <!-- svelte-ignore a11y_media_has_caption -->
-                <video class="msg-media" src={media} controls></video>
+                <div class="video-wrap">
+                  <!-- svelte-ignore a11y_media_has_caption -->
+                  <video class="msg-media" src={media} controls></video>
+                  <button type="button" class="video-expand" onclick={() => openLightboxForMessage(msg)} aria-label="Expand video">⛶</button>
+                </div>
               {:else}
                 <div class="media-fallback" class:failed={mediaUnavailable(msg)}>
                   <span>{mediaUnavailable(msg) ? 'Video unavailable' : 'Loading video…'}</span>
@@ -785,6 +895,24 @@
         </button>
       </div>
     </footer>
+    <MediaLightbox
+      open={lightboxOpen}
+      items={lightboxItems}
+      index={lightboxIndex}
+      onclose={() => (lightboxOpen = false)}
+      onindex={(i) => (lightboxIndex = i)}
+      onsave={saveLightboxItem}
+      onedit={editLightboxItem}
+    />
+    <ImageEditor
+      open={editorOpen}
+      src={editorSrc}
+      filename={editorFilename}
+      mime={editorMime}
+      oncancel={closeEditor}
+      onsend={onEditorSend}
+      onskip={editorOriginal ? onEditorSkip : undefined}
+    />
   {:else}
     <div class="empty-thread">
       <div class="empty-icon">
@@ -1063,6 +1191,41 @@
 
   .outbound .msg-time {
     color: rgba(255, 255, 255, 0.62);
+  }
+
+  .media-open {
+    display: block;
+    padding: 0;
+    border: none;
+    background: transparent;
+    cursor: zoom-in;
+    line-height: 0;
+  }
+
+  .video-wrap {
+    position: relative;
+    display: inline-block;
+    max-width: min(240px, 100%);
+  }
+
+  .video-expand {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 28px;
+    height: 28px;
+    border: none;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.55);
+    color: white;
+    font-size: 14px;
+    cursor: pointer;
+    line-height: 1;
+    opacity: 0.85;
+  }
+
+  .video-expand:hover {
+    opacity: 1;
   }
 
   .msg-media {
@@ -1428,14 +1591,6 @@
     margin: 0;
     font-size: 13px;
     white-space: pre-wrap;
-  }
-
-  .unsupported-chip {
-    display: inline-block;
-    font-size: 12px;
-    color: var(--text-muted);
-    font-style: italic;
-    padding: 2px 0;
   }
 
   .chat-search {

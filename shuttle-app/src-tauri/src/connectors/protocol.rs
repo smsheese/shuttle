@@ -112,6 +112,8 @@ pub enum ConnectorResponse {
         url: Option<String>,
         #[serde(default)]
         message: Option<String>,
+        #[serde(default)]
+        account_id: Option<String>,
     },
     Status { account_id: String, status: String, identity: Option<String> },
     Ok { request_id: Option<String> },
@@ -120,9 +122,15 @@ pub enum ConnectorResponse {
         request_id: Option<String>,
         #[serde(default)]
         conversation_id: Option<String>,
+        #[serde(default)]
+        account_id: Option<String>,
         profile: Value,
     },
-    Error { message: String },
+    Error {
+        message: String,
+        #[serde(default)]
+        account_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

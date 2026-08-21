@@ -169,7 +169,8 @@ impl Database {
         let conn = self.catalog.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, connector_id, name, identity, status, metadata, created_at, updated_at,
-                    disabled, muted, workspace_id, notify_enabled, send_receipts
+                    disabled, muted, workspace_id, notify_enabled, send_receipts,
+                    sleep_enabled, sleep_after_minutes, sleep_check_minutes
              FROM accounts ORDER BY name",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -187,6 +188,9 @@ impl Database {
                 workspace_id: row.get(10)?,
                 notify_enabled: opt_bool(row.get(11)?),
                 send_receipts: row.get::<_, i64>(12)? != 0,
+                sleep_enabled: opt_bool(row.get(13)?),
+                sleep_after_minutes: opt_u32(row.get(14)?),
+                sleep_check_minutes: opt_u32(row.get(15)?),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
@@ -218,6 +222,9 @@ impl Database {
             workspace_id: None,
             notify_enabled: None,
             send_receipts: false,
+            sleep_enabled: None,
+            sleep_after_minutes: None,
+            sleep_check_minutes: None,
         })
     }
 
@@ -959,9 +966,12 @@ impl Database {
     pub fn total_unread(&self) -> Result<i64, DbError> {
         let mut total = 0_i64;
         for account in self.list_accounts()? {
+            if account.muted {
+                continue;
+            }
             let inbox = self.inbox(&account.id)?;
             let count: i64 = inbox.conn.lock().query_row(
-                "SELECT COALESCE(SUM(unread_count), 0) FROM conversations WHERE archived = 0",
+                "SELECT COALESCE(SUM(unread_count), 0) FROM conversations WHERE archived = 0 AND muted = 0",
                 [],
                 |r| r.get(0),
             )?;
@@ -1024,6 +1034,39 @@ impl Database {
             conn.execute(
                 "UPDATE accounts SET send_receipts = ?1, updated_at = ?2 WHERE id = ?3",
                 params![if r { 1 } else { 0 }, now, id],
+            )?;
+        }
+        if patch.clear_sleep_enabled.unwrap_or(false) {
+            conn.execute(
+                "UPDATE accounts SET sleep_enabled = NULL, updated_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+        } else if let Some(v) = patch.sleep_enabled {
+            conn.execute(
+                "UPDATE accounts SET sleep_enabled = ?1, updated_at = ?2 WHERE id = ?3",
+                params![if v { 1 } else { 0 }, now, id],
+            )?;
+        }
+        if patch.clear_sleep_after.unwrap_or(false) {
+            conn.execute(
+                "UPDATE accounts SET sleep_after_minutes = NULL, updated_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+        } else if let Some(v) = patch.sleep_after_minutes {
+            conn.execute(
+                "UPDATE accounts SET sleep_after_minutes = ?1, updated_at = ?2 WHERE id = ?3",
+                params![v as i64, now, id],
+            )?;
+        }
+        if patch.clear_sleep_check.unwrap_or(false) {
+            conn.execute(
+                "UPDATE accounts SET sleep_check_minutes = NULL, updated_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+        } else if let Some(v) = patch.sleep_check_minutes {
+            conn.execute(
+                "UPDATE accounts SET sleep_check_minutes = ?1, updated_at = ?2 WHERE id = ?3",
+                params![v as i64, now, id],
             )?;
         }
         drop(conn);
@@ -1564,11 +1607,11 @@ impl Database {
         let conn = self.catalog.conn.lock();
         let sql = if include_sent {
             "SELECT id, source_account_id, source_conversation_id, source_message_id, dest_account_id,
-                    dest_conversation_id, body, send_at, sent, created_at
+                    dest_conversation_id, body, send_at, sent, created_at, attempts, last_error, failed
              FROM scheduled_messages ORDER BY send_at"
         } else {
             "SELECT id, source_account_id, source_conversation_id, source_message_id, dest_account_id,
-                    dest_conversation_id, body, send_at, sent, created_at
+                    dest_conversation_id, body, send_at, sent, created_at, attempts, last_error, failed
              FROM scheduled_messages WHERE sent = 0 ORDER BY send_at"
         };
         let mut stmt = conn.prepare(sql)?;
@@ -1603,7 +1646,7 @@ impl Database {
         let conn = self.catalog.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, source_account_id, source_conversation_id, source_message_id, dest_account_id,
-                    dest_conversation_id, body, send_at, sent, created_at
+                    dest_conversation_id, body, send_at, sent, created_at, attempts, last_error, failed
              FROM scheduled_messages WHERE id = ?1",
         )?;
         stmt.query_row(params![id], map_scheduled_message_row)
@@ -1616,8 +1659,8 @@ impl Database {
         let conn = self.catalog.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, source_account_id, source_conversation_id, source_message_id, dest_account_id,
-                    dest_conversation_id, body, send_at, sent, created_at
-             FROM scheduled_messages WHERE sent = 0 AND send_at <= ?1 ORDER BY send_at",
+                    dest_conversation_id, body, send_at, sent, created_at, attempts, last_error, failed
+             FROM scheduled_messages WHERE sent = 0 AND failed = 0 AND send_at <= ?1 ORDER BY send_at",
         )?;
         let rows = stmt.query_map(params![now], map_scheduled_message_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
@@ -1628,6 +1671,27 @@ impl Database {
             .conn
             .lock()
             .execute("UPDATE scheduled_messages SET sent = 1 WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn mark_scheduled_message_attempt(
+        &self,
+        id: &str,
+        error: &str,
+        give_up: bool,
+    ) -> Result<(), DbError> {
+        let conn = self.catalog.conn.lock();
+        let attempts: i64 = conn.query_row(
+            "SELECT attempts FROM scheduled_messages WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        let attempts = attempts + 1;
+        let failed = give_up || attempts >= 8;
+        conn.execute(
+            "UPDATE scheduled_messages SET attempts = ?1, last_error = ?2, failed = ?3 WHERE id = ?4",
+            params![attempts, error, if failed { 1 } else { 0 }, id],
+        )?;
         Ok(())
     }
 
@@ -1936,6 +2000,10 @@ fn opt_bool(v: Option<i64>) -> Option<bool> {
     v.map(|n| n != 0)
 }
 
+fn opt_u32(v: Option<i64>) -> Option<u32> {
+    v.and_then(|n| u32::try_from(n).ok())
+}
+
 fn normalize_stored_ts(value: Option<&str>) -> Option<&str> {
     let s = value?.trim();
     if s.is_empty() || s.starts_with("0001-") || s.starts_with("0000-") {
@@ -1949,7 +2017,7 @@ fn effective_workspace<'a>(conv: &'a Conversation, account: Option<&'a Account>)
     conv.workspace_id
         .as_deref()
         .or_else(|| account.and_then(|a| a.workspace_id.as_deref()))
-        .unwrap_or("others")
+        .unwrap_or("default")
 }
 
 fn map_todo_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatTodo> {
@@ -2010,6 +2078,9 @@ fn map_scheduled_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Schedu
         send_at: row.get(7)?,
         sent: row.get::<_, i64>(8)? != 0,
         created_at: row.get(9)?,
+        attempts: row.get(10)?,
+        last_error: row.get(11)?,
+        failed: row.get::<_, i64>(12)? != 0,
     })
 }
 
@@ -2143,6 +2214,7 @@ fn parse_account_status(s: &str) -> AccountStatus {
         "connecting" => AccountStatus::Connecting,
         "error" => AccountStatus::Error,
         "awaiting_auth" => AccountStatus::AwaitingAuth,
+        "sleeping" => AccountStatus::Sleeping,
         _ => AccountStatus::Disconnected,
     }
 }
@@ -2153,6 +2225,7 @@ fn account_status_str(s: &AccountStatus) -> &'static str {
         AccountStatus::Connecting => "connecting",
         AccountStatus::Error => "error",
         AccountStatus::AwaitingAuth => "awaiting_auth",
+        AccountStatus::Sleeping => "sleeping",
         AccountStatus::Disconnected => "disconnected",
     }
 }

@@ -1,8 +1,8 @@
 # Shuttle
 
-**Local-first unified messaging for the desktop.** One inbox for WhatsApp, Telegram, Signal, Messenger, Instagram DMs, Matrix, and email — on your machine, not in a Shuttle cloud.
+**Lightweight, local-first unified messaging for the desktop.** One inbox for WhatsApp, Telegram, Signal, Messenger, Instagram DMs, Matrix, and email — on your machine, not in a Shuttle cloud.
 
-Shuttle is a lightweight Windows, Linux, and macOS app (amd64 and arm64). The shell is [Tauri 2](https://tauri.app/) + [Svelte 5](https://svelte.dev/); the core is Rust and SQLite. Each network runs as an isolated sidecar so the UI never talks to providers directly.
+Shuttle aims to be the **no-thought answer** for low resource use: fast and responsive on Windows, Linux, and macOS (amd64 and arm64), with quality-of-life features that make multi-account messaging feel native — without the Chromium-per-service tax. The shell is [Tauri 2](https://tauri.app/) + [Svelte 5](https://svelte.dev/); the core is Rust and SQLite. Each network runs as an isolated sidecar so the UI never talks to providers directly. New connectors stay easy: one protocol, one process, no UI fork.
 
 ## Features
 
@@ -13,14 +13,18 @@ Shuttle is a lightweight Windows, Linux, and macOS app (amd64 and arm64). The sh
 - **Organization** — workspaces, priority groups, chat notes, todos, and one-shot reminders
 - **Routing** — forward between chats or accounts, delayed send, scheduled messages
 - **Themes** — system light/dark, bundled presets, or pasted CSS
-- **Backup / restore** of config and session pointers, password-protected
+- **Daily-driver chrome** — system tray (close-to-tray), Ctrl/Cmd+K quick switch, keyboard shortcuts
+- **Account sleep** — idle connectors hibernate after a few minutes; wake when you open that account (distinct from disable)
+- **Shared sidecars** — one Python process per network, not per account
+- **Media** — in-thread players, lightbox, canvas image editor on attach
+- **Backup / restore** — password-protected export/import with optional media; restart after restore
 - **Optional telemetry** (Sentry / PostHog) — off by default, with Settings → Privacy toggles
 
-Planned work (media, AI replies, more networks, calls) is in [docs/roadmap.md](docs/roadmap.md). Architecture and internals: [docs/](docs/README.md).
+Product north star (lightweight · responsive · cross-platform · QoL · contributor-friendly) and remaining work: [docs/roadmap.md](docs/roadmap.md). Architecture: [docs/](docs/README.md).
 
 ## Connectors
 
-Sidecars are Python processes over a newline-delimited JSON protocol. **Release installers ship the core app only.** When you add an account, Shuttle downloads the connector scripts, native helpers, slim Python runtime, and any pip deps from a versioned S3 manifest (`SHUTTLE_COMPONENTS_BASE_URL`, baked at build time). System Python 3.12+ is used when compatible.
+Sidecars are Python processes over a newline-delimited JSON protocol — **one process per network**, shared across accounts of that type. **Release installers ship the core app only.** When you add an account, Shuttle downloads the connector scripts, native helpers, slim Python runtime, and any pip deps from a versioned S3 manifest (`SHUTTLE_COMPONENTS_BASE_URL`, baked at build time). System Python 3.12+ is used when compatible.
 
 | Network | Integrator | Auth | Notes |
 | --- | --- | --- | --- |

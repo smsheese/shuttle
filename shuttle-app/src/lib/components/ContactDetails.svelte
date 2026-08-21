@@ -8,6 +8,7 @@
     updateConversation,
   } from '$lib/api';
   import NetworkIcon from '$lib/components/NetworkIcon.svelte';
+  import MediaLightbox, { type LightboxItem } from '$lib/components/MediaLightbox.svelte';
   import { mediaDataFromMessage, mediaFilename, mediaKindFromMessage, mediaPathFromMessage } from '$lib/messageMedia';
   import type { Account, ContactProfileBundle, Conversation, MediaRetentionConfig, Message, PriorityGroup, Workspace } from '$lib/types';
 
@@ -36,6 +37,9 @@
   let toast = $state<string | null>(null);
   let thumbUrls = $state<Record<string, string>>({});
   let retentionDraft = $state<MediaRetentionConfig>({});
+  let lightboxOpen = $state(false);
+  let lightboxIndex = $state(0);
+  let lightboxItems = $state<LightboxItem[]>([]);
 
   const RETENTION_FIELDS: { key: keyof MediaRetentionConfig; label: string }[] = [
     { key: 'images_days', label: 'Images' },
@@ -52,7 +56,7 @@
   const caps = $derived(connector?.capabilities ?? []);
   const callsAudio = $derived(caps.includes('calls:audio'));
   const callsVideo = $derived(caps.includes('calls:video'));
-  const whatsappCallsDisabled = $derived(account?.connector_id === 'whatsapp');
+  const canCall = $derived(callsAudio || callsVideo);
   const isDirect = $derived(conversation?.conversation_type === 'direct');
   const chatType = $derived(
     conversation?.conversation_type === 'group'
@@ -135,7 +139,6 @@
   }
 
   function handleCall(mode: 'audio' | 'video') {
-    if (whatsappCallsDisabled) return;
     onstartcall?.(mode);
   }
 
@@ -159,6 +162,50 @@
 
   function docLabel(item: Message): string {
     return mediaFilename(item) || item.body?.replace(/^\[.*\]$/, '') || 'Document';
+  }
+
+  function lightboxKindForMessage(msg: Message): LightboxItem['kind'] | null {
+    const kind = mediaKindFromMessage(msg);
+    if (kind === 'image' || kind === 'sticker') return 'image';
+    if (kind === 'video') return 'video';
+    if (kind === 'audio') return 'audio';
+    if (kind === 'document') return 'document';
+    return null;
+  }
+
+  function buildTabLightboxItems(): LightboxItem[] {
+    const items: LightboxItem[] = [];
+    for (const msg of tabItems) {
+      const kind = lightboxKindForMessage(msg);
+      if (!kind) continue;
+      const url = thumbSrc(msg);
+      if (!url) continue;
+      const mime = msg.metadata?.mime;
+      items.push({
+        id: msg.id,
+        url,
+        kind,
+        filename: mediaFilename(msg) ?? (tab === 'docs' ? docLabel(msg) : null),
+        mime: typeof mime === 'string' ? mime : null,
+      });
+    }
+    return items;
+  }
+
+  function openLightboxForItem(msg: Message) {
+    const items = buildTabLightboxItems();
+    const idx = items.findIndex((i) => i.id === msg.id);
+    if (idx < 0) return;
+    lightboxItems = items;
+    lightboxIndex = idx;
+    lightboxOpen = true;
+  }
+
+  function saveLightboxItem(item: LightboxItem) {
+    const a = document.createElement('a');
+    a.href = item.url;
+    a.download = item.filename ?? `media-${item.id.slice(0, 8)}`;
+    a.click();
   }
 </script>
 
@@ -204,26 +251,18 @@
       </div>
     {/if}
 
-    {#if isDirect && account}
+    {#if isDirect && account && canCall}
       <div class="call-row">
-        <button
-          type="button"
-          class="call-btn"
-          disabled={whatsappCallsDisabled || !callsAudio}
-          title={whatsappCallsDisabled ? "WhatsApp calling isn't available via the linked device API yet." : 'Audio call'}
-          onclick={() => handleCall('audio')}
-        >
-          🎧 Audio
-        </button>
-        <button
-          type="button"
-          class="call-btn"
-          disabled={whatsappCallsDisabled || !callsVideo}
-          title={whatsappCallsDisabled ? "WhatsApp calling isn't available via the linked device API yet." : 'Video call'}
-          onclick={() => handleCall('video')}
-        >
-          📹 Video
-        </button>
+        {#if callsAudio}
+          <button type="button" class="call-btn" title="Audio call" onclick={() => handleCall('audio')}>
+            🎧 Audio
+          </button>
+        {/if}
+        {#if callsVideo}
+          <button type="button" class="call-btn" title="Video call" onclick={() => handleCall('video')}>
+            📹 Video
+          </button>
+        {/if}
       </div>
     {/if}
 
@@ -273,7 +312,7 @@
               {#if tab === 'media'}
                 {@const src = thumbSrc(item)}
                 {@const kind = mediaKindFromMessage(item)}
-                <div class="grid-cell" title={kind ?? 'media'}>
+                <button type="button" class="grid-cell" title={kind ?? 'media'} onclick={() => openLightboxForItem(item)}>
                   {#if src}
                     <img src={src} alt="" loading="lazy" />
                   {:else}
@@ -281,12 +320,12 @@
                       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="m21 15-5-5-4 4-2-2-5 5"/></svg>
                     </div>
                   {/if}
-                </div>
+                </button>
               {:else}
-                <div class="grid-cell doc-cell" title={docLabel(item)}>
+                <button type="button" class="grid-cell doc-cell" title={docLabel(item)} onclick={() => openLightboxForItem(item)}>
                   <span class="doc-icon">📄</span>
                   <span class="doc-name">{docLabel(item)}</span>
-                </div>
+                </button>
               {/if}
             {/each}
           </div>
@@ -342,6 +381,14 @@
       <div class="toast">{toast}</div>
     {/if}
   </div>
+  <MediaLightbox
+    open={lightboxOpen}
+    items={lightboxItems}
+    index={lightboxIndex}
+    onclose={() => (lightboxOpen = false)}
+    onindex={(i) => (lightboxIndex = i)}
+    onsave={saveLightboxItem}
+  />
 {/if}
 
 <style>
@@ -464,6 +511,17 @@
     overflow: hidden;
     background: var(--bg-hover);
     min-width: 0;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    text-align: inherit;
+    color: inherit;
+    font: inherit;
+  }
+
+  .grid-cell:hover {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
 
   .grid-cell img {
@@ -491,7 +549,6 @@
     justify-content: center;
     gap: 2px;
     padding: 4px;
-    cursor: default;
   }
 
   .doc-icon { font-size: 16px; line-height: 1; }

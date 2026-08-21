@@ -116,20 +116,30 @@ def emit_auth(
     qr_data: Optional[str] = None,
     url: Optional[str] = None,
     message: Optional[str] = None,
+    account_id: Optional[str] = None,
 ) -> None:
-    send(
-        {
-            "type": "auth_required",
-            "method": method,
-            "qr_data": qr_data,
-            "url": url,
-            "message": message,
-        }
-    )
+    payload: dict[str, Any] = {
+        "type": "auth_required",
+        "method": method,
+        "qr_data": qr_data,
+        "url": url,
+        "message": message,
+    }
+    if account_id:
+        payload["account_id"] = account_id
+    send(payload)
 
 
-def emit_error(message: str) -> None:
-    send({"type": "error", "message": message})
+def emit_error(message: str, account_id: Optional[str] = None) -> None:
+    payload: dict[str, Any] = {"type": "error", "message": message}
+    if account_id:
+        payload["account_id"] = account_id
+    send(payload)
+
+
+def req_account_id(req: dict[str, Any], fallback: Optional[str] = None) -> Optional[str]:
+    aid = req.get("account_id") or fallback
+    return str(aid) if aid else None
 
 
 def emit_telemetry(

@@ -105,6 +105,18 @@ export async function updateAccount(accountId: string, patch: AccountPatch): Pro
     : mockApi.updateAccount(accountId, patch);
 }
 
+export async function wakeAccount(accountId: string): Promise<string> {
+  return isTauri() ? invoke('wake_account', { accountId }) : mockApi.wakeAccount(accountId);
+}
+
+export async function setActiveAccount(accountId: string | null): Promise<void> {
+  if (isTauri()) {
+    await invoke('set_active_account', { accountId });
+  } else {
+    await mockApi.setActiveAccount(accountId);
+  }
+}
+
 export async function connectAccount(
   accountId: string,
   credentials?: Record<string, string>
@@ -343,6 +355,11 @@ export async function totalUnread(): Promise<number> {
   return isTauri() ? invoke('total_unread') : mockApi.totalUnread();
 }
 
+export async function updateTrayUnread(count: number): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('update_tray_unread', { count });
+}
+
 export async function getAppConfig(): Promise<AppConfig> {
   return isTauri() ? invoke('get_app_config') : mockApi.getAppConfig();
 }
@@ -494,15 +511,20 @@ export async function updateScheduledMessage(
 export async function exportBackup(
   path: string,
   password: string,
-  includeMessages = true
+  includeMessages = true,
+  includeMedia = false
 ): Promise<BackupManifest> {
   return isTauri()
-    ? invoke('export_backup', { path, password, includeMessages })
-    : mockApi.exportBackup(path, password, includeMessages);
+    ? invoke('export_backup', { path, password, includeMessages, includeMedia })
+    : mockApi.exportBackup(path, password, includeMessages, includeMedia);
 }
 
 export async function restoreBackup(path: string, password: string): Promise<void> {
   return isTauri() ? invoke('restore_backup', { path, password }) : mockApi.restoreBackup(path, password);
+}
+
+export async function restartApp(): Promise<void> {
+  if (isTauri()) await invoke('restart_app');
 }
 
 export async function openExternal(url: string): Promise<void> {

@@ -42,6 +42,14 @@
     }
   }
 
+  function accountTitle(account: Account): string {
+    let title = account.name;
+    if (account.muted) title += ' (muted)';
+    if (account.disabled) title += ' (disabled)';
+    if (account.status === 'sleeping') title += ' (asleep)';
+    return title;
+  }
+
 </script>
 
 <nav class="sidebar" aria-label="Main navigation">
@@ -81,21 +89,26 @@
           class="nav-item network"
           class:active={selected === account.id}
           class:disabled={account.disabled}
+          class:sleeping={account.status === 'sleeping'}
           style="--network-color: {CONNECTOR_COLORS[account.connector_id] ?? '#888'}"
           onclick={() => onselect(account.id)}
           oncontextmenu={(e) => {
             e.preventDefault();
             onaccountmenu?.(account, e.clientX, e.clientY);
           }}
-          title={account.name}
-          aria-label={account.name}
+          title={accountTitle(account)}
+          aria-label={accountTitle(account)}
           aria-current={selected === account.id ? 'page' : undefined}
         >
           <span class="network-icon-wrap">
             <NetworkIcon connectorId={account.connector_id} size={16} />
           </span>
           {#if account.status !== 'connected'}
-            <span class="status-dot" class:connecting={account.status === 'connecting'}></span>
+            <span
+              class="status-dot"
+              class:connecting={account.status === 'connecting'}
+              class:sleeping={account.status === 'sleeping'}
+            ></span>
           {/if}
         </button>
       {/each}
@@ -324,6 +337,11 @@
     animation: pulse 1.5s infinite;
   }
 
+  .status-dot.sleeping {
+    background: var(--text-muted);
+    opacity: 0.65;
+  }
+
   .badge-pulse {
     animation: badge-breathe 2.4s ease-in-out infinite;
   }
@@ -400,6 +418,10 @@
 
   .network.disabled {
     opacity: 0.45;
+  }
+
+  .network.sleeping {
+    opacity: 0.7;
   }
 
   @media (max-width: 768px) {

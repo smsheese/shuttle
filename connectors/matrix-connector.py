@@ -16,7 +16,7 @@ from typing import Any, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from shuttle_ipc import creds, emit_auth, emit_error, emit_event, emit_status, log, now_iso, read_line, send, to_rfc3339
+from shuttle_ipc import creds, emit_auth, emit_error, emit_event, emit_status, log, now_iso, read_line, req_account_id, send, to_rfc3339
 
 CONNECTOR_ID = "matrix"
 VERSION = "1.0.0"
@@ -245,8 +245,8 @@ class MatrixSession:
 
 
 def main() -> None:
-    session: Optional[MatrixSession] = None
-    account_id = os.environ.get("SHUTTLE_ACCOUNT_ID")
+    sessions: dict[str, MatrixSession] = {}
+    fallback_id = os.environ.get("SHUTTLE_ACCOUNT_ID")
     while True:
         req = read_line()
         if req is None:
@@ -254,6 +254,8 @@ def main() -> None:
         if not req:
             continue
         rtype = req.get("type")
+        account_id = req_account_id(req, fallback_id)
+        session = sessions.get(account_id) if account_id else None
         if rtype == "handshake":
             send(
                 {
@@ -264,15 +266,18 @@ def main() -> None:
                 }
             )
         elif rtype in ("authenticate", "connect"):
-            account_id = req.get("account_id") or account_id
             if not account_id:
                 emit_error("missing account_id")
                 continue
             try:
+                old = sessions.pop(account_id, None)
+                if old:
+                    old.shutdown()
                 session = MatrixSession(str(account_id), creds(req))
+                sessions[account_id] = session
                 session.start()
             except Exception as e:
-                emit_error(str(e))
+                emit_error(str(e), account_id)
         elif rtype == "submit_auth":
             if session:
                 session.submit(creds(req))
@@ -284,13 +289,19 @@ def main() -> None:
                 try:
                     session.send_text(str(req.get("conversation_id") or ""), str(req.get("text") or ""))
                 except Exception as e:
-                    emit_error(str(e))
+                    emit_error(str(e), account_id)
         elif rtype == "mark_read":
             if session:
                 session.mark_read(str(req.get("conversation_id") or ""))
-        elif rtype in ("disconnect", "shutdown"):
-            if session:
-                session.shutdown()
+        elif rtype == "disconnect":
+            if account_id:
+                old = sessions.pop(account_id, None)
+                if old:
+                    old.shutdown()
+        elif rtype == "shutdown":
+            for old in sessions.values():
+                old.shutdown()
+            sessions.clear()
             break
         elif rtype == "get_status":
             emit_status(str(account_id or ""), "connected" if session and session.access_token else "disconnected")

@@ -32,6 +32,8 @@
     oncontext?: (conv: Conversation, x: number, y: number) => void;
     channelColor?: (connectorId: string) => string;
     datetimeFormat?: string;
+    focusSearchNonce?: number;
+    highlightId?: string | null;
   }
 
   let {
@@ -54,11 +56,14 @@
     oncontext,
     channelColor,
     datetimeFormat = '12h_full',
+    focusSearchNonce = 0,
+    highlightId = null,
   }: Props = $props();
 
   let searchExpanded = $state(false);
   let toastMessage = $state<string | null>(null);
   let searchInputEl = $state<HTMLInputElement | undefined>();
+  let desktopSearchInputEl = $state<HTMLInputElement | undefined>();
   let newMenuOpen = $state(false);
   let composeModal = $state<null | 'contact' | 'group'>(null);
   let contacts = $state<Contact[]>([]);
@@ -238,6 +243,17 @@
     searchExpanded = false;
     if (searchQuery) onsearch('');
   }
+
+  $effect(() => {
+    void focusSearchNonce;
+    if (!focusSearchNonce) return;
+    openSearch();
+    requestAnimationFrame(() => {
+      const el = desktopSearchInputEl ?? searchInputEl;
+      el?.focus();
+      el?.select();
+    });
+  });
 </script>
 
 {#snippet convRow(conv: Conversation)}
@@ -245,6 +261,7 @@
   <button
     class="conv-item"
     class:selected={selectedId === conv.id}
+    class:keyboard-focus={highlightId === conv.id && selectedId !== conv.id}
     class:unread={conv.unread_count > 0}
     class:pinned={conv.pinned}
     class:muted={conv.muted}
@@ -460,6 +477,7 @@
           <circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>
         </svg>
         <input
+          bind:this={desktopSearchInputEl}
           type="text"
           placeholder="Search conversations"
           value={searchQuery}
@@ -1221,6 +1239,11 @@
   .conv-item.selected {
     background: var(--bg-active);
     box-shadow: inset 0 0 0 1px var(--border-subtle);
+  }
+
+  .conv-item.keyboard-focus {
+    background: var(--bg-hover);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
   }
 
   .conv-item.unread {

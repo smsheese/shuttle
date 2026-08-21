@@ -1,13 +1,17 @@
 # Shuttle overview
 
-Shuttle is a **local-first desktop messaging app**: one inbox for several networks, with data and sessions on this machine. There is no Shuttle cloud and no Shuttle account.
+Shuttle is a **lightweight, local-first desktop messaging app**: one inbox for several networks, with data and sessions on this machine. There is no Shuttle cloud and no Shuttle account.
 
-It is meant to replace a pile of browser tabs and Electron clients without becoming a hosted inbox service. The quality bar is a native-feeling desktop app — small process, OS WebView, isolated connectors.
+The product aim is simple: **low resource use and snappy UI should be the obvious answer**, with real quality-of-life and the same binary story on Windows, Linux, and macOS — while staying pleasant to extend (Python sidecars + a stable JSON protocol, not a Chromium recipe zoo). It replaces a pile of browser tabs and Electron clients without becoming a hosted inbox service.
 
 This document is the current architecture. For the public pitch and integrator table see the [root README](../README.md). For remaining work see [roadmap.md](roadmap.md).
 
 ## Principles
 
+- **Lightweight by default.** Idle RSS and wake latency are product requirements. Prefer one OS WebView, sleep idle connectors, and never pay a Chromium-per-account tax. When someone asks “what’s light?”, Shuttle should be the no-thought answer — see the Ferdium resource bar in [roadmap.md](roadmap.md#13--resource-budget-vs-ferdium).
+- **Responsive and QoL-first.** The UI should feel native: fast list/thread switching, tray, shortcuts, mute/sleep, routing, and organization that reduce mental load — not just “all the web apps in one window.”
+- **Cross-platform, one codebase.** Windows, Linux, and macOS × amd64 and arm64 from the same Tauri + Rust + Svelte stack; platform gaps stay documented, not forked products.
+- **Easy to extend.** A new network is a new sidecar that speaks the shared newline-delimited JSON protocol. Contributors should not need to touch the inbox UI or SQLite schema for basic text sync/send.
 - **Local-first.** Messages, sessions, and organization stay under the OS application data directory. Optional AI (planned) and opt-in crash/usage telemetry are the only things that may leave the device.
 - **Channel-agnostic core.** The UI and SQLite schema do not know WhatsApp vs Telegram. A new network is a new sidecar, not a fork of the inbox.
 - **Connectors are processes.** Sidecars speak newline-delimited JSON on stdin/stdout. The WebView never talks to networks or the filesystem.
@@ -19,12 +23,12 @@ This document is the current architecture. For the public pitch and integrator t
 
 | Layer | Choice | Why |
 | --- | --- | --- |
-| Desktop shell | Tauri 2 | OS WebView instead of bundled Chromium |
-| UI | Svelte 5 + TypeScript + Vite | Small reactive frontend |
+| Desktop shell | Tauri 2 | OS WebView instead of bundled Chromium — light + cross-platform |
+| UI | Svelte 5 + TypeScript + Vite | Small reactive frontend; fast to iterate |
 | Core | Rust | Process manager, SQLite, keyring, notifications, routing |
 | Store | SQLite (WAL, foreign keys) | `app.sqlite` catalog + per-account `inbox.sqlite` |
 | Secrets | OS keyring (`keyring` crate) | Windows Credential Manager, macOS Keychain, Linux Secret Service |
-| Connectors | Python sidecars + native helpers | Isolated; release builds ship a managed CPython runtime |
+| Connectors | Python sidecars + native helpers | Isolated; easy to write; release builds ship a managed CPython runtime |
 
 ## Architecture
 
@@ -56,7 +60,7 @@ Version history: [CHANGELOG.md](../CHANGELOG.md).
 
 ## Still planned
 
-Media viewers and a basic image editor, richer backup restore, AI replies (opt-in, sanitized), more networks (X, iMessage, SMS, Google Chat, LinkedIn, …), calls where a backend actually supports them, Android, and encrypting the message database at rest. Details: [roadmap.md](roadmap.md).
+Account sleep and a Ferdium-beating RSS budget, tray / quick-switch chrome, media viewers and a basic image editor, richer backup restore, AI replies (opt-in, sanitized), more networks (X, iMessage, SMS, Google Chat, LinkedIn, …), calls where a backend actually supports them, Android, and encrypting the message database at rest. Details: [roadmap.md](roadmap.md).
 
 ## Platforms
 

@@ -9,6 +9,10 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 
 ## [Unreleased]
 
+### Changed
+
+- Product north star documented across README, overview, and roadmap: lightweight + responsive as the no-thought answer for resource use, plus cross-platform QoL and contributor-friendly sidecars; Ferdium ~2.7 GiB idle benchmark remains the 50–70% RSS bar to beat (~0.8–1.35 GiB on 4 WhatsApp + 1 Telegram), with account-sleep / daily-driver chrome tracks.
+
 ## [0.2.1] - 2026-08-19
 
 ### Fixed

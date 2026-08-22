@@ -21,7 +21,16 @@ from pathlib import Path
 from typing import Any, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from shuttle_ipc import to_rfc3339
+from shuttle_ipc import (
+    child_pdeathsig,
+    file_lock_exclusive,
+    file_unlock,
+    find_processes_matching,
+    pid_alive,
+    spawn_parent_death_watchdog,
+    terminate_pid,
+    to_rfc3339,
+)
 
 CONNECTOR_ID = "whatsapp"
 VERSION = "1.0.0"
@@ -248,70 +257,144 @@ def load_or_start_gowa() -> tuple[str, tuple[str, str], Optional[subprocess.Pope
         password = password_env or "shuttle"
         return existing.rstrip("/"), (user, password), None
 
-    state_path = gowa_home() / "runtime.json"
-    if state_path.exists():
-        try:
-            state = json.loads(state_path.read_text())
-            url = state.get("url")
-            password = state.get("password")
-            pid = state.get("pid")
-            if url and password and pid and _pid_alive(pid):
-                if wait_http(url, (GOWA_USER, password), timeout=3):
-                    return url, (GOWA_USER, password), None
-        except Exception as e:
-            log(f"stale GOWA state ignored: {e}")
+    home = gowa_home()
+    home.mkdir(parents=True, exist_ok=True)
+    state_path = home / "runtime.json"
+    lock_path = home / "gowa.lock"
 
-    binary = find_gowa_binary()
-    if binary is None:
-        raise FileNotFoundError(
-            "GOWA binary not found. Run ./connectors/gowa/fetch.sh or set SHUTTLE_GOWA_BIN."
-        )
-
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    password = secrets.token_urlsafe(18)
-    url = f"http://127.0.0.1:{port}"
-    env = os.environ.copy()
-    env.update(
-        {
-            "APP_HOST": "127.0.0.1",
-            "APP_PORT": str(port),
-            "APP_OS": "Shuttle",
-            "APP_DEBUG": "false",
-            "APP_BASIC_AUTH": f"{GOWA_USER}:{password}",
-            "WHATSAPP_AUTO_MARK_READ": "false",
-            "WHATSAPP_AUTO_DOWNLOAD_MEDIA": "false",
-            "WHATSAPP_PRESENCE_ON_CONNECT": "unavailable",
-            "WHATSAPP_CHAT_STORAGE": "true",
-            "DB_URI": f"file:{gowa_home() / 'storages' / 'whatsapp.db'}?_foreign_keys=on",
-        }
-    )
-    log(f"starting GOWA {binary} on {url}")
-    proc = subprocess.Popen(
-        [str(binary), "rest", f"--host=127.0.0.1", f"--port={port}", f"--os=Shuttle", f"--basic-auth={GOWA_USER}:{password}"],
-        cwd=str(gowa_home()),
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=open(gowa_home() / "gowa.log", "ab"),
-        start_new_session=True,
-    )
-    state_path.write_text(
-        json.dumps({"url": url, "password": password, "pid": proc.pid, "port": port})
-    )
-    if not wait_http(url, (GOWA_USER, password), timeout=25):
-        proc.kill()
-        raise RuntimeError("GOWA did not become ready on loopback")
-    return url, (GOWA_USER, password), proc
-
-
-def _pid_alive(pid: int) -> bool:
+    # Serialize start so only one GOWA can be created; kill strays under the lock.
+    lock_f = open(lock_path, "a+", encoding="utf-8")
+    file_lock_exclusive(lock_f)
     try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+        reusable = _try_reuse_gowa(state_path)
+        if reusable is not None:
+            return reusable
+
+        binary = find_gowa_binary()
+        if binary is None:
+            raise FileNotFoundError(
+                "GOWA binary not found. Run ./connectors/gowa/fetch.sh or set SHUTTLE_GOWA_BIN."
+            )
+
+        # Hard singleton: never leave more than one Shuttle GOWA alive.
+        for pid in _find_gowa_pids(binary):
+            log(f"killing stray GOWA pid {pid}")
+            terminate_pid(pid)
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        password = secrets.token_urlsafe(18)
+        url = f"http://127.0.0.1:{port}"
+        env = os.environ.copy()
+        env.update(
+            {
+                "APP_HOST": "127.0.0.1",
+                "APP_PORT": str(port),
+                "APP_OS": "Shuttle",
+                "APP_DEBUG": "false",
+                "APP_BASIC_AUTH": f"{GOWA_USER}:{password}",
+                "WHATSAPP_AUTO_MARK_READ": "false",
+                "WHATSAPP_AUTO_DOWNLOAD_MEDIA": "false",
+                "WHATSAPP_PRESENCE_ON_CONNECT": "unavailable",
+                "WHATSAPP_CHAT_STORAGE": "true",
+                "DB_URI": f"file:{home / 'storages' / 'whatsapp.db'}?_foreign_keys=on",
+            }
+        )
+        log(f"starting GOWA {binary} on {url}")
+        proc = subprocess.Popen(
+            [
+                str(binary),
+                "rest",
+                "--host=127.0.0.1",
+                f"--port={port}",
+                "--os=Shuttle",
+                f"--basic-auth={GOWA_USER}:{password}",
+            ],
+            cwd=str(home),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=open(home / "gowa.log", "ab"),
+            # Stay in the connector process tree so Shuttle/connector death cleans GOWA up.
+            preexec_fn=child_pdeathsig if sys.platform == "linux" else None,
+        )
+        state_path.write_text(
+            json.dumps({"url": url, "password": password, "pid": proc.pid, "port": port})
+        )
+        if not wait_http(url, (GOWA_USER, password), timeout=25):
+            proc.kill()
+            try:
+                state_path.unlink(missing_ok=True)
+            except TypeError:
+                if state_path.exists():
+                    state_path.unlink()
+            raise RuntimeError("GOWA did not become ready on loopback")
+        return url, (GOWA_USER, password), proc
+    finally:
+        file_unlock(lock_f)
+        lock_f.close()
+
+
+def _try_reuse_gowa(
+    state_path: Path,
+) -> Optional[tuple[str, tuple[str, str], Optional[subprocess.Popen]]]:
+    if not state_path.exists():
+        return None
+    try:
+        state = json.loads(state_path.read_text())
+        url = state.get("url")
+        password = state.get("password")
+        pid = state.get("pid")
+        if url and password and pid and pid_alive(int(pid)):
+            if wait_http(url, (GOWA_USER, password), timeout=3):
+                return url, (GOWA_USER, password), None
+            log(f"GOWA pid {pid} alive but HTTP not ready; replacing")
+            terminate_pid(int(pid))
+        elif pid and pid_alive(int(pid)):
+            terminate_pid(int(pid))
+    except Exception as e:
+        log(f"stale GOWA state ignored: {e}")
+    try:
+        state_path.unlink(missing_ok=True)
+    except TypeError:
+        if state_path.exists():
+            state_path.unlink()
+    return None
+
+
+def _find_gowa_pids(binary: Path) -> list[int]:
+    """Find Shuttle-managed GOWA rest processes (max should be 0 or 1)."""
+    bin_name = binary.name
+    pids = set(
+        find_processes_matching("rest", "--host=127.0.0.1", "--os=Shuttle", binary_name=bin_name)
+    )
+    pids.update(
+        find_processes_matching(
+            "rest", "--host=127.0.0.1", "basic-auth=shuttle:", binary_name=bin_name
+        )
+    )
+    return sorted(pids)
+
+
+def stop_gowa_singleton() -> None:
+    """Stop the shared GOWA process for this Shuttle data dir (if any)."""
+    state_path = gowa_home() / "runtime.json"
+    if not state_path.exists():
+        return
+    try:
+        state = json.loads(state_path.read_text())
+        pid = state.get("pid")
+        if pid and pid_alive(int(pid)):
+            log(f"stopping GOWA pid {pid}")
+            terminate_pid(int(pid))
+    except Exception as e:
+        log(f"GOWA stop failed: {e}")
+    try:
+        state_path.unlink(missing_ok=True)
+    except TypeError:
+        if state_path.exists():
+            state_path.unlink()
 
 
 class MiniWebSocket:
@@ -1854,9 +1937,10 @@ class WhatsAppSession:
 
     def shutdown(self) -> None:
         self.stop.set()
-
+        # GOWA is shared across accounts in this process; stopped in main()'s finally.
 
 def main() -> None:
+    spawn_parent_death_watchdog()
     sessions: dict[str, WhatsAppSession] = {}
     fallback_id = os.environ.get("SHUTTLE_ACCOUNT_ID")
 
@@ -1865,115 +1949,121 @@ def main() -> None:
         aid = str(aid) if aid else None
         return aid, sessions.get(aid) if aid else None
 
-    while True:
-        req = read_line()
-        if req is None:
-            break
-        rtype = req.get("type")
-        account_id, session = pick(req)
-        if rtype == "handshake":
-            send(
-                {
-                    "type": "handshake_ok",
-                    "connector_id": CONNECTOR_ID,
-                    "version": VERSION,
-                    "capabilities": CAPABILITIES,
-                }
-            )
-        elif rtype in {"authenticate", "connect"}:
-            if not account_id:
-                send({"type": "error", "message": "missing account_id"})
-                continue
-            send({"type": "status", "account_id": account_id, "status": "connecting", "identity": None})
-            try:
-                old = sessions.pop(account_id, None)
-                if old:
-                    old.shutdown()
-                session = WhatsAppSession(account_id)
-                sessions[account_id] = session
-                session.connect()
-            except FileNotFoundError as e:
-                send({"type": "error", "message": str(e), "account_id": account_id})
-            except Exception as e:
-                log(f"authenticate failed: {e}")
-                send({"type": "error", "message": str(e), "account_id": account_id})
-        elif rtype == "sync_history":
-            if session and session._connected:
-                try:
-                    session.sync_history(force=True)
-                except Exception as e:
-                    log(f"sync_history: {e}")
-            send({"type": "ok", "request_id": None})
-        elif rtype == "sync_chat":
-            if session and session._connected:
-                try:
-                    session.refresh_chat(req.get("conversation_id") or "")
-                except Exception as e:
-                    log(f"sync_chat: {e}")
-            send({"type": "ok", "request_id": None})
-        elif rtype == "download_media":
-            if session:
-                session.download_media(req.get("conversation_id") or "", req.get("message_id") or "")
-            else:
-                send({"type": "error", "message": "not connected", "account_id": account_id})
-        elif rtype == "fetch_avatar":
-            if session:
-                session.emit_avatar(req.get("conversation_id") or "")
-            send({"type": "ok", "request_id": None})
-        elif rtype == "fetch_contact_profile":
-            if session:
-                session.fetch_contact_profile(req.get("conversation_id") or "")
-            else:
-                send({"type": "error", "message": "not connected", "account_id": account_id})
-        elif rtype == "create_group":
-            if not session:
-                send({"type": "error", "message": "not connected", "account_id": account_id})
-                continue
-            parts = req.get("participants") or []
-            if not isinstance(parts, list):
-                parts = []
-            session.create_group(req.get("title") or "", [str(p) for p in parts])
-        elif rtype == "send_message":
-            if not session:
-                send({"type": "error", "message": "not connected", "account_id": account_id})
-                continue
-            session.send_text(req.get("conversation_id") or "", req.get("text") or "")
-        elif rtype == "send_attachment":
-            if not session:
-                send({"type": "error", "message": "not connected", "account_id": account_id})
-                continue
-            session.send_attachment(req.get("conversation_id") or "", req)
-        elif rtype == "mark_read":
-            if session:
-                session.mark_read(req.get("conversation_id") or "")
-            else:
-                send({"type": "ok", "request_id": None})
-        elif rtype == "get_status":
-            if session:
-                st = session.device_status()
-                logged = bool(st.get("is_logged_in"))
+    try:
+        while True:
+            req = read_line()
+            if req is None:
+                break
+            rtype = req.get("type")
+            account_id, session = pick(req)
+            if rtype == "handshake":
                 send(
                     {
-                        "type": "status",
-                        "account_id": account_id,
-                        "status": "connected" if logged else "awaiting_auth",
-                        "identity": st.get("device_id") or st.get("jid"),
+                        "type": "handshake_ok",
+                        "connector_id": CONNECTOR_ID,
+                        "version": VERSION,
+                        "capabilities": CAPABILITIES,
                     }
                 )
-            else:
-                send({"type": "status", "account_id": account_id, "status": "disconnected", "identity": None})
-        elif rtype == "submit_auth":
-            send({"type": "ok", "request_id": None})
-        elif rtype == "disconnect":
-            if account_id:
-                old = sessions.pop(account_id, None)
-                if old:
+            elif rtype in {"authenticate", "connect"}:
+                if not account_id:
+                    send({"type": "error", "message": "missing account_id"})
+                    continue
+                send({"type": "status", "account_id": account_id, "status": "connecting", "identity": None})
+                try:
+                    old = sessions.pop(account_id, None)
+                    if old:
+                        old.shutdown()
+                    session = WhatsAppSession(account_id)
+                    sessions[account_id] = session
+                    session.connect()
+                except FileNotFoundError as e:
+                    send({"type": "error", "message": str(e), "account_id": account_id})
+                except Exception as e:
+                    log(f"authenticate failed: {e}")
+                    send({"type": "error", "message": str(e), "account_id": account_id})
+            elif rtype == "sync_history":
+                if session and session._connected:
+                    try:
+                        session.sync_history(force=True)
+                    except Exception as e:
+                        log(f"sync_history: {e}")
+                send({"type": "ok", "request_id": None})
+            elif rtype == "sync_chat":
+                if session and session._connected:
+                    try:
+                        session.refresh_chat(req.get("conversation_id") or "")
+                    except Exception as e:
+                        log(f"sync_chat: {e}")
+                send({"type": "ok", "request_id": None})
+            elif rtype == "download_media":
+                if session:
+                    session.download_media(req.get("conversation_id") or "", req.get("message_id") or "")
+                else:
+                    send({"type": "error", "message": "not connected", "account_id": account_id})
+            elif rtype == "fetch_avatar":
+                if session:
+                    session.emit_avatar(req.get("conversation_id") or "")
+                send({"type": "ok", "request_id": None})
+            elif rtype == "fetch_contact_profile":
+                if session:
+                    session.fetch_contact_profile(req.get("conversation_id") or "")
+                else:
+                    send({"type": "error", "message": "not connected", "account_id": account_id})
+            elif rtype == "create_group":
+                if not session:
+                    send({"type": "error", "message": "not connected", "account_id": account_id})
+                    continue
+                parts = req.get("participants") or []
+                if not isinstance(parts, list):
+                    parts = []
+                session.create_group(req.get("title") or "", [str(p) for p in parts])
+            elif rtype == "send_message":
+                if not session:
+                    send({"type": "error", "message": "not connected", "account_id": account_id})
+                    continue
+                session.send_text(req.get("conversation_id") or "", req.get("text") or "")
+            elif rtype == "send_attachment":
+                if not session:
+                    send({"type": "error", "message": "not connected", "account_id": account_id})
+                    continue
+                session.send_attachment(req.get("conversation_id") or "", req)
+            elif rtype == "mark_read":
+                if session:
+                    session.mark_read(req.get("conversation_id") or "")
+                else:
+                    send({"type": "ok", "request_id": None})
+            elif rtype == "get_status":
+                if session:
+                    st = session.device_status()
+                    logged = bool(st.get("is_logged_in"))
+                    send(
+                        {
+                            "type": "status",
+                            "account_id": account_id,
+                            "status": "connected" if logged else "awaiting_auth",
+                            "identity": st.get("device_id") or st.get("jid"),
+                        }
+                    )
+                else:
+                    send({"type": "status", "account_id": account_id, "status": "disconnected", "identity": None})
+            elif rtype == "submit_auth":
+                send({"type": "ok", "request_id": None})
+            elif rtype == "disconnect":
+                if account_id:
+                    old = sessions.pop(account_id, None)
+                    if old:
+                        old.shutdown()
+            elif rtype == "shutdown":
+                for old in sessions.values():
                     old.shutdown()
-        elif rtype == "shutdown":
-            for old in sessions.values():
-                old.shutdown()
-            sessions.clear()
-            break
+                sessions.clear()
+                break
+    finally:
+        for old in list(sessions.values()):
+            old.shutdown()
+        sessions.clear()
+        stop_gowa_singleton()
 
 
 if __name__ == "__main__":

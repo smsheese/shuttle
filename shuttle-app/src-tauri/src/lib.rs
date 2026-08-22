@@ -11,15 +11,29 @@ mod secrets;
 mod telemetry;
 mod tray;
 
-use commands::{init_state, APP_HANDLE};
-use tauri::{Manager, WindowEvent};
+use commands::{init_state, AppState, APP_HANDLE};
+use tauri::{Manager, RunEvent, WindowEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     crate::env::load_dotenv();
     tracing_subscriber::fmt::init();
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+
+    #[cfg(desktop)]
+    {
+        // Must be registered first so a second launch focuses the existing window.
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }));
+    }
+
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -124,6 +138,13 @@ pub fn run() {
             commands::cancel_component_install,
             tray::update_tray_unread,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.connectors.shutdown_all();
+                }
+            }
+        });
 }

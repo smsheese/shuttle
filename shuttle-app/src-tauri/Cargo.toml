@@ -1,6 +1,6 @@
 [package]
 name = "shuttle"
-version = "0.3.0"
+version = "0.3.2"
 description = "Local-first unified messaging desktop app"
 authors = ["Sheese Sheikh <https://shee.se>"]
 homepage = "https://shee.se"
@@ -20,6 +20,7 @@ dotenvy = "0.15"
 tauri = { version = "2", features = ["image-png", "tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -45,6 +46,14 @@ flate2 = "1"
 futures-util = "0.3"
 sentry = { version = "0.35", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 dotenvy = "0.15"
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

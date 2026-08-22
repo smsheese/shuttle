@@ -5,6 +5,7 @@
   import { dismissSplashScreen } from '$lib/splash';
   import { applyAppConfig } from '$lib/theme';
   import { ensureThemeConfig } from '$lib/tweakcn';
+  import { startWindowTitleClock } from '$lib/windowTitle';
 
   onMount(() => {
     const block = (e: Event) => e.preventDefault();
@@ -16,6 +17,10 @@
       }
     };
     window.addEventListener('keydown', onKey);
+    let stopTitle: (() => void) | undefined;
+    void startWindowTitleClock().then((stop) => {
+      stopTitle = stop;
+    });
     getAppConfig()
       .then(async (cfg) => {
         const withTheme = await ensureThemeConfig(cfg, fetchTweakcnTheme);
@@ -34,6 +39,7 @@
     };
     mq.addEventListener('change', onScheme);
     return () => {
+      stopTitle?.();
       document.removeEventListener('contextmenu', block, true);
       window.removeEventListener('keydown', onKey);
       mq.removeEventListener('change', onScheme);

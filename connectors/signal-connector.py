@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from shuttle_ipc import (
     account_dir,
+    child_pdeathsig,
     creds,
     emit_auth,
     emit_error,
@@ -26,6 +27,7 @@ from shuttle_ipc import (
     read_line,
     req_account_id,
     send,
+    spawn_parent_death_watchdog,
     to_rfc3339,
 )
 
@@ -121,6 +123,7 @@ class SignalSession:
             env=env,
             text=True,
             bufsize=1,
+            preexec_fn=child_pdeathsig if sys.platform == "linux" else None,
         )
         threading.Thread(target=self._read, daemon=True).start()
         emit_status(self.account_id, "connected", self.phone)
@@ -344,6 +347,7 @@ class SignalSession:
 
 
 def main() -> None:
+    spawn_parent_death_watchdog()
     sessions: dict[str, SignalSession] = {}
     fallback_id = os.environ.get("SHUTTLE_ACCOUNT_ID")
     while True:

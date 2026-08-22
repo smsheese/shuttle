@@ -832,6 +832,22 @@ impl Database {
         }
     }
 
+    pub fn update_message_status(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        status: MessageStatus,
+    ) -> Result<(), DbError> {
+        let conv = self.get_conversation(conversation_id)?;
+        let inbox = self.inbox(&conv.account_id)?;
+        let conn = inbox.conn.lock();
+        conn.execute(
+            "UPDATE messages SET status = ?1 WHERE id = ?2 AND conversation_id = ?3",
+            params![message_status_str(&status), message_id, conversation_id],
+        )?;
+        Ok(())
+    }
+
     pub fn upsert_contact(
         &self,
         account_id: &str,

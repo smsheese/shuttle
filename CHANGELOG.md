@@ -9,6 +9,30 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-08-22
+
+### Changed
+
+- Connector/GOWA process lifecycle is cross-platform: Linux `PR_SET_PDEATHSIG`, Windows job objects (`KILL_ON_JOB_CLOSE`), macOS/Windows parent watchdog threads, and platform-specific orphan/cmdline checks (Linux `/proc`, macOS `ps`, Windows PowerShell CIM).
+
+## [0.3.1] - 2026-08-21
+
+### Added
+
+- Single-instance lock: launching Shuttle again focuses the existing window instead of opening a second copy.
+- Window title shows app version and a live locale date/time (`Shuttle 0.3.1 — …`).
+- Hard cap of **one OS process per connector** (pidfile reclaim of orphans) and **one GOWA** instance (lock + stray kill before start).
+- Connector and GOWA children are parented to Shuttle (Linux `PR_SET_PDEATHSIG`, `kill_on_drop`, no detached GOWA session) so killing/quitting Shuttle tears them down too.
+
+### Changed
+
+- Outbound chat bubbles, send button, search highlight, and related accents follow the active tweakcn theme (`--bg-bubble-out` / `--text-on-accent`) instead of a hardcoded blue gradient.
+- Regenerated desktop/mobile app icons from the in-love emoji logo (including Android launcher assets and a real `.icns`).
+
+### Fixed
+
+- Sending no longer silently succeeds when the connector isn’t running: start/send errors are surfaced, failed messages are marked `failed`, and the composer draft is restored when nothing was queued.
+
 ## [0.3.0] - 2026-08-21
 
 ### Added

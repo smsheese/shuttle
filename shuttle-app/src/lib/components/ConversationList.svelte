@@ -651,8 +651,8 @@
   }
 
   .search-scope button.active {
-    background: var(--accent, #3b82f6);
-    color: #fff;
+    background: var(--accent);
+    color: var(--text-on-accent, var(--primary-foreground, #ffffff));
     border-color: transparent;
   }
 

@@ -62,12 +62,14 @@ function shuttleMappings(vars: Record<string, string>): string[] {
   const mutedForeground = pick(vars, 'muted-foreground');
   const secondaryForeground = pick(vars, 'secondary-foreground');
   const primary = pick(vars, 'primary');
+  const primaryForeground = pick(vars, 'primary-foreground');
   const accent = pick(vars, 'accent');
   const muted = pick(vars, 'muted');
   const border = pick(vars, 'border');
   const input = pick(vars, 'input');
   const radius = pick(vars, 'radius');
   const fontSans = pick(vars, 'font-sans');
+  const destructive = pick(vars, 'destructive');
 
   if (background) lines.push(`  --bg-main: ${background};`);
   if (card) lines.push(`  --bg-panel: ${card};`);
@@ -79,12 +81,19 @@ function shuttleMappings(vars: Record<string, string>): string[] {
     lines.push(`  --accent: ${primary};`);
     lines.push(`  --accent-hover: color-mix(in oklch, ${primary} 88%, black);`);
     lines.push(`  --bg-bubble-out: ${primary};`);
+    lines.push(`  --accent-glow: color-mix(in oklch, ${primary} 35%, transparent);`);
+  }
+  if (primaryForeground) {
+    lines.push(`  --text-on-accent: ${primaryForeground};`);
+  } else if (primary) {
+    lines.push(`  --text-on-accent: #ffffff;`);
   }
   if (accent) {
     lines.push(`  --accent-muted: color-mix(in oklch, ${accent} 18%, transparent);`);
   } else if (primary) {
     lines.push(`  --accent-muted: color-mix(in oklch, ${primary} 15%, transparent);`);
   }
+  if (destructive) lines.push(`  --destructive: ${destructive};`);
   if (border) {
     lines.push(`  --border: ${border};`);
     lines.push(`  --border-subtle: color-mix(in oklch, ${border} 55%, transparent);`);
@@ -226,7 +235,6 @@ export async function ensureThemeConfig(
   if (isLegacyPreset(themeId)) return cfg;
   const id = parseTweakcnId(themeId);
   if (!id) return cfg;
-  if (cfg.appearance.tweakcn_css?.trim()) return cfg;
 
   const bundled = bundledThemeForId(id);
   if (bundled) {
@@ -235,10 +243,14 @@ export async function ensureThemeConfig(
       appearance: {
         ...cfg.appearance,
         theme_id: id,
+        // Always refresh bundled theme CSS so Shuttle mapping vars stay current.
         tweakcn_css: themeToCss(bundled),
       },
     };
   }
+
+  const existing = cfg.appearance.tweakcn_css?.trim();
+  if (existing?.includes('--text-on-accent')) return cfg;
 
   const fetched = await fetchTheme(id);
   return {

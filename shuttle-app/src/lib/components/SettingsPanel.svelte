@@ -1262,7 +1262,7 @@
     border: none;
     background: none;
     padding: 0;
-    color: var(--accent, #3b82f6);
+    color: var(--accent);
     cursor: pointer;
     font: inherit;
     text-align: left;

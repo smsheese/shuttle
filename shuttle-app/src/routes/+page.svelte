@@ -131,6 +131,7 @@
   let showSetup = $state(false);
   let connecting = $state(false);
   let setupError = $state<string | null>(null);
+  let sendError = $state<string | null>(null);
   let qrData = $state<string | null>(null);
   let authMethod = $state<string | null>(null);
   let authMessage = $state<string | null>(null);
@@ -397,14 +398,32 @@
     if (!draft.trim() || !selectedConversation) return;
     const text = normalizeRichText(draft.trim(), connectorForAccount(selectedConversation.account_id));
     draft = '';
-    await sendMessage(selectedConversation.account_id, selectedConversation.id, text);
+    sendError = null;
+    try {
+      await sendMessage(selectedConversation.account_id, selectedConversation.id, text);
+    } catch (e) {
+      sendError = e instanceof Error ? e.message : String(e);
+      await loadMessages(selectedConversation.id);
+      const saved = messages.some(
+        (m) =>
+          m.direction === 'outbound' &&
+          m.body === text &&
+          (m.status === 'failed' || m.status === 'pending')
+      );
+      if (!saved) draft = text;
+      return;
+    }
     await loadMessages(selectedConversation.id);
   }
 
   async function handleSendAttachment(attachment: AttachmentPayload) {
     if (!selectedConversation) return;
-    draft = '';
-    await sendAttachment(selectedConversation.account_id, selectedConversation.id, attachment);
+    sendError = null;
+    try {
+      await sendAttachment(selectedConversation.account_id, selectedConversation.id, attachment);
+    } catch (e) {
+      sendError = e instanceof Error ? e.message : String(e);
+    }
     await loadMessages(selectedConversation.id);
   }
 
@@ -885,6 +904,12 @@
 </script>
 
 <div class="app" class:hidden={setupOnly}>
+  {#if sendError}
+    <div class="send-error" role="alert">
+      <span>Couldn’t send: {sendError}</span>
+      <button type="button" onclick={() => (sendError = null)} aria-label="Dismiss">×</button>
+    </div>
+  {/if}
   <div class="sidebar-wrap" class:hidden-mobile={mobileView === 'thread'}>
     <Sidebar
       {accounts}
@@ -1195,6 +1220,34 @@
     width: 100vw;
     overflow: hidden;
     background: var(--bg-main);
+    position: relative;
+  }
+  .send-error {
+    position: absolute;
+    top: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: min(520px, calc(100vw - 24px));
+    padding: 8px 10px 8px 12px;
+    border-radius: var(--radius-md);
+    background: color-mix(in oklch, var(--destructive, #ef4444) 16%, var(--bg-panel));
+    border: 1px solid color-mix(in oklch, var(--destructive, #ef4444) 45%, var(--border));
+    color: var(--text);
+    box-shadow: var(--shadow-md);
+    font-size: 13px;
+  }
+  .send-error button {
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 4px;
   }
   .app.hidden {
     visibility: hidden;

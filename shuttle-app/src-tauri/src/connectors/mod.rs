@@ -1,3 +1,5 @@
+mod process_lock;
+mod process_tree;
 mod protocol;
 
 pub use protocol::*;
@@ -62,6 +64,7 @@ impl ConnectorManager {
         components: Arc<ComponentManager>,
         event_tx: broadcast::Sender<AppEvent>,
     ) -> Self {
+        process_tree::init();
         Self {
             db,
             config,
@@ -261,9 +264,16 @@ impl ConnectorManager {
             .env("SHUTTLE_FILES_DIR", &files_dir)
             .env("SHUTTLE_GOWA_BIN", self.components.gowa_binary())
             .env("SHUTTLE_TDLIB", self.components.tdlib_path())
-            .env("SHUTTLE_SIGNAL_CLI", self.components.signal_cli())
+            .env("SHUTTLE_SIGNAL_CLI", self.components.signal_cli());
+        process_tree::prepare_connector_command(&mut command);
+
+        let child = command
             .spawn()
-            .map_err(|e| format!("Failed to spawn connector: {e}"))
+            .map_err(|e| format!("Failed to spawn connector: {e}"))?;
+        if let Some(pid) = child.id() {
+            process_tree::on_connector_spawned(pid);
+        }
+        Ok(child)
     }
 
     pub fn start_connector(
@@ -289,7 +299,13 @@ impl ConnectorManager {
             return Ok("Connector attached".into());
         }
 
+        // Hard cap: one OS process per connector_id. Reclaim orphans from crashed runs.
+        process_lock::reclaim(&self.data_dir, connector_id);
+
         let mut child = self.spawn_connector_process(connector_id, account_id)?;
+        if let Some(pid) = child.id() {
+            process_lock::write_pid(&self.data_dir, connector_id, pid);
+        }
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
 
         let stdout = child.stdout.take().ok_or("No stdout")?;
@@ -679,9 +695,9 @@ impl ConnectorManager {
         conversation_id: &str,
         text: &str,
     ) -> Result<Message, String> {
-        let _ = self.ensure_running(account_id);
+        self.ensure_running(account_id)?;
         let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
-        let msg = Message {
+        let mut msg = Message {
             id: Uuid::new_v4().to_string(),
             conversation_id: conversation_id.to_string(),
             remote_id: None,
@@ -699,14 +715,32 @@ impl ConnectorManager {
         self.touch_activity(account_id);
         let conv = self.db.get_conversation(conversation_id).unwrap_or(conv);
 
-        let _ = self.send_to_connector(
+        if let Err(e) = self.send_to_connector(
             account_id,
             &ConnectorRequest::SendMessage {
                 account_id: account_id.to_string(),
                 conversation_id: conv.remote_id.clone(),
                 text: text.to_string(),
             },
-        );
+        ) {
+            tracing::error!("[send_message] send_to_connector failed: {e}");
+            let _ = self.db.update_message_status(
+                conversation_id,
+                &msg.id,
+                MessageStatus::Failed,
+            );
+            msg.status = MessageStatus::Failed;
+            self.emit(
+                "message.sent",
+                serde_json::json!({
+                    "account_id": account_id,
+                    "conversation_id": conversation_id,
+                    "conversation": conv,
+                    "message": msg,
+                }),
+            );
+            return Err(e);
+        }
 
         self.emit(
             "message.sent",
@@ -736,7 +770,7 @@ impl ConnectorManager {
         options: Vec<String>,
         max_answer: Option<i32>,
     ) -> Result<Message, String> {
-        let _ = self.ensure_running(account_id);
+        self.ensure_running(account_id)?;
         let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
         let body = match kind {
             "location" => caption
@@ -795,7 +829,7 @@ impl ConnectorManager {
                 "data:{mime_type};base64,{b64}"
             ));
         }
-        let msg = Message {
+        let mut msg = Message {
             id: Uuid::new_v4().to_string(),
             conversation_id: conversation_id.to_string(),
             remote_id: None,
@@ -836,6 +870,22 @@ impl ConnectorManager {
             },
         ) {
             tracing::error!("[send_attachment] send_to_connector failed: {e}");
+            let _ = self.db.update_message_status(
+                conversation_id,
+                &msg.id,
+                MessageStatus::Failed,
+            );
+            msg.status = MessageStatus::Failed;
+            self.emit(
+                "message.sent",
+                serde_json::json!({
+                    "account_id": account_id,
+                    "conversation_id": conversation_id,
+                    "conversation": conv,
+                    "message": msg,
+                }),
+            );
+            return Err(e);
         }
 
         self.emit(
@@ -1039,6 +1089,24 @@ impl ConnectorManager {
         self.detach_account(account_id, true);
     }
 
+    /// Tear down every sidecar (and recorded GOWA) — call on app quit.
+    pub fn shutdown_all(&self) {
+        let mut map = self.processes.lock();
+        for (connector_id, mut running) in map.drain() {
+            self.do_not_restart
+                .lock()
+                .extend(running.accounts.iter().cloned());
+            let _ = running.tx.send(
+                encode_line(&ConnectorRequest::Shutdown)
+                    .unwrap_or_else(|_| "{\"type\":\"shutdown\"}\n".into()),
+            );
+            let _ = running.child.start_kill();
+            process_lock::clear_pid(&self.data_dir, &connector_id);
+        }
+        drop(map);
+        process_lock::stop_gowa(&self.data_dir);
+    }
+
     /// Drop one account from a shared sidecar. If it was the last account, kill the process.
     fn detach_account(&self, account_id: &str, send_shutdown_if_last: bool) {
         let mut map = self.processes.lock();
@@ -1071,6 +1139,7 @@ impl ConnectorManager {
                     );
                 }
                 let _ = running.child.start_kill();
+                process_lock::clear_pid(&self.data_dir, &key);
             }
         }
     }
@@ -1082,6 +1151,7 @@ impl ConnectorManager {
                 Some(running) if running.generation == generation => {
                     let ids: Vec<String> = running.accounts.iter().cloned().collect();
                     map.remove(connector_id);
+                    process_lock::clear_pid(&self.data_dir, connector_id);
                     ids
                 }
                 _ => return,

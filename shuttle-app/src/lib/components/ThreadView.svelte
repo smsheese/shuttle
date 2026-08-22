@@ -717,8 +717,15 @@
               {#if msg.starred}<span class="msg-star" title="Starred">★</span>{/if}
               {formatMsgTime(msg.timestamp)}
               {#if msg.direction === 'outbound'}
-                <span class="status" class:read={msg.status === 'read'} aria-label={msg.status === 'read' ? 'Read' : 'Sent'}>
-                  {msg.status === 'read' ? '✓✓' : msg.status === 'delivered' ? '✓✓' : '✓'}
+                <span
+                  class="status"
+                  class:read={msg.status === 'read'}
+                  class:failed={msg.status === 'failed'}
+                  aria-label={msg.status === 'failed' ? 'Failed' : msg.status === 'read' ? 'Read' : 'Sent'}
+                >
+                  {#if msg.status === 'failed'}!
+                  {:else if msg.status === 'read' || msg.status === 'delivered'}✓✓
+                  {:else}✓{/if}
                 </span>
               {/if}
             </span>
@@ -1123,9 +1130,9 @@
   }
 
   .outbound .bubble {
-    background: linear-gradient(135deg, #3b82f6 0%, #2563eb 55%, #1d4ed8 100%);
-    color: white;
-    box-shadow: 0 1px 3px rgba(37, 99, 235, 0.35);
+    background: var(--bg-bubble-out, var(--primary, var(--accent)));
+    color: var(--text-on-accent, var(--primary-foreground, #ffffff));
+    box-shadow: var(--shadow-sm);
   }
 
   /* Outbound grouping — tail on bottom-right */
@@ -1173,7 +1180,7 @@
   }
 
   .outbound .bubble p {
-    color: rgba(255, 255, 255, 0.95);
+    color: inherit;
   }
 
   .msg-time {
@@ -1190,7 +1197,11 @@
   }
 
   .outbound .msg-time {
-    color: rgba(255, 255, 255, 0.62);
+    color: color-mix(
+      in oklch,
+      var(--text-on-accent, var(--primary-foreground, #ffffff)) 62%,
+      transparent
+    );
   }
 
   .media-open {
@@ -1250,7 +1261,11 @@
   }
 
   .outbound .media-fallback {
-    color: rgba(255, 255, 255, 0.8);
+    color: color-mix(
+      in oklch,
+      var(--text-on-accent, var(--primary-foreground, #ffffff)) 80%,
+      transparent
+    );
   }
 
   .media-fallback.failed {
@@ -1263,9 +1278,18 @@
   }
 
   .status.read {
-    color: #7dd3fc;
+    color: var(--accent);
     opacity: 1;
-    text-shadow: 0 0 6px rgba(125, 211, 252, 0.5);
+  }
+
+  .outbound .status.read {
+    color: var(--text-on-accent);
+    opacity: 0.95;
+  }
+
+  .status.failed {
+    color: var(--destructive, #ef4444);
+    opacity: 1;
   }
 
   .composer {
@@ -1538,7 +1562,7 @@
     border: none;
     border-radius: var(--radius-md);
     background: var(--accent);
-    color: white;
+    color: var(--text-on-accent, var(--primary-foreground, #ffffff));
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -1620,11 +1644,11 @@
   }
 
   .msg-row.search-hit .bubble {
-    outline: 1px solid var(--accent, #3b82f6);
+    outline: 1px solid var(--accent);
   }
 
   .highlight {
-    background: rgba(59, 130, 246, 0.15);
+    background: var(--accent-muted);
     border-radius: 4px;
   }
 

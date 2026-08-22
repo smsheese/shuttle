@@ -33,7 +33,12 @@ pub fn setup_tray<R: Runtime>(app: &tauri::App<R>) -> Result<(), Box<dyn std::er
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "tray-show" => show_main(app),
-            "tray-quit" => app.exit(0),
+            "tray-quit" => {
+                if let Some(state) = app.try_state::<crate::commands::AppState>() {
+                    state.connectors.shutdown_all();
+                }
+                app.exit(0);
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {

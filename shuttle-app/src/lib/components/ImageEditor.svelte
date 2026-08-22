@@ -48,7 +48,8 @@
     ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
     ctx.drawImage(img, 0, 0, canvasEl.width, canvasEl.height);
     if (cropRect) {
-      ctx.strokeStyle = '#3b82f6';
+      ctx.strokeStyle =
+        getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#3b82f6';
       ctx.lineWidth = 2;
       ctx.setLineDash([6, 4]);
       ctx.strokeRect(cropRect.x, cropRect.y, cropRect.w, cropRect.h);

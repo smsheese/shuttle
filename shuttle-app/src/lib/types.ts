@@ -19,6 +19,25 @@ export interface Account {
   sleep_check_minutes?: number | null;
 }
 
+export interface StatusPost {
+  id: string;
+  media_type: string;
+  text?: string;
+  timestamp: string | null;
+}
+
+export interface StatusItem {
+  account_id?: string;
+  sender_id: string;
+  sender_name: string;
+  timestamp: string | null;
+  media_type?: string;
+  preview?: string;
+  from_me?: boolean;
+  count?: number;
+  posts?: StatusPost[];
+}
+
 export interface Conversation {
   id: string;
   account_id: string;

@@ -87,7 +87,16 @@ def to_rfc3339(value: Any) -> str:
     try:
         return to_rfc3339(float(s))
     except ValueError:
-        return s
+        pass
+    if "T" not in s and " " in s:
+        s = s.replace(" ", "T", 1)
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        return to_rfc3339(dt)
+    except ValueError:
+        return now_iso()
 
 
 def emit_event(account_id: str, event: str, payload: dict[str, Any]) -> None:

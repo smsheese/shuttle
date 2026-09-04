@@ -1,5 +1,6 @@
 <script lang="ts">
   import NetworkIcon from '$lib/components/NetworkIcon.svelte';
+  import { accountAvatar } from '$lib/api';
   import { CONNECTOR_COLORS, type Account } from '$lib/types';
 
   interface Props {
@@ -85,6 +86,7 @@
 
     <div class="networks">
       {#each accounts as account (account.id)}
+        {@const photo = accountAvatar(account)}
         <button
           class="nav-item network"
           class:active={selected === account.id}
@@ -100,8 +102,21 @@
           aria-label={accountTitle(account)}
           aria-current={selected === account.id ? 'page' : undefined}
         >
-          <span class="network-icon-wrap">
-            <NetworkIcon connectorId={account.connector_id} size={16} />
+          <span
+            class="network-avatar"
+            class:photo={!!photo}
+            style={photo ? undefined : `background: color-mix(in srgb, var(--network-color) 18%, transparent); color: var(--network-color)`}
+          >
+            {#if photo}
+              <img class="network-photo" src={photo} alt="" />
+            {:else}
+              <NetworkIcon connectorId={account.connector_id} size={16} />
+            {/if}
+            {#if photo}
+              <span class="network-badge-inset" aria-hidden="true">
+                <NetworkIcon connectorId={account.connector_id} size={10} />
+              </span>
+            {/if}
           </span>
           {#if account.status !== 'connected'}
             <span
@@ -170,7 +185,9 @@
   .sidebar {
     width: 100%;
     min-width: var(--rail-width);
+    min-height: 0;
     height: 100%;
+    flex: 1 1 auto;
     background: var(--bg-sidebar);
     border-right: 1px solid var(--border-subtle);
     display: flex;
@@ -178,6 +195,7 @@
     align-items: center;
     padding: 14px 0 16px;
     gap: 6px;
+    overflow: hidden;
   }
 
   .desktop-rail {
@@ -273,24 +291,60 @@
     background: var(--network-color);
   }
 
-  .network-icon-wrap {
-    width: 28px;
-    height: 28px;
-    border-radius: var(--radius-sm);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: color-mix(in srgb, var(--network-color) 18%, transparent);
-    color: var(--network-color);
-    transition: background 0.15s ease;
+  .network-avatar {
+    position: relative;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    display: grid;
+    place-items: center;
+    overflow: visible;
   }
 
-  .network.active .network-icon-wrap {
+  .network-avatar:not(.photo) {
+    border-radius: var(--radius-sm);
+    width: 28px;
+    height: 28px;
+  }
+
+  .network-photo {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    object-fit: cover;
+    display: block;
+  }
+
+  .network-badge-inset {
+    position: absolute;
+    left: -1px;
+    bottom: -1px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--network-color) 22%, var(--bg-sidebar));
+    color: var(--network-color);
+    display: grid;
+    place-items: center;
+    box-shadow: 0 0 0 1.5px var(--bg-sidebar);
+    z-index: 1;
+  }
+
+  .network.active .network-avatar.photo {
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--network-color) 55%, transparent);
+  }
+
+  .network.active .network-avatar:not(.photo) {
     background: color-mix(in srgb, var(--network-color) 28%, transparent);
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--network-color) 40%, transparent);
   }
 
-  .network:hover .network-icon-wrap {
+  .network:hover .network-avatar.photo {
+    filter: brightness(1.06);
+  }
+
+  .network:hover .network-avatar:not(.photo) {
     background: color-mix(in srgb, var(--network-color) 24%, transparent);
   }
 
@@ -323,13 +377,14 @@
 
   .status-dot {
     position: absolute;
-    bottom: 4px;
-    right: 4px;
+    bottom: 2px;
+    right: 2px;
     width: 8px;
     height: 8px;
     border-radius: 50%;
     background: var(--warning);
     border: 2px solid var(--bg-sidebar);
+    z-index: 2;
   }
 
   .status-dot.connecting {
@@ -424,7 +479,7 @@
     opacity: 0.7;
   }
 
-  @media (max-width: 768px) {
+  @media (max-width: 639px) {
     .sidebar {
       position: relative;
       width: 100%;

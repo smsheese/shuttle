@@ -334,7 +334,7 @@ let appConfig: AppConfig = {
     usage_diagnostics: false,
   },
   sleep: {
-    enabled: true,
+    enabled: false,
     after_minutes: 5,
     check_minutes: 15,
   },
@@ -385,13 +385,27 @@ export const mockApi = {
     accountId?: string,
     workspaceId?: string,
     priorityGroup?: string,
+    archivedOnly?: boolean,
+    offset = 0,
+    limit = 30
+  ) => {
+    let list = accountId ? conversations.filter((c) => c.account_id === accountId) : conversations;
+    list = list.filter((c) => (archivedOnly ? c.archived : !c.archived));
+    if (workspaceId) list = list.filter((c) => (c.workspace_id ?? 'default') === workspaceId);
+    if (priorityGroup) list = list.filter((c) => c.priority_group === priorityGroup);
+    return list.slice(offset, offset + limit);
+  },
+  countConversations: async (
+    accountId?: string,
+    workspaceId?: string,
+    priorityGroup?: string,
     archivedOnly?: boolean
   ) => {
     let list = accountId ? conversations.filter((c) => c.account_id === accountId) : conversations;
     list = list.filter((c) => (archivedOnly ? c.archived : !c.archived));
     if (workspaceId) list = list.filter((c) => (c.workspace_id ?? 'default') === workspaceId);
     if (priorityGroup) list = list.filter((c) => c.priority_group === priorityGroup);
-    return list;
+    return list.length;
   },
   listContacts: async (accountId: string): Promise<Contact[]> =>
     conversations

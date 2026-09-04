@@ -4,7 +4,7 @@ const CONV_SELECT: &str = "SELECT c.id, c.account_id, c.remote_id, c.contact_id,
  FROM conversations c";
 
 use crate::models::*;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
@@ -251,6 +251,34 @@ impl Database {
         Ok(())
     }
 
+    pub fn merge_account_metadata(
+        &self,
+        id: &str,
+        patch: &serde_json::Value,
+    ) -> Result<Account, DbError> {
+        let conn = self.catalog.conn.lock();
+        let existing: String = conn
+            .query_row(
+                "SELECT metadata FROM accounts WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => DbError::NotFound(id.to_string()),
+                other => DbError::from(other),
+            })?;
+        let base: serde_json::Value =
+            serde_json::from_str(&existing).unwrap_or_else(|_| serde_json::json!({}));
+        let merged = merge_json_objects(base, patch.clone());
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE accounts SET metadata = ?1, updated_at = ?2 WHERE id = ?3",
+            params![merged.to_string(), now, id],
+        )?;
+        drop(conn);
+        self.get_account(id)
+    }
+
     pub fn delete_account(&self, id: &str) -> Result<(), DbError> {
         {
             let conn = self.catalog.conn.lock();
@@ -284,6 +312,42 @@ impl Database {
         workspace_id: Option<&str>,
         priority_group: Option<&str>,
         archived_only: bool,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<Conversation>, DbError> {
+        let all = self.filtered_conversations(
+            account_id,
+            workspace_id,
+            priority_group,
+            archived_only,
+        )?;
+        let off = offset.max(0) as usize;
+        let lim = limit.max(1) as usize;
+        Ok(all.into_iter().skip(off).take(lim).collect())
+    }
+
+    pub fn count_conversations(
+        &self,
+        account_id: Option<&str>,
+        workspace_id: Option<&str>,
+        priority_group: Option<&str>,
+        archived_only: bool,
+    ) -> Result<i64, DbError> {
+        let all = self.filtered_conversations(
+            account_id,
+            workspace_id,
+            priority_group,
+            archived_only,
+        )?;
+        Ok(all.len() as i64)
+    }
+
+    fn filtered_conversations(
+        &self,
+        account_id: Option<&str>,
+        workspace_id: Option<&str>,
+        priority_group: Option<&str>,
+        archived_only: bool,
     ) -> Result<Vec<Conversation>, DbError> {
         let accounts = self.list_accounts()?;
         let mut all = if let Some(aid) = account_id {
@@ -296,6 +360,10 @@ impl Database {
                 list_conversations_in(&conn, Some(aid), archived_only)
             })?
         };
+        all.retain(|c| {
+            let rid = c.remote_id.to_lowercase();
+            !rid.starts_with("status@")
+        });
         if let Some(ws) = workspace_id {
             all.retain(|c| {
                 let acct = accounts.iter().find(|a| a.id == c.account_id);
@@ -305,11 +373,7 @@ impl Database {
         if let Some(pg) = priority_group {
             all.retain(|c| c.priority_group.as_deref() == Some(pg));
         }
-        all.sort_by(|a, b| match (a.pinned, b.pinned) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => b.last_message_at.cmp(&a.last_message_at),
-        });
+        all.sort_by(|a, b| compare_conversations(a, b));
         Ok(all)
     }
 
@@ -486,7 +550,7 @@ impl Database {
                             sender_name: row.get(4)?,
                             direction: parse_direction(&row.get::<_, String>(5)?),
                             body: row.get(6)?,
-                            timestamp: row.get::<_, String>(7)?.parse().unwrap_or_else(|_| Utc::now()),
+                            timestamp: parse_stored_datetime(&row.get::<_, String>(7)?).unwrap_or_else(Utc::now),
                             status: parse_message_status(&row.get::<_, String>(8)?),
                             metadata: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
                             starred: row.get::<_, i64>(10)? != 0,
@@ -520,7 +584,7 @@ impl Database {
                                 sender_name: row.get(4)?,
                                 direction: parse_direction(&row.get::<_, String>(5)?),
                                 body: row.get(6)?,
-                                timestamp: row.get::<_, String>(7)?.parse().unwrap_or_else(|_| Utc::now()),
+                                timestamp: parse_stored_datetime(&row.get::<_, String>(7)?).unwrap_or_else(Utc::now),
                                 status: parse_message_status(&row.get::<_, String>(8)?),
                                 metadata: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
                                 starred: row.get::<_, i64>(10)? != 0,
@@ -566,37 +630,24 @@ impl Database {
         let inserted = conn.changes() > 0;
         let preview = message_preview(&msg.body, &msg.metadata);
         let ts = msg.timestamp.to_rfc3339();
-        if inserted {
-            conn.execute(
-                "UPDATE conversations SET
-                    last_message_preview = CASE
-                        WHEN last_message_at IS NULL OR last_message_at LIKE '0001-%' OR last_message_at <= ?1 THEN ?2
-                        ELSE last_message_preview
-                    END,
-                    last_message_at = CASE
-                        WHEN last_message_at IS NULL OR last_message_at LIKE '0001-%' OR last_message_at <= ?1 THEN ?1
-                        ELSE last_message_at
-                    END,
-                    updated_at = ?1
-                 WHERE id = ?3",
-                params![ts, preview, msg.conversation_id],
-            )?;
-        } else if let Some(remote) = &msg.remote_id {
-            merge_message_metadata_locked(&conn, &msg.conversation_id, remote, &msg.metadata)?;
-            conn.execute(
-                "UPDATE conversations SET
-                    last_message_preview = CASE
-                        WHEN last_message_at IS NULL OR last_message_at LIKE '0001-%' OR last_message_at <= ?1 THEN ?2
-                        ELSE last_message_preview
-                    END,
-                    last_message_at = CASE
-                        WHEN last_message_at IS NULL OR last_message_at LIKE '0001-%' OR last_message_at <= ?1 THEN ?1
-                        ELSE last_message_at
-                    END,
-                    updated_at = ?1
-                 WHERE id = ?3",
-                params![ts, preview, msg.conversation_id],
-            )?;
+        let advance = conv
+            .last_message_at
+            .map(|existing| msg.timestamp >= existing)
+            .unwrap_or(true);
+        if inserted || msg.remote_id.is_some() {
+            if inserted && !advance {
+                // Keep a newer chat-list timestamp (GOWA often knows recency before the body lands).
+            } else if advance {
+                conn.execute(
+                    "UPDATE conversations SET last_message_preview = ?1, last_message_at = ?2, updated_at = ?2 WHERE id = ?3",
+                    params![preview, ts, msg.conversation_id],
+                )?;
+            }
+            if !inserted {
+                if let Some(remote) = &msg.remote_id {
+                    merge_message_metadata_locked(&conn, &msg.conversation_id, remote, &msg.metadata)?;
+                }
+            }
         }
         Ok(inserted)
     }
@@ -627,10 +678,29 @@ impl Database {
                 let meta: serde_json::Value =
                     serde_json::from_str(&meta_raw).unwrap_or_else(|_| serde_json::json!({}));
                 let preview = message_preview(&body, &meta);
-                conn.execute(
-                    "UPDATE conversations SET last_message_at = ?1, last_message_preview = ?2, updated_at = ?1 WHERE id = ?3",
-                    params![ts, preview, id],
+                let existing: Option<String> = conn.query_row(
+                    "SELECT last_message_at FROM conversations WHERE id = ?1",
+                    params![&id],
+                    |row| row.get(0),
                 )?;
+                let msg_dt = parse_stored_datetime(&ts);
+                let existing_dt = existing.as_deref().and_then(parse_stored_datetime);
+                let advance = match (existing_dt, msg_dt) {
+                    (None, _) => true,
+                    (_, None) => false,
+                    (Some(ex), Some(incoming)) => incoming >= ex,
+                };
+                if advance {
+                    conn.execute(
+                        "UPDATE conversations SET last_message_at = ?1, last_message_preview = ?2, updated_at = ?1 WHERE id = ?3",
+                        params![ts, preview, id],
+                    )?;
+                } else {
+                    conn.execute(
+                        "UPDATE conversations SET last_message_preview = COALESCE(last_message_preview, ?1) WHERE id = ?2",
+                        params![preview, id],
+                    )?;
+                }
             }
         }
         Ok(())
@@ -647,6 +717,7 @@ impl Database {
         archived: Option<bool>,
         pinned: Option<bool>,
         force_recency: bool,
+        replace_title: bool,
     ) -> Result<Conversation, DbError> {
         let inbox = self.inbox(account_id)?;
         let conn = inbox.conn.lock();
@@ -654,6 +725,8 @@ impl Database {
             let now = Utc::now().to_rfc3339();
             let last_message_at = normalize_stored_ts(last_message_at);
             let force = if force_recency { 1 } else { 0 };
+            let stored_title =
+                pick_conversation_title(&existing.title, title, remote_id, replace_title);
             conn.execute(
                 "UPDATE conversations SET title = ?1,
                  last_message_preview = CASE
@@ -674,7 +747,7 @@ impl Database {
                  updated_at = ?6
                  WHERE id = ?7",
                 params![
-                    title,
+                    stored_title,
                     last_message_at,
                     preview,
                     archived.map(|v| if v { 1 } else { 0 }),
@@ -869,6 +942,32 @@ impl Database {
         )?;
         stmt.query_row(params![account_id, remote_id], map_contact_row)
             .map_err(DbError::from)
+    }
+
+    /// Replace placeholder (and stale) conversation titles with saved contact names.
+    pub fn refresh_conversation_titles_from_contacts(&self, account_id: &str) -> Result<(), DbError> {
+        let contacts = self.list_contacts(account_id)?;
+        let inbox = self.inbox(account_id)?;
+        let conn = inbox.conn.lock();
+        for contact in contacts {
+            let name = contact.display_name.trim();
+            if name.is_empty() || is_placeholder_title(name, &contact.remote_id) {
+                continue;
+            }
+            if let Some(conv) =
+                get_conversation_by_remote_locked(&conn, account_id, &contact.remote_id)?
+            {
+                // Always prefer the address book for 1:1 chats — WhatsApp Business
+                // accounts often leak their own brand into other conversation titles.
+                if conv.title != name {
+                    conn.execute(
+                        "UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3",
+                        params![name, Utc::now().to_rfc3339(), conv.id],
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn fix_self_conversation_titles(&self, account_id: &str, identity: &str) -> Result<(), DbError> {
@@ -1791,6 +1890,36 @@ impl Database {
     }
 }
 
+fn compare_conversations(a: &Conversation, b: &Conversation) -> std::cmp::Ordering {
+    match (a.pinned, b.pinned) {
+        (true, false) => return std::cmp::Ordering::Less,
+        (false, true) => return std::cmp::Ordering::Greater,
+        _ => {}
+    }
+    let ta = a
+        .last_message_at
+        .map(|t| t.timestamp())
+        .unwrap_or(0);
+    let tb = b
+        .last_message_at
+        .map(|t| t.timestamp())
+        .unwrap_or(0);
+    if ta != tb {
+        return tb.cmp(&ta);
+    }
+    let ra = a
+        .metadata
+        .get("list_rank")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(999_999);
+    let rb = b
+        .metadata
+        .get("list_rank")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(999_999);
+    ra.cmp(&rb)
+}
+
 fn list_conversations_in(
     conn: &Connection,
     account_id: Option<&str>,
@@ -1992,13 +2121,7 @@ fn map_conversation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conversatio
         unread_count: row.get(6)?,
         last_message_at: row
             .get::<_, Option<String>>(7)?
-            .and_then(|s| {
-                if s.starts_with("0001-") || s.starts_with("0000-") {
-                    None
-                } else {
-                    s.parse().ok()
-                }
-            }),
+            .and_then(|s| parse_stored_datetime(&s)),
         last_message_preview: row.get(8)?,
         pinned: row.get::<_, i64>(9)? != 0,
         archived: row.get::<_, i64>(10)? != 0,
@@ -2018,6 +2141,35 @@ fn opt_bool(v: Option<i64>) -> Option<bool> {
 
 fn opt_u32(v: Option<i64>) -> Option<u32> {
     v.and_then(|n| u32::try_from(n).ok())
+}
+
+pub fn parse_stored_datetime(value: &str) -> Option<DateTime<Utc>> {
+    let s = value.trim();
+    if s.is_empty() || s.starts_with("0001-") || s.starts_with("0000-") {
+        return None;
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    let mut normalized = if s.contains('T') {
+        s.to_string()
+    } else {
+        s.replacen(' ', "T", 1)
+    };
+    let has_offset = normalized.ends_with('Z')
+        || normalized.contains('+')
+        || normalized.rfind('-').map(|i| i > 10).unwrap_or(false);
+    if !has_offset {
+        normalized.push('Z');
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(&normalized) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        let secs = if n.abs() > 10_000_000_000 { n / 1000 } else { n };
+        return DateTime::from_timestamp(secs, 0);
+    }
+    None
 }
 
 fn normalize_stored_ts(value: Option<&str>) -> Option<&str> {
@@ -2109,7 +2261,7 @@ fn map_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         sender_name: row.get(4)?,
         direction: parse_direction(&row.get::<_, String>(5)?),
         body: row.get(6)?,
-        timestamp: row.get::<_, String>(7)?.parse().unwrap_or_else(|_| Utc::now()),
+        timestamp: parse_stored_datetime(&row.get::<_, String>(7)?).unwrap_or_else(Utc::now),
         status: parse_message_status(&row.get::<_, String>(8)?),
         metadata: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
         starred: row.get::<_, i64>(10).unwrap_or(0) != 0,
@@ -2287,4 +2439,47 @@ fn message_status_str(s: &MessageStatus) -> &'static str {
         MessageStatus::Failed => "failed",
         MessageStatus::Pending => "pending",
     }
+}
+
+fn jid_user_part(jid: &str) -> &str {
+    jid.split('@').next().unwrap_or(jid)
+}
+
+fn is_placeholder_title(name: &str, remote_id: &str) -> bool {
+    let n = name.trim();
+    if n.is_empty() {
+        return true;
+    }
+    if n.contains('∙') || n.contains('•') || n.contains('·') {
+        return true;
+    }
+    let user = jid_user_part(remote_id);
+    if n == user || n == remote_id {
+        return true;
+    }
+    let letters = n.chars().any(|c| c.is_alphabetic());
+    let digits = n.chars().any(|c| c.is_ascii_digit());
+    digits && !letters
+}
+
+fn pick_conversation_title(
+    existing: &str,
+    incoming: &str,
+    remote_id: &str,
+    replace_title: bool,
+) -> String {
+    let ex_bad = is_placeholder_title(existing, remote_id);
+    let in_bad = is_placeholder_title(incoming, remote_id);
+    // History/contact refresh may replace a leaked business self-name with the
+    // real contact title. Live websocket events should not clobber a good title.
+    if replace_title && !in_bad {
+        return incoming.to_string();
+    }
+    if !ex_bad {
+        return existing.to_string();
+    }
+    if !in_bad {
+        return incoming.to_string();
+    }
+    incoming.to_string()
 }

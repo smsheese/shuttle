@@ -9,6 +9,47 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-04
+
+### Added
+
+- WhatsApp status updates appear as a horizontal stories row at the top of the conversation list. Tapping a status opens a full-screen viewer (progress bars, hold to pause, tap sides to seek).
+- Paginated conversation list: the UI loads ~30 chats at a time with scroll-to-load-more; search still queries the full SQLite inbox.
+
+### Changed
+
+- WhatsApp connector continuously backfills message text for every chat (up to 500 messages each, throttled) so search and opening older threads hit local data sooner.
+- Account hibernation is **off by default**; enable it globally under Notifications or per account in Accounts.
+- Conversation list order follows WhatsApp chat list rank when synced, then recency.
+- Status row avatars use neutral rings (not accent) so business profiles are not mistaken for unread; status count badge shows number of posts.
+
+### Fixed
+
+- Incoming WhatsApp messages show up live: the connector registers a local GOWA webhook (websocket often never carries chat events), normalizes chat JIDs, and catch-up polling is tighter.
+- Opening an unread chat stays pinned to the latest messages instead of landing further up after an empty-then-load layout race.
+- Conversation recency follows WhatsApp’s chat list even when GOWA has not stored the newest message body yet (history preview refresh no longer rewinds timestamps).
+- WhatsApp history JSON ingest reads every `history-*.json` dump (not only the newest eight), merges chats by phone JID, and re-applies that dump when you open a chat so existing backup bodies show without waiting for a new inbound message. Threads whose WhatsApp list time is ahead of stored bodies say so instead of implying a live message is required.
+- Active conversations sort by message recency instead of stale sync-time list ranks.
+- WhatsApp business/verified names take precedence over incorrect saved/self-account labels, and outgoing websocket events resolve the recipient JID.
+- WhatsApp Business chats no longer show your own business brand name; titles prefer the address book and reject GOWA’s leaked self display name.
+- Conversation list pins sync from WhatsApp (whatsmeow chat settings) so pinned chats like Message yourself stay at the top like WhatsApp Web.
+- Opening a chat (and sending a message) snaps the thread to the latest message.
+- Status/stories row sits above the scrollable conversation list so it is not covered while scrolling.
+- Unread chats use a light row tint only (no left accent bar), so business chats are not mistaken for a special border.
+- Conversation list unread badges no longer stretch into full-width bars (Settings `.row > *` flex rule was leaking globally).
+- Desktop shell uses CSS grid with a fixed viewport height chain so the rail, list, and thread stay side-by-side down to 640px.
+- Hibernation and quit no longer panic: connector shutdown uses sync `kill_process()` instead of Tokio `start_kill()` / `kill_on_drop` (which require a runtime on the main thread).
+- WhatsApp waits through GOWA `SESSION_SAVED_ERROR` while the saved session reconnects instead of bailing early.
+- Contact names are restored from the address book and no longer overwritten by phone-number placeholders from backup sync.
+- Unread chats get a tinted row highlight; WhatsApp history/backup `unreadCount` is ignored so stale badges (e.g. business chats already read in WhatsApp) are not reapplied.
+- Status row scrolls with mouse wheel and click-drag.
+- Desktop three-pane layout fills the window (no stacked half-height panes) for tiled widths down to 640px.
+- Conversation list hides `status@broadcast` as a normal chat.
+- WhatsApp catch-up that recovers messages missed by the websocket now counts as live (bumps unread + UI), not as history sync.
+- Status/stories row stays visible: feed parsing accepts GOWA `messages` payloads, catch-up refreshes the feed, empty snapshots no longer wipe it, and the row stays above the scrollable list.
+- Sidebar account buttons show the account profile photo (circular) with the network icon inset at the bottom-left.
+- Empty WhatsApp protocol stubs are no longer stored as blank messages; threads with no synced content show an explanation instead of an empty pane.
+
 ## [0.3.2] - 2026-08-22
 
 ### Changed

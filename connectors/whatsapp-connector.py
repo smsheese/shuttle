@@ -12,6 +12,8 @@ import struct
 import subprocess
 import sys
 import concurrent.futures
+import http.server
+import socketserver
 import threading
 import time
 import urllib.error
@@ -84,6 +86,11 @@ def files_dir() -> Path:
 
 def phone_digits(value: str) -> str:
     return "".join(ch for ch in str(value) if ch.isdigit())
+
+
+def is_status_jid(jid: str) -> bool:
+    j = str(jid or "").lower()
+    return j.startswith("status@")
 
 
 def jids_same(a: str, b: str) -> bool:
@@ -196,6 +203,9 @@ class GowaClient:
     def post(self, path: str, **kwargs: Any) -> tuple[int, Any]:
         return self.call("POST", path, **kwargs)
 
+    def patch(self, path: str, **kwargs: Any) -> tuple[int, Any]:
+        return self.call("PATCH", path, **kwargs)
+
     def post_multipart(
         self,
         path: str,
@@ -249,7 +259,9 @@ class GowaClient:
             return resp.read()
 
 
-def load_or_start_gowa() -> tuple[str, tuple[str, str], Optional[subprocess.Popen]]:
+def load_or_start_gowa(
+    webhook_url: Optional[str] = None,
+) -> tuple[str, tuple[str, str], Optional[subprocess.Popen]]:
     existing = os.environ.get("SHUTTLE_GOWA_URL")
     password_env = os.environ.get("SHUTTLE_GOWA_PASSWORD")
     if existing:
@@ -302,16 +314,20 @@ def load_or_start_gowa() -> tuple[str, tuple[str, str], Optional[subprocess.Pope
                 "DB_URI": f"file:{home / 'storages' / 'whatsapp.db'}?_foreign_keys=on",
             }
         )
+        cmd = [
+            str(binary),
+            "rest",
+            "--host=127.0.0.1",
+            f"--port={port}",
+            "--os=Shuttle",
+            f"--basic-auth={GOWA_USER}:{password}",
+        ]
+        if webhook_url:
+            env["WHATSAPP_WEBHOOK"] = webhook_url
+            cmd.append(f"--webhook={webhook_url}")
         log(f"starting GOWA {binary} on {url}")
         proc = subprocess.Popen(
-            [
-                str(binary),
-                "rest",
-                "--host=127.0.0.1",
-                f"--port={port}",
-                "--os=Shuttle",
-                f"--basic-auth={GOWA_USER}:{password}",
-            ],
+            cmd,
             cwd=str(home),
             env=env,
             stdout=subprocess.DEVNULL,
@@ -519,6 +535,92 @@ class MiniWebSocket:
         self.sock.sendall(header + masked)
 
 
+_sessions_by_account: dict[str, "WhatsAppSession"] = {}
+_webhook_lock = threading.Lock()
+_webhook_url: Optional[str] = None
+
+
+class _GowaWebhookHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+    def _ok(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._ok()
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self.send_response(200)
+        self.end_headers()
+
+    def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length > 0 else b""
+        self._ok()
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            return
+        if isinstance(payload, dict):
+            threading.Thread(
+                target=_dispatch_gowa_webhook,
+                args=(payload,),
+                daemon=True,
+                name="wa-webhook",
+            ).start()
+
+
+def ensure_webhook_server() -> Optional[str]:
+    global _webhook_url
+    with _webhook_lock:
+        if _webhook_url:
+            return _webhook_url
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        try:
+            class _WebhookServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+                daemon_threads = True
+                allow_reuse_address = True
+
+            server = _WebhookServer(("127.0.0.1", port), _GowaWebhookHandler)
+        except OSError as e:
+            log(f"webhook listen failed: {e}")
+            return None
+        threading.Thread(target=server.serve_forever, daemon=True, name="wa-webhook-http").start()
+        _webhook_url = f"http://127.0.0.1:{port}/"
+        log(f"GOWA webhook listening on {_webhook_url}")
+        return _webhook_url
+
+
+def _dispatch_gowa_webhook(payload: dict[str, Any]) -> None:
+    aid = str(payload.get("session_id") or "")
+    session = _sessions_by_account.get(aid) if aid else None
+    if session is None:
+        device = str(payload.get("device_id") or "")
+        session = _sessions_by_account.get(device) if device else None
+        if session is None and device:
+            for candidate in _sessions_by_account.values():
+                if candidate._self_jid and jids_same(candidate._self_jid, device):
+                    session = candidate
+                    break
+    if session is None and len(_sessions_by_account) == 1:
+        session = next(iter(_sessions_by_account.values()))
+    if session is None:
+        log("webhook dropped: no matching WhatsApp session")
+        return
+    log(f"webhook event={payload.get('event') or payload.get('code')}")
+    try:
+        session._handle_ws(payload)
+    except Exception as e:
+        log(f"webhook: {e}")
+
+
 def results(payload: Any) -> dict[str, Any]:
     if isinstance(payload, dict):
         r = payload.get("results")
@@ -526,6 +628,18 @@ def results(payload: Any) -> dict[str, Any]:
             return r
         return payload
     return {}
+
+
+def user_info_record(payload: Any) -> dict[str, Any]:
+    """Unwrap GOWA /user/info results (`{data: [ {...} ]}` or a flat dict)."""
+    r = results(payload)
+    data = r.get("data")
+    if isinstance(data, list) and data:
+        first = data[0]
+        return first if isinstance(first, dict) else {}
+    if isinstance(data, dict):
+        return data
+    return r if isinstance(r, dict) else {}
 
 
 def jid_user_part(jid: str) -> str:
@@ -722,7 +836,9 @@ def fetch_avatar_bytes(client: GowaClient, account_id: str, jid: str) -> Optiona
         return None
 
 
-def download_gowa_media(client: GowaClient, message_id: str, phone: str) -> Optional[dict[str, Any]]:
+def download_gowa_media(
+    client: GowaClient, message_id: str, phone: str, *, for_status: bool = False
+) -> Optional[dict[str, Any]]:
     code, body = client.get(
         f"/message/{urllib.parse.quote(str(message_id), safe='')}/download",
         query={"phone": phone},
@@ -743,7 +859,10 @@ def download_gowa_media(client: GowaClient, message_id: str, phone: str) -> Opti
     if not raw:
         return None
     media_type = str(r.get("media_type") or "image").lower()
-    max_bytes = 12_000_000 if media_type == "document" else 2_500_000
+    if for_status:
+        max_bytes = 30_000_000
+    else:
+        max_bytes = 12_000_000 if media_type == "document" else 2_500_000
     if len(raw) > max_bytes:
         log(f"media download {message_id} too large ({len(raw)} bytes)")
         return None
@@ -762,8 +881,33 @@ def download_gowa_media(client: GowaClient, message_id: str, phone: str) -> Opti
     }
 
 
+_NESTED_TEXT_SKIP = {
+    "chat_id",
+    "chat_jid",
+    "from",
+    "to",
+    "sender_jid",
+    "remotejid",
+    "participant",
+    "jid",
+    "id",
+    "message_id",
+    "timestamp",
+    "device_id",
+    "session_id",
+    "from_lid",
+    "lid",
+    "key",
+    "info",
+    "url",
+    "media_path",
+}
+
+
 def nested_text(value: Any) -> str:
     if isinstance(value, str) and value.strip():
+        if looks_like_jid(value.strip()):
+            return ""
         return value
     if isinstance(value, dict):
         for key in (
@@ -774,14 +918,13 @@ def nested_text(value: Any) -> str:
             "body",
             "content",
             "matchedText",
-            "name",
-            "displayName",
-            "title",
         ):
             found = nested_text(value.get(key))
             if found:
                 return found
-        for nested in value.values():
+        for key, nested in value.items():
+            if str(key).lower() in _NESTED_TEXT_SKIP:
+                continue
             found = nested_text(nested)
             if found:
                 return found
@@ -859,10 +1002,46 @@ def load_lid_map() -> dict[str, str]:
         return {}
 
 
+def load_chat_settings(lid_map: Optional[dict[str, str]] = None) -> dict[str, dict[str, bool]]:
+    """Pinned/archived flags from whatsmeow (GOWA /chats omits these)."""
+    path = gowa_home() / "storages" / "whatsapp.db"
+    if not path.is_file():
+        return {}
+    try:
+        import sqlite3
+
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        out: dict[str, dict[str, bool]] = {}
+        for chat_jid, pinned, archived in con.execute(
+            "SELECT chat_jid, pinned, archived FROM whatsmeow_chat_settings"
+        ):
+            if not chat_jid:
+                continue
+            jid = canonical_chat_jid(str(chat_jid), lid_map)
+            flags = {
+                "pinned": bool(pinned),
+                "archived": bool(archived),
+            }
+            out[jid] = flags
+            out[str(chat_jid)] = flags
+            out[jid_user_part(jid)] = flags
+        con.close()
+        if out:
+            log(f"chat settings: {sum(1 for v in out.values() if v.get('pinned'))} pinned")
+        return out
+    except Exception as e:
+        log(f"chat settings: {e}")
+        return {}
+
+
 def canonical_chat_jid(jid: str, lid_map: Optional[dict[str, str]] = None) -> str:
     raw = str(jid or "").strip()
     if not raw:
         return raw
+    if "@" not in raw:
+        digits = phone_digits(raw)
+        if digits:
+            raw = f"{digits}@s.whatsapp.net"
     mapped = (lid_map or {}).get(raw) or (lid_map or {}).get(jid_user_part(raw))
     return mapped or raw
 
@@ -871,8 +1050,7 @@ def history_files() -> list[Path]:
     store = gowa_home() / "storages"
     if not store.is_dir():
         return []
-    files = sorted(store.glob("history-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return files[:8]
+    return sorted(store.glob("history-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
 def parse_history_conversations() -> list[dict[str, Any]]:
@@ -888,7 +1066,13 @@ def parse_history_conversations() -> list[dict[str, Any]]:
         for conv in rows:
             if not isinstance(conv, dict):
                 continue
-            cid = str(conv.get("ID") or conv.get("id") or "")
+            cid = str(
+                conv.get("pnJID")
+                or conv.get("pnJid")
+                or conv.get("ID")
+                or conv.get("id")
+                or ""
+            )
             if not cid or cid.endswith("@broadcast") or cid.startswith("status@"):
                 continue
             prev = merged.get(cid)
@@ -930,7 +1114,13 @@ def history_message_fields(wrap: dict[str, Any]) -> Optional[dict[str, Any]]:
                 stub_name = item
                 break
     if not text.strip() and not stub_name:
-        return None
+        inner_keys = inner.keys() if isinstance(inner, dict) else ()
+        if any(k in inner_keys for k in ("locationMessage", "liveLocationMessage")):
+            text = "[location]"
+        elif "placeholderMessage" in inner_keys:
+            return None
+        else:
+            return None
     if text.strip() and looks_like_jid(text.strip()) and not stub_name:
         return None
     ts = msg.get("messageTimestamp") or wrap.get("messageTimestamp")
@@ -944,7 +1134,15 @@ def history_message_fields(wrap: dict[str, Any]) -> Optional[dict[str, Any]]:
     }
 
 
-def load_self_profile(client: GowaClient) -> tuple[Optional[str], Optional[str]]:
+def load_self_profile(
+    client: GowaClient,
+    contacts: Optional[dict[str, str]] = None,
+) -> tuple[Optional[str], Optional[str], set[str]]:
+    """Return (jid, display_name, aliases).
+
+    GOWA often stamps the connected *business* display name onto other chats'
+    `name` / `verified_name` fields. Aliases let us reject those as titles.
+    """
     code, body = client.get("/app/status")
     jid: Optional[str] = None
     if code == 200:
@@ -959,15 +1157,63 @@ def load_self_profile(client: GowaClient) -> tuple[Optional[str], Optional[str]]
             jid = r.get("jid") or r.get("device_id")
             if isinstance(jid, str) and "@" not in jid and jid.isdigit():
                 jid = f"{jid}@s.whatsapp.net"
+
+    aliases: set[str] = set()
     name: Optional[str] = None
+
+    code, body = client.get("/devices")
+    if code == 200:
+        rows: list[Any] = []
+        if isinstance(body, dict):
+            maybe = body.get("results")
+            if isinstance(maybe, list):
+                rows = maybe
+            elif isinstance(maybe, dict):
+                data = maybe.get("data")
+                if isinstance(data, list):
+                    rows = data
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("id") or "") != str(client.device_id):
+                continue
+            display = row.get("display_name") or row.get("name")
+            if isinstance(display, str) and display.strip():
+                aliases.add(display.strip())
+                name = name or display.strip()
+            break
+
     if jid:
         code, body = client.get("/user/info", query={"phone": jid})
         if code == 200:
-            info = results(body)
-            name = info.get("verified_name") or info.get("push_name") or info.get("name")
-            if isinstance(name, str):
-                name = name.strip() or None
-    return jid, name
+            info = user_info_record(body)
+            for key in ("verified_name", "push_name", "business_name", "name"):
+                val = info.get(key)
+                if isinstance(val, str) and val.strip() and not is_placeholder_name(val.strip(), jid):
+                    aliases.add(val.strip())
+                    if key in ("verified_name", "business_name", "push_name") and not name:
+                        name = val.strip()
+        code, body = client.get("/user/business-profile", query={"phone": jid})
+        if code == 200:
+            biz = results(body)
+            for key in ("business_name", "name", "verified_name"):
+                val = biz.get(key)
+                if isinstance(val, str) and val.strip():
+                    aliases.add(val.strip())
+                    name = name or val.strip()
+
+        book = contacts if contacts is not None else {}
+        saved = lookup_contact_name(book, jid)
+        if saved and not is_placeholder_name(saved, jid):
+            if saved not in aliases:
+                name = name or saved
+            elif not name:
+                name = saved
+
+    aliases = {a for a in aliases if a and not is_placeholder_name(a, jid or "")}
+    if name and is_placeholder_name(name, jid or ""):
+        name = next(iter(aliases), None)
+    return jid, name, aliases
 
 
 def emit_contacts_synced(account_id: str, contacts: dict[str, str]) -> None:
@@ -993,25 +1239,59 @@ def resolve_chat_title(
     contacts: dict[str, str],
     self_jid: Optional[str] = None,
     self_name: Optional[str] = None,
+    self_aliases: Optional[set[str]] = None,
 ) -> str:
     jid = str(chat.get("jid") or chat.get("id") or "")
+    aliases = {a.strip() for a in (self_aliases or set()) if isinstance(a, str) and a.strip()}
+    if self_name and str(self_name).strip():
+        aliases.add(str(self_name).strip())
+
+    def usable(label: Optional[str]) -> Optional[str]:
+        if not label:
+            return None
+        text = str(label).strip()
+        if not text or is_placeholder_name(text, jid):
+            return None
+        # Connected WhatsApp Business accounts often leak their own brand name
+        # into other chats' name/verified_name fields via GOWA.
+        if text in aliases and not (self_jid and jids_same(jid, self_jid)):
+            return None
+        return text
+
     if self_jid and jid and jids_same(jid, self_jid):
-        saved = lookup_contact_name(contacts, jid)
+        saved = usable(lookup_contact_name(contacts, jid))
+        if saved and saved not in aliases:
+            return f"{saved} (You)"
+        if self_name and not is_placeholder_name(str(self_name), jid):
+            return f"{self_name} (You)"
         if saved:
             return f"{saved} (You)"
-        if self_name:
-            return f"{self_name} (You)"
         return "Message yourself"
-    raw = chat.get("name") or chat.get("push_name") or chat.get("pushname")
-    name = str(raw).strip() if raw else ""
-    saved = lookup_contact_name(contacts, jid)
+
+    saved = usable(lookup_contact_name(contacts, jid))
+    candidates = [
+        chat.get("business_name"),
+        chat.get("verified_name"),
+        chat.get("push_name"),
+        chat.get("pushname"),
+        chat.get("name"),
+        chat.get("chat_name"),
+    ]
+    name = None
+    for raw in candidates:
+        name = usable(str(raw) if raw is not None else None)
+        if name:
+            break
+
     if jid.endswith("@g.us"):
-        if name and not is_placeholder_name(name, jid):
+        if name:
             return name
         return saved or jid_user_part(jid) or jid or "Group"
+
+    # Address book wins for 1:1 — GOWA chat.name is unreliable for businesses.
     if saved:
         return saved
-    if name and not is_placeholder_name(name, jid):
+    if name:
         return name
     return jid_user_part(jid) or jid or "Chat"
 
@@ -1022,14 +1302,24 @@ def resolve_sender_name(
     chat_jid: str,
     chat_title: str,
     contacts: dict[str, str],
+    self_aliases: Optional[set[str]] = None,
 ) -> str:
-    if row.get("is_from_me") or row.get("from_me") or data.get("from_me"):
+    if (
+        row.get("is_from_me")
+        or row.get("from_me")
+        or data.get("from_me")
+        or data.get("is_from_me")
+    ):
         return "You"
+    aliases = {a.strip() for a in (self_aliases or set()) if isinstance(a, str) and a.strip()}
     sender = row.get("sender_jid") or data.get("sender_jid") or data.get("from") or row.get("from")
     saved = lookup_contact_name(contacts, str(sender) if sender else None) or lookup_contact_name(
         contacts, chat_jid
     )
+    if saved and saved in aliases:
+        saved = None
     for key in (
+        "from_name",
         "sender_display_name",
         "pushname",
         "push_name",
@@ -1040,13 +1330,15 @@ def resolve_sender_name(
         if not val:
             continue
         text = str(val).strip()
+        if text in aliases:
+            continue
         if not is_placeholder_name(text, str(sender or chat_jid)):
             return text
     if saved:
         return saved
     if chat_jid.endswith("@g.us"):
         return jid_user_part(str(sender)) if sender else "Unknown"
-    if chat_title and not is_placeholder_name(chat_title, chat_jid):
+    if chat_title and not is_placeholder_name(chat_title, chat_jid) and chat_title not in aliases:
         return chat_title
     if sender:
         return jid_user_part(str(sender))
@@ -1069,18 +1361,70 @@ class WhatsAppSession:
         self._contacts: dict[str, str] = {}
         self._self_jid: Optional[str] = None
         self._self_name: Optional[str] = None
+        self._self_aliases: set[str] = set()
         self._lid_map: dict[str, str] = {}
+        self._all_chat_jids: list[str] = []
+        self._msg_sync_idx = 0
+        self._msg_sync_thread: Optional[threading.Thread] = None
 
     def connect(self) -> None:
-        url, auth, proc = load_or_start_gowa()
+        webhook = ensure_webhook_server()
+        url, auth, proc = load_or_start_gowa(webhook)
         self.gowa_proc = proc
         self.client = GowaClient(url, auth, self.account_id)
+        _sessions_by_account[self.account_id] = self
         self.ensure_device()
-        status = self.device_status()
-        if status.get("is_logged_in") or status.get("state") in {"logged_in", "connected"}:
+        if webhook:
+            self._register_gowa_webhook(webhook)
+        self._start_listeners()
+        status = self._wait_until_logged_in(timeout=30.0)
+        if self._status_logged_in(status):
             self._on_connected(status)
             return
-        self.start_qr_login(start_listeners=True)
+        self.start_qr_login(start_listeners=False)
+
+    def _wait_until_logged_in(self, timeout: float = 30.0) -> dict[str, Any]:
+        deadline = time.time() + timeout
+        last: dict[str, Any] = {}
+        while time.time() < deadline:
+            last = self.device_status()
+            if self._status_logged_in(last):
+                return last
+            assert self.client
+            code, body = self.client.get(f"/devices/{self.account_id}/login")
+            if self._login_pending(code, body):
+                time.sleep(1.0)
+                continue
+            time.sleep(0.45)
+        return last
+
+    def _status_logged_in(self, status: dict[str, Any]) -> bool:
+        if status.get("is_logged_in") is True or status.get("is_connected") is True:
+            return True
+        return str(status.get("state") or "").lower() in {"logged_in", "connected"}
+
+    def _login_already_active(self, code: int, body: Any) -> bool:
+        r = results(body) if isinstance(body, dict) else {}
+        if self._status_logged_in(r):
+            return True
+        code_s = str(body.get("code") if isinstance(body, dict) else "").upper()
+        msg = str(body.get("message") if isinstance(body, dict) else body).lower()
+        if code_s in {"ALREADY_LOGGED_IN", "SESSION_SAVED_ERROR"}:
+            return True
+        if code in (400, 409, 500) and (
+            "already logged" in msg or "session" in msg and "wait" in msg
+        ):
+            return True
+        return False
+
+    def _login_pending(self, code: int, body: Any) -> bool:
+        if self._login_already_active(code, body):
+            return True
+        code_s = str(body.get("code") if isinstance(body, dict) else "").upper()
+        return code in (400, 409, 500) and code_s in {
+            "ALREADY_LOGGED_IN",
+            "SESSION_SAVED_ERROR",
+        }
 
     def ensure_device(self) -> None:
         assert self.client
@@ -1109,8 +1453,11 @@ class WhatsAppSession:
         code, body = self.client.get(f"/devices/{self.account_id}/login")
         if code != 200:
             code, body = self.client.get("/app/login")
+        if self._login_already_active(code, body):
+            self._on_connected(self.device_status() or results(body))
+            return
         if code != 200:
-            send({"type": "error", "message": f"GOWA login failed ({code}): {body}"})
+            log(f"GOWA login not ready ({code}): {body}")
             return
         r = results(body)
         qr_link = r.get("qr_link")
@@ -1194,12 +1541,18 @@ class WhatsAppSession:
 
     def _poll_loop(self) -> None:
         last_logged_in = False
+        last_catchup = 0.0
         while not self.stop.is_set():
             try:
                 status = self.device_status()
-                logged_in = bool(status.get("is_logged_in") or status.get("state") in {"logged_in", "connected"})
+                logged_in = bool(
+                    status.get("is_logged_in")
+                    or status.get("is_connected")
+                    or status.get("state") in {"logged_in", "connected"}
+                )
                 if logged_in and not last_logged_in:
                     self._on_connected(status)
+                    last_catchup = time.time()
                 elif last_logged_in and not logged_in:
                     self._connected = False
                     send(
@@ -1213,10 +1566,13 @@ class WhatsAppSession:
                 last_logged_in = logged_in
                 if not logged_in and not self._connected:
                     self._refresh_qr_if_needed()
+                elif logged_in and self._connected and time.time() - last_catchup >= 8:
+                    last_catchup = time.time()
+                    self.catch_up_recent()
             except Exception as e:
                 log(f"poll: {e}")
-            # Login detection only. Live messages come from the websocket, not this loop.
-            self.stop.wait(2 if not last_logged_in else 60)
+            # Websocket/webhook is primary; catch-up recovers missed events.
+            self.stop.wait(2 if not last_logged_in else 8)
 
     def _refresh_qr_if_needed(self) -> None:
         if time.time() - self._last_qr_at < 25:
@@ -1235,26 +1591,37 @@ class WhatsAppSession:
             self._on_connected(results(payload) or payload)
             return
         event = str(payload.get("event") or code).lower()
-        if event in {"message.ack", "chat_presence"}:
+        if event in {
+            "message.ack",
+            "message.reaction",
+            "message.revoked",
+            "message.deleted",
+            "chat_presence",
+        }:
             return
         data = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
         if not isinstance(data, dict):
             return
-        if event in {"message", "message.received"} or event.startswith("message.") or data.get("chat_id") or data.get("chat_jid"):
+        emit = event in {"message", "message.received", "message.edited"} or bool(
+            data.get("chat_id")
+            or data.get("chat_jid")
+            or data.get("body")
+        )
+        if emit:
             self._emit_incoming(data)
 
     def _on_connected(self, status: dict[str, Any]) -> None:
         if self._connected:
             return
         self._connected = True
+        if self.client:
+            self._self_jid, self._self_name, self._self_aliases = load_self_profile(self.client)
         identity = (
-            status.get("device_id")
-            or status.get("jid")
+            status.get("jid")
+            or self._self_jid
             or status.get("phone_number")
             or status.get("id")
         )
-        if self.client:
-            self._self_jid, self._self_name = load_self_profile(self.client)
         send(
             {
                 "type": "status",
@@ -1271,11 +1638,18 @@ class WhatsAppSession:
                 "payload": {"identity": identity},
             }
         )
+        self._start_listeners()
+        threading.Thread(
+            target=self._bg_sync_history,
+            daemon=True,
+            name="wa-history",
+        ).start()
+
+    def _bg_sync_history(self) -> None:
         try:
-            self.sync_history()
+            self.sync_history(force=True)
         except Exception as e:
             log(f"history sync: {e}")
-        self._start_listeners()
 
     def sync_history(self, force: bool = False) -> None:
         if self._syncing or (self._history_done and not force):
@@ -1295,10 +1669,16 @@ class WhatsAppSession:
             self._contacts = load_saved_contacts(self.client)
             contacts = self._contacts
             self._lid_map = load_lid_map()
-            self._self_jid, self._self_name = load_self_profile(self.client)
+            chat_settings = load_chat_settings(self._lid_map)
+            self._self_jid, self._self_name, self._self_aliases = load_self_profile(
+                self.client, contacts
+            )
             emit_contacts_synced(self.account_id, contacts)
+            self._emit_status_feed()
+            self._emit_account_avatar()
             offset = 0
             page = 100
+            list_rank = 0
             while True:
                 code, body = self.client.get("/chats", query={"limit": page, "offset": offset})
                 if code != 200:
@@ -1308,15 +1688,19 @@ class WhatsAppSession:
                 chats = r.get("data") or r.get("chats") or []
                 if not isinstance(chats, list):
                     return
-                for idx, chat in enumerate(chats):
+                for chat in chats:
                     if not isinstance(chat, dict):
                         continue
                     jid = chat.get("jid") or chat.get("id")
                     if not jid:
                         continue
                     jid_s = canonical_chat_jid(str(jid), self._lid_map)
+                    if is_status_jid(jid_s):
+                        continue
                     chat_jids.append(jid_s)
-                    title = resolve_chat_title(chat, contacts, self._self_jid, self._self_name)
+                    title = resolve_chat_title(
+                        chat, contacts, self._self_jid, self._self_name, self._self_aliases
+                    )
                     ctype = "group" if jid_s.endswith("@g.us") else "direct"
                     last_at = chat.get("last_message_time") or chat.get("updated_at") or chat.get("lastMessageTime")
                     pinned = chat.get("pinned")
@@ -1325,6 +1709,28 @@ class WhatsAppSession:
                     archived = chat.get("archived")
                     if archived is None:
                         archived = chat.get("is_archived")
+                    settings = (
+                        chat_settings.get(jid_s)
+                        or chat_settings.get(jid_user_part(jid_s))
+                        or {}
+                    )
+                    if pinned is None and "pinned" in settings:
+                        pinned = settings["pinned"]
+                    if archived is None and "archived" in settings:
+                        archived = settings["archived"]
+                    # Self-chat is often pinned in WhatsApp but only present as LID in settings.
+                    if (
+                        pinned is not True
+                        and self._self_jid
+                        and jids_same(jid_s, self._self_jid)
+                    ):
+                        self_flags = (
+                            chat_settings.get(self._self_jid)
+                            or chat_settings.get(jid_user_part(self._self_jid))
+                            or {}
+                        )
+                        if self_flags.get("pinned"):
+                            pinned = True
                     raw_preview = chat.get("last_message") or chat.get("last_message_preview")
                     preview = str(raw_preview) if raw_preview else None
                     if preview and preview.strip().startswith("[") and preview.strip().endswith("]"):
@@ -1341,8 +1747,9 @@ class WhatsAppSession:
                         "preview": preview,
                         "history": True,
                         "force_recency": True,
-                        "list_rank": offset + idx,
+                        "list_rank": list_rank,
                     }
+                    list_rank += 1
                     if isinstance(unread, int):
                         payload["unread_count"] = max(unread, 0)
                     if isinstance(pinned, bool):
@@ -1357,19 +1764,32 @@ class WhatsAppSession:
                             "payload": payload,
                         }
                     )
-                    self._sync_messages(jid_s, title, contacts)
                 if len(chats) < page:
                     break
                 offset += page
-            self._ingest_history_chats(contacts, chat_jids)
             self._history_done = True
             self._emit_self_conversation(contacts)
+            send(
+                {
+                    "type": "event",
+                    "event": "history.sync.completed",
+                    "account_id": self.account_id,
+                    "payload": {},
+                }
+            )
+            for jid_s in chat_jids[:30]:
+                title = resolve_chat_title(
+                    {"jid": jid_s}, contacts, self._self_jid, self._self_name, self._self_aliases
+                )
+                self._sync_messages(jid_s, title, contacts, max_messages=120, as_history=True)
+            self._ingest_history_chats(contacts, chat_jids)
+            self._start_message_backfill(chat_jids)
         finally:
             self._syncing = False
             send(
                 {
                     "type": "event",
-                    "event": "history.sync.completed",
+                    "event": "inbox.catchup",
                     "account_id": self.account_id,
                     "payload": {},
                 }
@@ -1382,95 +1802,279 @@ class WhatsAppSession:
                     name="wa-avatars",
                 ).start()
 
+    def _start_message_backfill(self, jids: list[str]) -> None:
+        """Continuously page message history for every chat into Shuttle's DB."""
+        if not jids:
+            return
+        self._all_chat_jids = list(dict.fromkeys(jids))
+        if self._msg_sync_thread and self._msg_sync_thread.is_alive():
+            return
+        self._msg_sync_idx = 0
+        self._msg_sync_thread = threading.Thread(
+            target=self._message_backfill_loop,
+            daemon=True,
+            name="wa-msg-backfill",
+        )
+        self._msg_sync_thread.start()
+
+    def _message_backfill_loop(self) -> None:
+        batch = 4
+        max_per_chat = 500
+        idle_rounds = 0
+        while not self.stop.is_set() and self._connected and self.client:
+            jids = self._all_chat_jids
+            if not jids:
+                time.sleep(30)
+                continue
+            if self._msg_sync_idx >= len(jids):
+                idle_rounds += 1
+                send(
+                    {
+                        "type": "event",
+                        "event": "inbox.backfill",
+                        "account_id": self.account_id,
+                        "payload": {
+                            "done": True,
+                            "total": len(jids),
+                            "round": idle_rounds,
+                        },
+                    }
+                )
+                # Re-sync on a slower cadence so new GOWA rows land in SQLite.
+                time.sleep(300 if idle_rounds > 1 else 60)
+                self._msg_sync_idx = 0
+                continue
+            contacts = self._contacts or {}
+            end = min(self._msg_sync_idx + batch, len(jids))
+            for jid_s in jids[self._msg_sync_idx : end]:
+                if self.stop.is_set() or not self._connected:
+                    return
+                title = resolve_chat_title(
+                    {"jid": jid_s},
+                    contacts,
+                    self._self_jid,
+                    self._self_name,
+                    self._self_aliases,
+                )
+                try:
+                    self._sync_messages(
+                        jid_s, title, contacts, max_messages=max_per_chat, as_history=True
+                    )
+                except Exception as e:
+                    log(f"message backfill {jid_s}: {e}")
+                time.sleep(0.12)
+            self._msg_sync_idx = end
+            send(
+                {
+                    "type": "event",
+                    "event": "inbox.backfill",
+                    "account_id": self.account_id,
+                    "payload": {
+                        "done": False,
+                        "progress": self._msg_sync_idx,
+                        "total": len(jids),
+                    },
+                }
+            )
+            time.sleep(0.35)
+
+    def _emit_status_feed(self) -> None:
+        if not self.client:
+            return
+        encoded = urllib.parse.quote("status@broadcast", safe="")
+        code, body = self.client.get(f"/chat/{encoded}/messages", query={"limit": 80, "offset": 0})
+        if code != 200:
+            log(f"status feed {code}: {body}")
+            return
+        r = results(body)
+        rows = r.get("data") or r.get("messages") or []
+        if not isinstance(rows, list):
+            return
+        by_sender: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sender = canonical_chat_jid(str(row.get("sender_jid") or ""), self._lid_map)
+            if not sender:
+                continue
+            msg_id = str(row.get("id") or "").strip()
+            ts = to_rfc3339(row.get("timestamp") or row.get("created_at"))
+            text, extra = message_body_and_media(row)
+            preview = (text or "")[:160]
+            media_type = str(extra.get("media_type") or row.get("media_type") or "text")
+            sender_name = row.get("sender_display_name") or jid_user_part(sender)
+            from_me = bool(row.get("is_from_me") or row.get("from_me"))
+            post = {
+                "id": msg_id,
+                "media_type": media_type,
+                "text": text if text and not text.startswith("[") else (preview or ""),
+                "timestamp": ts,
+            }
+            entry = by_sender.get(sender)
+            if not entry:
+                by_sender[sender] = {
+                    "sender_id": sender,
+                    "sender_name": sender_name,
+                    "timestamp": ts,
+                    "media_type": media_type,
+                    "preview": preview,
+                    "from_me": from_me,
+                    "count": 1,
+                    "posts": [post] if msg_id else [],
+                }
+                continue
+            entry["count"] = int(entry.get("count") or 0) + 1
+            if msg_id:
+                posts = entry.setdefault("posts", [])
+                if isinstance(posts, list) and not any(
+                    isinstance(p, dict) and p.get("id") == msg_id for p in posts
+                ):
+                    posts.append(post)
+            if ts and (not entry.get("timestamp") or str(ts) > str(entry.get("timestamp"))):
+                entry["timestamp"] = ts
+                entry["preview"] = preview
+                entry["media_type"] = media_type
+                if sender_name:
+                    entry["sender_name"] = sender_name
+        items: list[dict[str, Any]] = []
+        for entry in by_sender.values():
+            posts = entry.get("posts")
+            if isinstance(posts, list) and posts:
+                # Oldest → newest within a sender (WhatsApp-style playback).
+                posts.sort(key=lambda p: str((p or {}).get("timestamp") or ""))
+                entry["posts"] = posts
+                entry["count"] = len(posts)
+            items.append(entry)
+        # Newest activity first in the stories rail.
+        items.sort(key=lambda e: str(e.get("timestamp") or ""), reverse=True)
+        send(
+            {
+                "type": "event",
+                "event": "status.feed",
+                "account_id": self.account_id,
+                "payload": {"items": items},
+            }
+        )
+
+    def _emit_account_avatar(self) -> None:
+        """Push the connected account's profile photo for the sidebar rail."""
+        if not self.client or not self._self_jid:
+            return
+        try:
+            data = load_cached_avatar(self.account_id, self._self_jid)
+            if not data:
+                raw = fetch_avatar_bytes(self.client, self.account_id, self._self_jid)
+                if raw:
+                    data = load_cached_avatar(self.account_id, self._self_jid)
+            if not data:
+                return
+            send(
+                {
+                    "type": "event",
+                    "event": "account.avatar",
+                    "account_id": self.account_id,
+                    "payload": {"avatar_data": data},
+                }
+            )
+        except Exception as e:
+            log(f"account avatar: {e}")
+
+    def _history_jid(self, conv: dict[str, Any]) -> str:
+        raw_id = str(conv.get("ID") or conv.get("id") or "")
+        pn = conv.get("pnJID") or conv.get("pnJid")
+        return canonical_chat_jid(str(pn or raw_id), self._lid_map)
+
+    def _parse_history_wraps(self, wraps: Any) -> tuple[list[dict[str, Any]], str]:
+        parsed: list[dict[str, Any]] = []
+        stub_name = ""
+        if not isinstance(wraps, list):
+            return parsed, stub_name
+        for wrap in wraps:
+            if not isinstance(wrap, dict):
+                continue
+            fields = history_message_fields(wrap)
+            if not fields:
+                continue
+            if fields.get("stub_name") and not stub_name:
+                stub_name = str(fields["stub_name"])
+            body = str(fields.get("text") or "").strip()
+            if body.startswith("[") and body.endswith("]") and fields.get("stub_name"):
+                continue
+            if not body:
+                continue
+            parsed.append(fields)
+        return parsed, stub_name
+
+    def _emit_history_messages(self, jid: str, title: str, parsed: list[dict[str, Any]]) -> None:
+        for fields in parsed[-500:]:
+            text, extra = message_body_and_media({"text": fields["text"]})
+            send(
+                {
+                    "type": "event",
+                    "event": "message.sent" if fields["from_me"] else "message.received",
+                    "account_id": self.account_id,
+                    "payload": {
+                        "conversation_id": jid,
+                        "remote_id": jid,
+                        "history": True,
+                        "message": {
+                            "id": fields.get("id"),
+                            "sender_id": fields.get("sender_jid") or jid,
+                            "sender_name": "You" if fields["from_me"] else str(title),
+                            "text": text,
+                            "preview": preview_for_message(text, extra),
+                            "timestamp": to_rfc3339(fields.get("timestamp")),
+                            "from_me": fields["from_me"],
+                            **extra,
+                        },
+                    },
+                }
+            )
+
     def _ingest_history_chats(self, contacts: dict[str, str], known: list[str]) -> None:
         known_set = {canonical_chat_jid(j, self._lid_map) for j in known}
         imported = 0
         for conv in parse_history_conversations():
-            raw_id = str(conv.get("ID") or "")
-            pn = conv.get("pnJID")
-            jid = canonical_chat_jid(str(pn or raw_id), self._lid_map)
+            jid = self._history_jid(conv)
             if not jid or jid.endswith("@broadcast") or jid.endswith("@newsletter") or jid.startswith("status@"):
                 continue
-            wraps = conv.get("messages") if isinstance(conv.get("messages"), list) else []
-            parsed: list[dict[str, Any]] = []
-            stub_name = ""
-            for wrap in wraps:
-                if not isinstance(wrap, dict):
-                    continue
-                fields = history_message_fields(wrap)
-                if not fields:
-                    continue
-                if fields.get("stub_name") and not stub_name:
-                    stub_name = str(fields["stub_name"])
-                body = str(fields.get("text") or "").strip()
-                if body.startswith("[") and body.endswith("]") and fields.get("stub_name"):
-                    continue
-                if not body:
-                    continue
-                parsed.append(fields)
-            title = (
-                lookup_contact_name(contacts, jid)
-                or stub_name
-                or conv.get("name")
-                or ""
+            parsed, stub_name = self._parse_history_wraps(conv.get("messages"))
+            title = resolve_chat_title(
+                {
+                    "jid": jid,
+                    "name": conv.get("name"),
+                    "verified_name": conv.get("verified_name"),
+                    "business_name": conv.get("business_name"),
+                },
+                contacts,
+                self._self_jid,
+                self._self_name,
+                self._self_aliases,
             )
-            if not parsed and not str(title).strip() and not stub_name:
+            if not parsed and is_placeholder_name(str(title), jid) and not stub_name:
                 continue
             title = str(title).strip() or stub_name or jid_user_part(jid)
             last = parsed[-1] if parsed else None
             last_at = last.get("timestamp") if last else conv.get("conversationTimestamp")
             preview = last.get("text") if last else stub_name
-            unread = conv.get("unreadCount") or 0
-            try:
-                unread_n = int(unread)
-            except (TypeError, ValueError):
-                unread_n = 0
-            payload: dict[str, Any] = {
-                "remote_id": jid,
-                "title": str(title),
-                "conversation_type": "group" if jid.endswith("@g.us") else "direct",
-                "last_message_at": to_rfc3339(last_at) if last_at else None,
-                "preview": preview,
-                "history": True,
-                "unread_count": unread_n,
-            }
+            # Backup unreadCount is often stale vs WhatsApp Web. Live unread is inbound-only.
             send(
                 {
                     "type": "event",
                     "event": "conversation.updated",
                     "account_id": self.account_id,
-                    "payload": payload,
+                    "payload": {
+                        "remote_id": jid,
+                        "title": str(title),
+                        "conversation_type": "group" if jid.endswith("@g.us") else "direct",
+                        "last_message_at": to_rfc3339(last_at) if last_at else None,
+                        "preview": preview,
+                        "history": True,
+                    },
                 }
             )
             imported += 1
-            if jid in known_set and unread_n <= 0 and parsed:
-                continue
-            limit = 20 if jid in known_set else 80
-            for fields in parsed[-limit:]:
-                extra: dict[str, Any] = {}
-                text, extra = message_body_and_media({"text": fields["text"]})
-                send(
-                    {
-                        "type": "event",
-                        "event": "message.sent" if fields["from_me"] else "message.received",
-                        "account_id": self.account_id,
-                        "payload": {
-                            "conversation_id": jid,
-                            "remote_id": jid,
-                            "history": True,
-                            "message": {
-                                "id": fields.get("id"),
-                                "sender_id": fields.get("sender_jid") or jid,
-                                "sender_name": "You" if fields["from_me"] else str(title),
-                                "text": text,
-                                "preview": preview_for_message(text, extra),
-                                "timestamp": to_rfc3339(fields.get("timestamp")),
-                                "from_me": fields["from_me"],
-                                **extra,
-                            },
-                        },
-                    }
-                )
+            self._emit_history_messages(jid, title, parsed)
             if jid not in known_set:
                 known.append(jid)
                 known_set.add(jid)
@@ -1480,37 +2084,63 @@ class WhatsAppSession:
         if not self._self_jid:
             return
         title = resolve_chat_title(
-            {"jid": self._self_jid}, contacts, self._self_jid, self._self_name
+            {"jid": self._self_jid},
+            contacts,
+            self._self_jid,
+            self._self_name,
+            self._self_aliases,
+        )
+        settings = load_chat_settings(self._lid_map)
+        flags = (
+            settings.get(str(self._self_jid))
+            or settings.get(jid_user_part(str(self._self_jid)))
+            or {}
         )
         jids = {str(self._self_jid)}
         digits = phone_digits(self._self_jid)
         if digits:
             jids.add(f"{digits}@s.whatsapp.net")
         for jid in jids:
+            payload: dict[str, Any] = {
+                "remote_id": jid,
+                "title": title,
+                "conversation_type": "direct",
+                "history": True,
+                "replace_title": True,
+            }
+            if "pinned" in flags:
+                payload["pinned"] = flags["pinned"]
+            if "archived" in flags:
+                payload["archived"] = flags["archived"]
             send(
                 {
                     "type": "event",
                     "event": "conversation.updated",
                     "account_id": self.account_id,
-                    "payload": {
-                        "remote_id": jid,
-                        "title": title,
-                        "conversation_type": "direct",
-                    },
+                    "payload": payload,
                 }
             )
 
     def _sync_messages(
-        self, jid: str, title: str, contacts: dict[str, str], max_messages: int = 500
+        self,
+        jid: str,
+        title: str,
+        contacts: dict[str, str],
+        max_messages: int = 500,
+        *,
+        as_history: bool = True,
     ) -> None:
+        if is_status_jid(jid):
+            return
         assert self.client
         encoded = urllib.parse.quote(jid, safe="")
         offset = 0
         page = 80
         while offset < max_messages:
+            batch = min(page, max_messages - offset)
             code, body = self.client.get(
                 f"/chat/{encoded}/messages",
-                query={"limit": page, "offset": offset},
+                query={"limit": batch, "offset": offset},
             )
             if code != 200:
                 return
@@ -1522,10 +2152,19 @@ class WhatsAppSession:
             for row in reversed(rows):
                 if not isinstance(row, dict):
                     continue
+                # Protocol stubs (no content) — do not create blank bubbles.
+                if row.get("message_stub_type") or row.get("messageStubType"):
+                    inner = row.get("message") if isinstance(row.get("message"), dict) else {}
+                    if not (row.get("content") or row.get("media_type") or (inner or {}).get("conversation")):
+                        continue
                 from_me = bool(row.get("is_from_me") or row.get("from_me"))
                 text, extra = message_body_and_media(row)
+                if not str(text or "").strip() and not extra.get("media_type"):
+                    continue
                 event = "message.sent" if from_me else "message.received"
-                sender_name = resolve_sender_name(row, row, jid, title, contacts)
+                sender_name = resolve_sender_name(
+                    row, row, jid, title, contacts, self._self_aliases
+                )
                 message: dict[str, Any] = {
                     "id": row.get("id"),
                     "sender_id": row.get("sender_jid"),
@@ -1544,30 +2183,47 @@ class WhatsAppSession:
                         "payload": {
                             "conversation_id": jid,
                             "remote_id": jid,
-                            "history": True,
+                            "history": as_history,
                             "message": message,
                         },
                     }
                 )
-            if len(rows) < page:
+            if len(rows) < batch:
                 break
-            offset += page
+            offset += batch
 
     def refresh_chat(self, jid: str) -> None:
         if not self.client:
             return
         contacts = self._contacts or load_saved_contacts(self.client)
         self._contacts = contacts
-        title = resolve_chat_title({"jid": jid}, contacts, self._self_jid, self._self_name)
-        self._sync_messages(jid, title, contacts, max_messages=80)
+        title = resolve_chat_title(
+            {"jid": jid}, contacts, self._self_jid, self._self_name, self._self_aliases
+        )
+        self._sync_messages(jid, title, contacts, max_messages=80, as_history=True)
+        for conv in parse_history_conversations():
+            hist_jid = self._history_jid(conv)
+            if not hist_jid or not jids_same(hist_jid, jid):
+                continue
+            parsed, _stub = self._parse_history_wraps(conv.get("messages"))
+            self._emit_history_messages(jid, title, parsed)
+            break
+        send(
+            {
+                "type": "event",
+                "event": "chat.synced",
+                "account_id": self.account_id,
+                "payload": {"remote_id": jid},
+            }
+        )
 
     def catch_up_recent(self) -> None:
-        """One-shot pull of recent chats after a websocket reconnect. Not a poll loop."""
+        """Bounded pull of recent chats to recover events missed by the websocket."""
         if not self.client or not self._connected:
             return
         contacts = self._contacts or load_saved_contacts(self.client)
         self._contacts = contacts
-        code, body = self.client.get("/chats", query={"limit": 40, "offset": 0})
+        code, body = self.client.get("/chats", query={"limit": 25, "offset": 0})
         if code != 200:
             log(f"catch-up GET /chats {code}: {body}")
             return
@@ -1581,8 +2237,38 @@ class WhatsAppSession:
             if not jid:
                 continue
             jid_s = canonical_chat_jid(str(jid), self._lid_map)
-            title = resolve_chat_title(chat, contacts, self._self_jid, self._self_name)
-            self._sync_messages(jid_s, title, contacts, max_messages=40)
+            if is_status_jid(jid_s):
+                continue
+            title = resolve_chat_title(
+                chat, contacts, self._self_jid, self._self_name, self._self_aliases
+            )
+            last_at = chat.get("last_message_time") or chat.get("updated_at") or chat.get("lastMessageTime")
+            last_at_s = to_rfc3339(last_at) if last_at else None
+            if last_at_s and (last_at_s.startswith("0001-") or last_at_s.startswith("0000-")):
+                last_at_s = None
+            send(
+                {
+                    "type": "event",
+                    "event": "conversation.updated",
+                    "account_id": self.account_id,
+                    "payload": {
+                        "remote_id": jid_s,
+                        "title": title,
+                        "conversation_type": "group" if jid_s.endswith("@g.us") else "direct",
+                        "last_message_at": last_at_s,
+                        "history": True,
+                        "force_recency": True,
+                    },
+                }
+            )
+            # Live recovery: newly inserted inbound rows must bump unread (WS often misses).
+            self._sync_messages(
+                jid_s, title, contacts, max_messages=20, as_history=False
+            )
+        try:
+            self._emit_status_feed()
+        except Exception as e:
+            log(f"catch-up status feed: {e}")
         send(
             {
                 "type": "event",
@@ -1643,11 +2329,17 @@ class WhatsAppSession:
         if self.client and not jid_s.endswith("@g.us"):
             code, body = self.client.get("/user/info", query={"phone": jid_s})
             if code == 200:
-                info = results(body)
-                profile["username"] = info.get("push_name") or info.get("verified_name") or info.get("name")
+                info = user_info_record(body)
+                username = info.get("push_name") or info.get("verified_name") or info.get("name")
+                if (
+                    isinstance(username, str)
+                    and username.strip()
+                    and username.strip() not in self._self_aliases
+                ):
+                    profile["username"] = username.strip()
+                elif saved := lookup_contact_name(self._contacts, jid_s):
+                    profile["username"] = saved
                 profile["about"] = info.get("status") or info.get("about")
-                if isinstance(profile["username"], str):
-                    profile["username"] = profile["username"].strip() or None
                 if isinstance(profile["about"], str):
                     profile["about"] = profile["about"].strip() or None
             code, body = self.client.get("/user/business-profile", query={"phone": jid_s})
@@ -1656,8 +2348,12 @@ class WhatsAppSession:
                 profile["business_name"] = biz.get("business_name") or biz.get("name")
                 if isinstance(profile["business_name"], str):
                     profile["business_name"] = profile["business_name"].strip() or None
+                if profile["business_name"] and profile["business_name"] in self._self_aliases:
+                    profile["business_name"] = lookup_contact_name(self._contacts, jid_s)
                 if not profile["about"]:
                     profile["about"] = biz.get("description") or biz.get("status")
+            if not profile["username"]:
+                profile["username"] = lookup_contact_name(self._contacts, jid_s)
         send(
             {
                 "type": "contact_profile",
@@ -1691,6 +2387,36 @@ class WhatsAppSession:
             {
                 "type": "event",
                 "event": "media.downloaded",
+                "account_id": self.account_id,
+                "payload": payload,
+            }
+        )
+
+    def download_status_media(self, message_id: str) -> None:
+        """Download a status@broadcast media item for the story viewer."""
+        payload: dict[str, Any] = {"message_id": message_id}
+        if not self.client or not message_id:
+            payload["error"] = "not connected"
+            send(
+                {
+                    "type": "event",
+                    "event": "status.media",
+                    "account_id": self.account_id,
+                    "payload": payload,
+                }
+            )
+            return
+        got = download_gowa_media(
+            self.client, message_id, "status@broadcast", for_status=True
+        )
+        if got:
+            payload.update(got)
+        else:
+            payload["error"] = "download failed"
+        send(
+            {
+                "type": "event",
+                "event": "status.media",
                 "account_id": self.account_id,
                 "payload": payload,
             }
@@ -1735,40 +2461,113 @@ class WhatsAppSession:
         inner = data.get("message") if isinstance(data.get("message"), dict) else data
         if not isinstance(inner, dict):
             inner = data
+        info = data.get("info") if isinstance(data.get("info"), dict) else {}
+        if not isinstance(info, dict):
+            info = {}
         text = nested_text(inner) or nested_text(data)
-        from_me = bool(data.get("from_me") or inner.get("is_from_me") or inner.get("from_me"))
+        if isinstance(data.get("body"), str) and data["body"].strip():
+            text = data["body"]
+        from_me = bool(
+            data.get("from_me")
+            or data.get("is_from_me")
+            or inner.get("is_from_me")
+            or inner.get("from_me")
+            or info.get("IsFromMe")
+            or info.get("is_from_me")
+        )
+        data_key = data.get("key") if isinstance(data.get("key"), dict) else {}
+        inner_key = inner.get("key") if isinstance(inner.get("key"), dict) else {}
         chat_jid = str(
             data.get("chat_id")
             or data.get("chat_jid")
             or inner.get("chat_jid")
+            or inner.get("chat_id")
+            or info.get("Chat")
+            or info.get("chat")
+            or data_key.get("remoteJID")
+            or data_key.get("remoteJid")
+            or inner_key.get("remoteJID")
+            or inner_key.get("remoteJid")
+            or (data.get("to") if from_me else None)
+            or (inner.get("to") if from_me else None)
+            or (data.get("recipient") if from_me else None)
             or data.get("from")
             or inner.get("from")
             or ""
         )
         chat_jid = canonical_chat_jid(chat_jid, self._lid_map)
-        msg_id = data.get("id") or inner.get("id") or inner.get("message_id")
+        msg_id = (
+            data.get("id")
+            or inner.get("id")
+            or inner.get("message_id")
+            or data_key.get("ID")
+            or data_key.get("id")
+            or inner_key.get("ID")
+            or inner_key.get("id")
+            or info.get("ID")
+            or info.get("id")
+        )
         if not chat_jid:
+            return
+        if is_status_jid(chat_jid):
+            sender = canonical_chat_jid(
+                str(data.get("sender_jid") or inner.get("sender_jid") or data.get("from") or ""),
+                self._lid_map,
+            )
+            media_type = inner.get("media_type") or data.get("media_type") or "text"
+            ts = to_rfc3339(data.get("timestamp") or inner.get("timestamp"))
+            post_id = str(msg_id or "").strip()
+            send(
+                {
+                    "type": "event",
+                    "event": "status.feed",
+                    "account_id": self.account_id,
+                    "payload": {
+                        "upsert": {
+                            "sender_id": sender or chat_jid,
+                            "sender_name": data.get("pushname")
+                            or inner.get("sender_display_name")
+                            or jid_user_part(sender or chat_jid),
+                            "timestamp": ts,
+                            "media_type": media_type,
+                            "preview": (text or "")[:160],
+                            "from_me": from_me,
+                            "count": 1,
+                            "posts": [
+                                {
+                                    "id": post_id,
+                                    "media_type": str(media_type or "text"),
+                                    "text": (text or "")[:500],
+                                    "timestamp": ts,
+                                }
+                            ]
+                            if post_id
+                            else [],
+                        }
+                    },
+                }
+            )
             return
         contacts = self._contacts
         if self.client and not contacts:
             contacts = load_saved_contacts(self.client)
             self._contacts = contacts
-        chat_title = lookup_contact_name(contacts, chat_jid) or (
-            data.get("chat_name")
-            or data.get("name")
-            or jid_user_part(chat_jid)
+        chat_title = resolve_chat_title(
+            {
+                "jid": chat_jid,
+                "business_name": data.get("business_name") or inner.get("business_name"),
+                "verified_name": data.get("verified_name") or inner.get("verified_name"),
+                "push_name": data.get("pushname") or data.get("push_name") or inner.get("push_name"),
+                "name": data.get("chat_name") or data.get("name") or inner.get("name"),
+            },
+            contacts,
+            self._self_jid,
+            self._self_name,
+            self._self_aliases,
         )
-        if self._self_jid and jids_same(chat_jid, self._self_jid):
-            saved = lookup_contact_name(contacts, chat_jid)
-            if saved:
-                chat_title = f"{saved} (You)"
-            elif self._self_name:
-                chat_title = f"{self._self_name} (You)"
-            else:
-                chat_title = "Message yourself"
-        elif is_placeholder_name(str(chat_title), chat_jid):
-            chat_title = lookup_contact_name(contacts, chat_jid) or jid_user_part(chat_jid)
-        sender_name = resolve_sender_name(inner, data, chat_jid, str(chat_title), contacts)
+        sender_name = resolve_sender_name(
+            inner, data, chat_jid, str(chat_title), contacts, self._self_aliases
+        )
         merged = dict(inner)
         merged.update(data)
         merged["text"] = text
@@ -1792,6 +2591,7 @@ class WhatsAppSession:
                     "conversation_type": "group" if chat_jid.endswith("@g.us") else "direct",
                     "last_message_at": ts,
                     "preview": preview,
+                    "force_recency": True,
                 },
             }
         )
@@ -1806,7 +2606,11 @@ class WhatsAppSession:
                     "history": False,
                     "message": {
                         "id": msg_id,
-                        "sender_id": data.get("sender_jid") or inner.get("sender_jid") or data.get("from"),
+                        "sender_id": data.get("sender_jid")
+                        or inner.get("sender_jid")
+                        or data.get("from")
+                        or info.get("Sender")
+                        or info.get("sender"),
                         "sender_name": sender_name,
                         "text": text or "",
                         "preview": preview,
@@ -1935,8 +2739,18 @@ class WhatsAppSession:
             log(f"mark read {code}: {body}")
             send({"type": "ok", "request_id": None})
 
+    def _register_gowa_webhook(self, webhook_url: str) -> None:
+        assert self.client
+        code, body = self.client.patch(
+            f"/devices/{self.account_id}/webhook",
+            json_body={"webhook_url": webhook_url},
+        )
+        if code not in (200, 201):
+            log(f"device webhook {code}: {body}")
+
     def shutdown(self) -> None:
         self.stop.set()
+        _sessions_by_account.pop(self.account_id, None)
         # GOWA is shared across accounts in this process; stopped in main()'s finally.
 
 def main() -> None:
@@ -1999,6 +2813,11 @@ def main() -> None:
             elif rtype == "download_media":
                 if session:
                     session.download_media(req.get("conversation_id") or "", req.get("message_id") or "")
+                else:
+                    send({"type": "error", "message": "not connected", "account_id": account_id})
+            elif rtype == "download_status_media":
+                if session:
+                    session.download_status_media(req.get("message_id") or "")
                 else:
                     send({"type": "error", "message": "not connected", "account_id": account_id})
             elif rtype == "fetch_avatar":

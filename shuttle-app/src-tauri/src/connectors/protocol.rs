@@ -67,6 +67,10 @@ pub enum ConnectorRequest {
         conversation_id: String,
         message_id: String,
     },
+    DownloadStatusMedia {
+        account_id: String,
+        message_id: String,
+    },
     FetchAvatar {
         account_id: String,
         conversation_id: String,

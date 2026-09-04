@@ -9,7 +9,8 @@ pub fn init() {
 }
 
 pub fn prepare_connector_command(command: &mut Command) {
-    command.kill_on_drop(true);
+    // Do not use kill_on_drop: tokio requires a runtime on drop, but hibernation/quit
+    // stops sidecars from the main thread and sleep loop via sync kill_process().
 
     #[cfg(target_os = "linux")]
     {

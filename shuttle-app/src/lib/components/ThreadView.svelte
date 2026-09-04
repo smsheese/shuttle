@@ -99,6 +99,27 @@
     })
   );
 
+  const visibleMessages = $derived(
+    displayMessages.filter((msg) => {
+      const kind = mediaKindFromMessage(msg);
+      const caption = captionText(msg);
+      return Boolean(kind || (caption && caption.trim()));
+    })
+  );
+
+  const listAheadOfBodies = $derived.by(() => {
+    const listAt = conversation?.last_message_at
+      ? Date.parse(conversation.last_message_at)
+      : NaN;
+    if (!Number.isFinite(listAt) || visibleMessages.length === 0) return false;
+    let newest = 0;
+    for (const msg of visibleMessages) {
+      const t = Date.parse(msg.timestamp);
+      if (Number.isFinite(t) && t > newest) newest = t;
+    }
+    return listAt - newest > 120_000;
+  });
+
   const account = $derived(
     conversation ? accounts.find((a) => a.id === conversation.account_id) : null
   );
@@ -169,25 +190,67 @@
     queueMicrotask(resizeComposer);
   });
 
-  // Scroll to bottom when conversation changes (always) or new messages arrive (if near bottom)
+  // Snap to latest on open and stay pinned to bottom until the user scrolls up.
   let lastConversationId = $state<string | null>(null);
+  let pendingSnapToLatest = $state(false);
+  let stickToBottom = $state(true);
+
+  function scrollMessagesToLatest() {
+    const el = messagesEl;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function onMessagesScroll() {
+    const el = messagesEl;
+    if (!el) return;
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottom = distance < 140;
+  }
+
   $effect(() => {
     const convId = conversation?.id ?? null;
-    const changed = convId !== lastConversationId;
-    displayMessages; // track
-    if (!messagesEl) return;
-    const el = messagesEl;
-    if (changed) {
+    if (convId !== lastConversationId) {
       lastConversationId = convId;
-      // Always scroll to bottom on conversation switch
-      queueMicrotask(() => { el.scrollTop = el.scrollHeight; });
-    } else {
-      // Only scroll if near bottom
-      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-      if (atBottom) {
-        queueMicrotask(() => { el.scrollTop = el.scrollHeight; });
-      }
+      pendingSnapToLatest = true;
+      stickToBottom = true;
     }
+  });
+
+  $effect(() => {
+    const el = messagesEl;
+    if (!el) return;
+    const ro = new ResizeObserver(() => {
+      if (pendingSnapToLatest || stickToBottom) scrollMessagesToLatest();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  });
+
+  $effect(() => {
+    const el = messagesEl;
+    const convId = conversation?.id ?? null;
+    const count = visibleMessages.length;
+    const last = visibleMessages[count - 1];
+    const lastId = last?.id ?? null;
+    const lastOutbound = last?.direction === 'outbound';
+    if (!el || !convId) return;
+
+    const force = pendingSnapToLatest || stickToBottom || lastOutbound;
+    if (!force) return;
+    if (pendingSnapToLatest && count === 0) return;
+
+    scrollMessagesToLatest();
+    queueMicrotask(scrollMessagesToLatest);
+    requestAnimationFrame(() => {
+      scrollMessagesToLatest();
+      requestAnimationFrame(() => {
+        scrollMessagesToLatest();
+        if (pendingSnapToLatest && count > 0) pendingSnapToLatest = false;
+      });
+    });
+
+    void lastId;
   });
 
   $effect(() => {
@@ -343,7 +406,7 @@
 
   function buildThreadLightboxItems(): LightboxItem[] {
     const items: LightboxItem[] = [];
-    for (const msg of displayMessages) {
+    for (const msg of visibleMessages) {
       const kind = mediaKindFromMessage(msg);
       const lbKind = lightboxKind(kind);
       if (!lbKind) continue;
@@ -619,10 +682,28 @@
       </div>
     {/if}
 
-    <div class="messages" bind:this={messagesEl}>
-      {#each displayMessages as msg, i (msg.id)}
-        {@const prev = displayMessages[i - 1]}
-        {@const pos = groupPos(displayMessages, i)}
+    <div class="messages" bind:this={messagesEl} onscroll={onMessagesScroll}>
+      {#if visibleMessages.length === 0}
+        <div class="thread-empty-msgs">
+          <p>No messages synced for this chat yet.</p>
+          <p class="hint">
+            The chat list comes from WhatsApp immediately. Message bodies only appear after WhatsApp
+            sends a history dump to this linked device, or after a live message. Opening a chat
+            cannot pull older threads the way WhatsApp Web does.
+          </p>
+        </div>
+      {/if}
+      {#if listAheadOfBodies}
+        <div class="thread-empty-msgs history-gap">
+          <p class="hint">
+            WhatsApp lists this chat as newer than the messages stored on this linked device.
+            Shuttle cannot download the missing bodies until WhatsApp sends them.
+          </p>
+        </div>
+      {/if}
+      {#each visibleMessages as msg, i (msg.id)}
+        {@const prev = visibleMessages[i - 1]}
+        {@const pos = groupPos(visibleMessages, i)}
         {@const showGap = !prev || prev.direction !== msg.direction}
         {@const showDate = !prev || dateKey(prev.timestamp) !== dateKey(msg.timestamp)}
         {@const kind = mediaKindFromMessage(msg)}
@@ -935,12 +1016,13 @@
 
 <style>
   .thread {
-    flex: 1;
+    flex: 1 1 auto;
     display: flex;
     flex-direction: column;
     background: var(--bg-main);
     min-width: 0;
     min-height: 0;
+    overflow: hidden;
   }
 
   .thread-header {
@@ -1062,7 +1144,8 @@
   }
 
   .messages {
-    flex: 1;
+    flex: 1 1 auto;
+    min-height: 0;
     overflow-y: auto;
     padding: 20px 24px;
     display: flex;
@@ -1711,6 +1794,31 @@
     background: radial-gradient(ellipse at center, var(--accent-muted) 0%, transparent 70%);
   }
 
+  .thread-empty-msgs {
+    margin: auto;
+    max-width: 340px;
+    padding: 40px 20px;
+    text-align: center;
+    color: var(--text-secondary);
+  }
+
+  .thread-empty-msgs p {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.45;
+  }
+
+  .thread-empty-msgs .hint {
+    margin-top: 8px;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+
+  .history-gap {
+    margin: 0 auto 8px;
+    padding: 12px 16px 0;
+  }
+
   .empty-icon {
     opacity: 0.2;
     margin-bottom: 20px;
@@ -1732,7 +1840,7 @@
     color: var(--text-muted);
   }
 
-  @media (max-width: 768px) {
+  @media (max-width: 639px) {
     .thread {
       width: 100%;
     }

@@ -216,7 +216,7 @@
     });
   }
 
-  const sleepDefaults = { enabled: true, after_minutes: 5, check_minutes: 15 };
+  const sleepDefaults = { enabled: false, after_minutes: 5, check_minutes: 15 };
 
   const sleepCfg = $derived(config.sleep ?? sleepDefaults);
 
@@ -469,7 +469,7 @@
             </select>
           </label>
           <p class="hint">
-            Sleeping accounts stop their connector to save RAM. They will not get live notifications until Shuttle wakes them (you open the account, or the periodic check).
+            Off by default. Enable globally here, or per account under Accounts. Sleeping accounts stop their connector to save RAM.
           </p>
           <p class="hint">Muted chats and accounts never notify. Read receipts stay off until you opt in per account or chat.</p>
         </section>
@@ -569,7 +569,7 @@
       {:else if activeTab === 'accounts'}
         <section>
           <h2>Accounts</h2>
-          <p class="hint">Global hibernation is under Notifications. Each account can stay always on or use a custom idle/check interval.</p>
+          <p class="hint">Hibernation is off by default (Notifications). Enable globally or set a custom schedule per account below.</p>
           <ul class="account-list">
             {#each accounts as account (account.id)}
               <li
@@ -1089,7 +1089,7 @@
     flex-direction: column;
     gap: 8px;
   }
-  .row > * {
+  .settings .row > * {
     flex: 1;
   }
   .hint, .about-lead {
@@ -1318,7 +1318,7 @@
     line-height: 1.3;
   }
 
-  @media (max-width: 768px) {
+  @media (max-width: 639px) {
     .settings-layout {
       flex-direction: column;
     }

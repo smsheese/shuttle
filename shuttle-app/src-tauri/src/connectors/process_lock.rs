@@ -133,6 +133,13 @@ fn cmdline_looks_like_connector(_pid: i32, _connector_id: &str) -> bool {
     true
 }
 
+/// Stop a connector or GOWA sidecar by PID (safe from any thread; no Tokio runtime required).
+pub fn kill_process(pid: i32) {
+    if pid > 1 {
+        kill_pid(pid);
+    }
+}
+
 fn cmdline_matches(cmd: &str, connector_id: &str) -> bool {
     let needle = format!("{connector_id}-connector");
     cmd.contains(&needle) || (cmd.contains("connectors/") && cmd.contains(connector_id))

@@ -18,5 +18,5 @@ Point Shuttle at an already-running instance with `SHUTTLE_GOWA_URL` (still must
 2. Registers a device per Shuttle account (`POST /devices`).
 3. Fetches a QR image (`GET /devices/{id}/login`) and sends it over the connector protocol.
 4. Listens on `/ws?device_id=…` for login and inbound messages.
-5. Syncs chats (`GET /chats`) and recent messages (`GET /chat/{jid}/messages`).
+5. Syncs the chat list (`GET /chats`) and message bodies already in GOWA sqlite (`GET /chat/{jid}/messages`), plus WhatsApp `history-*.json` dumps. Those REST message queries do not download on-demand history from the phone.
 6. Sends text (`POST /send/message`) and marks read (`POST /message/{id}/read`).

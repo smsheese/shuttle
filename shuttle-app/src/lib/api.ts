@@ -137,7 +137,9 @@ export async function listConversations(
   accountId?: string,
   workspaceId?: string,
   priorityGroup?: string,
-  archivedOnly?: boolean
+  archivedOnly?: boolean,
+  offset = 0,
+  limit = 30
 ): Promise<Conversation[]> {
   return isTauri()
     ? invoke('list_conversations', {
@@ -145,8 +147,26 @@ export async function listConversations(
         workspaceId: workspaceId ?? null,
         priorityGroup: priorityGroup ?? null,
         archivedOnly: archivedOnly ?? false,
+        offset,
+        limit,
       })
-    : mockApi.listConversations(accountId, workspaceId, priorityGroup, archivedOnly);
+    : mockApi.listConversations(accountId, workspaceId, priorityGroup, archivedOnly, offset, limit);
+}
+
+export async function countConversations(
+  accountId?: string,
+  workspaceId?: string,
+  priorityGroup?: string,
+  archivedOnly?: boolean
+): Promise<number> {
+  return isTauri()
+    ? invoke('count_conversations', {
+        accountId: accountId ?? null,
+        workspaceId: workspaceId ?? null,
+        priorityGroup: priorityGroup ?? null,
+        archivedOnly: archivedOnly ?? false,
+      })
+    : mockApi.countConversations(accountId, workspaceId, priorityGroup, archivedOnly);
 }
 
 export async function listContacts(accountId: string): Promise<Contact[]> {
@@ -182,6 +202,12 @@ export async function downloadMessageMedia(
 ): Promise<void> {
   if (isTauri()) {
     await invoke('download_message_media', { accountId, conversationId, messageId });
+  }
+}
+
+export async function downloadStatusMedia(accountId: string, messageId: string): Promise<void> {
+  if (isTauri()) {
+    await invoke('download_status_media', { accountId, messageId });
   }
 }
 
@@ -655,5 +681,13 @@ export function avatarColor(name: string): string {
 
 export function conversationAvatar(conv: { metadata?: Record<string, unknown> | null }): string | null {
   const data = conv.metadata?.avatar_data ?? conv.metadata?.avatar_url;
+  return typeof data === 'string' && data.length > 8 ? data : null;
+}
+
+export function accountAvatar(account: {
+  metadata?: Record<string, unknown> | null;
+  name?: string;
+}): string | null {
+  const data = account.metadata?.avatar_data ?? account.metadata?.avatar_url;
   return typeof data === 'string' && data.length > 8 ? data : null;
 }

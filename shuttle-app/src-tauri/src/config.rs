@@ -134,7 +134,7 @@ pub struct NotificationConfig {
 /// Ferdium-style hibernation: stop idle sidecars, optionally wake to poll.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SleepConfig {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled: bool,
     /// Idle minutes before a non-active account is stopped.
     #[serde(default = "default_sleep_after")]
@@ -147,7 +147,7 @@ pub struct SleepConfig {
 impl Default for SleepConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             after_minutes: default_sleep_after(),
             check_minutes: default_sleep_check(),
         }

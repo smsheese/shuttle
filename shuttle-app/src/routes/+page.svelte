@@ -15,6 +15,7 @@
     deleteScheduledMessage,
     deleteWorkspace,
     downloadMessageMedia,
+    downloadStatusMedia,
     exportBackup,
     fetchConversationAvatar,
     fetchContactProfile,
@@ -23,6 +24,7 @@
     getMessages,
     listAccounts,
     listConnectors,
+    countConversations,
     listConversations,
     listForwardRules,
     listPriorityGroups,
@@ -33,6 +35,7 @@
     onShuttleEvent,
     openExternal,
     pinMessage,
+    readMessageMedia,
     restoreBackup,
     saveAppConfig,
     scheduleMessage,
@@ -50,6 +53,7 @@
     setActiveAccount,
     updateConversation,
     updateForwardRule,
+    conversationAvatar,
   } from '$lib/api';
   import AccountSetup from '$lib/components/AccountSetup.svelte';
   import CallPanel from '$lib/components/CallPanel.svelte';
@@ -61,6 +65,7 @@
   import QuickSwitch from '$lib/components/QuickSwitch.svelte';
   import SettingsPanel from '$lib/components/SettingsPanel.svelte';
   import Sidebar from '$lib/components/Sidebar.svelte';
+  import StatusViewer from '$lib/components/StatusViewer.svelte';
   import ThreadView from '$lib/components/ThreadView.svelte';
   import { isModKey, isTypingTarget } from '$lib/shortcuts';
   import { normalizeRichText } from '$lib/richText';
@@ -86,12 +91,23 @@
     type ScheduleMessageDraft,
     type SearchMessageHit,
     type SearchScope,
+    type StatusItem,
     type Workspace,
   } from '$lib/types';
 
   let accounts = $state<Account[]>([]);
   let connectors = $state<ConnectorInfo[]>([]);
+  const LIST_PAGE_SIZE = 30;
   let conversations = $state<Conversation[]>([]);
+  let listOffset = $state(0);
+  let listTotal = $state(0);
+  let listHasMore = $state(false);
+  let listLoadingMore = $state(false);
+  let statusFeed = $state<StatusItem[]>([]);
+  let statusViewerOpen = $state(false);
+  let statusViewerStartId = $state('');
+  const statusMediaCache = new Map<string, string>();
+  const statusMediaWaiters = new Map<string, Array<(url: string | null) => void>>();
   let messages = $state<Message[]>([]);
   let workspaces = $state<Workspace[]>([]);
   let priorityGroups = $state<PriorityGroup[]>([]);
@@ -110,7 +126,7 @@
       usage_diagnostics: false,
     },
     sleep: {
-      enabled: true,
+      enabled: false,
       after_minutes: 5,
       check_minutes: 15,
     },
@@ -164,8 +180,60 @@
   );
   const extrasTop = $derived(narrowWidth && panelOpen);
 
+  /** Prefer stored account avatar; fall back to “(You)” / identity chat photo. */
+  const accountsForRail = $derived(
+    accounts.map((account) => {
+      const existing = account.metadata?.avatar_data;
+      if (typeof existing === 'string' && existing.length > 8) return account;
+      const identity = (account.identity || '').replace(/@.*/, '');
+      const selfConv = conversations.find((c) => {
+        if (c.account_id !== account.id) return false;
+        if (/\(you\)/i.test(c.title || '')) return true;
+        if (!identity) return false;
+        return (c.remote_id || '').includes(identity);
+      });
+      const photo = selfConv ? conversationAvatar(selfConv) : null;
+      if (!photo) return account;
+      return { ...account, metadata: { ...account.metadata, avatar_data: photo } };
+    })
+  );
+
   function channelColor(connectorId: string): string {
     return appConfig.channel_styles[connectorId]?.tag ?? CONNECTOR_COLORS[connectorId] ?? '#888';
+  }
+
+  function statusMediaKey(accountId: string, messageId: string): string {
+    return `${accountId}::${messageId}`;
+  }
+
+  function resolveStatusMediaWaiters(key: string, url: string | null) {
+    const waiters = statusMediaWaiters.get(key);
+    if (!waiters?.length) return;
+    statusMediaWaiters.delete(key);
+    for (const resolve of waiters) resolve(url);
+  }
+
+  async function requestStatusMedia(accountId: string, messageId: string): Promise<string | null> {
+    const key = statusMediaKey(accountId, messageId);
+    const cached = statusMediaCache.get(key);
+    if (cached) return cached;
+    return new Promise((resolve) => {
+      const list = statusMediaWaiters.get(key) ?? [];
+      list.push(resolve);
+      statusMediaWaiters.set(key, list);
+      if (list.length > 1) return;
+      downloadStatusMedia(accountId, messageId).catch(() => {
+        resolveStatusMediaWaiters(key, null);
+      });
+      window.setTimeout(() => {
+        if (statusMediaWaiters.has(key)) resolveStatusMediaWaiters(key, null);
+      }, 25000);
+    });
+  }
+
+  function openStatusViewer(item: StatusItem) {
+    statusViewerStartId = item.sender_id;
+    statusViewerOpen = true;
   }
 
   function connectorForAccount(accountId: string | null | undefined): string {
@@ -200,13 +268,26 @@
     return typeof rank === 'number' ? rank : 999999;
   }
 
+  function hasListRank(conv: Conversation): boolean {
+    return typeof conv.metadata?.list_rank === 'number';
+  }
+
+  function compareConversations(a: Conversation, b: Conversation): number {
+    // Match WhatsApp: pinned first, then most recent activity.
+    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+    const byTime = convTime(b) - convTime(a);
+    if (byTime !== 0) return byTime;
+    // Stable fallback: WhatsApp chat-list rank from last sync.
+    const rankA = hasListRank(a);
+    const rankB = hasListRank(b);
+    if (rankA !== rankB) return rankA ? -1 : 1;
+    return listRank(a) - listRank(b);
+  }
+
   function sortConversations(list: Conversation[]): Conversation[] {
-    return [...list].sort((a, b) => {
-      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-      const byTime = convTime(b) - convTime(a);
-      if (byTime !== 0) return byTime;
-      return listRank(a) - listRank(b);
-    });
+    return [...list]
+      .filter((c) => !(c.remote_id || '').toLowerCase().startsWith('status@'))
+      .sort(compareConversations);
   }
 
   function patchConversation(conv: Conversation) {
@@ -245,6 +326,67 @@
     }
   }
 
+  function listFilterArgs() {
+    return {
+      accountId: selectedAccountId ?? undefined,
+      workspaceId: selectedWorkspace ?? undefined,
+      priorityGroup: selectedPriority ?? undefined,
+      archivedOnly: showArchived,
+    };
+  }
+
+  async function loadConversationPage(reset = false) {
+    if (searchQuery) return;
+    if (listLoadingMore && !reset) return;
+    if (!reset && !listHasMore) return;
+
+    if (reset) {
+      listOffset = 0;
+    }
+
+    listLoadingMore = true;
+    try {
+      const filters = listFilterArgs();
+      const offset = reset ? 0 : listOffset;
+      const [rows, total] = await Promise.all([
+        listConversations(
+          filters.accountId,
+          filters.workspaceId,
+          filters.priorityGroup,
+          filters.archivedOnly,
+          offset,
+          LIST_PAGE_SIZE
+        ),
+        reset || listTotal === 0
+          ? countConversations(
+              filters.accountId,
+              filters.workspaceId,
+              filters.priorityGroup,
+              filters.archivedOnly
+            )
+          : Promise.resolve(listTotal),
+      ]);
+      if (reset) {
+        listTotal = total;
+        conversations = sortConversations(rows);
+        listOffset = rows.length;
+      } else {
+        const seen = new Set(conversations.map((c) => c.id));
+        const fresh = rows.filter((c) => !seen.has(c.id));
+        conversations = sortConversations([...conversations, ...fresh]);
+        listOffset += fresh.length;
+      }
+      listHasMore = conversations.length < listTotal;
+      queueAvatarFetches(rows);
+    } finally {
+      listLoadingMore = false;
+    }
+  }
+
+  async function loadMoreConversations() {
+    await loadConversationPage(false);
+  }
+
   async function refresh() {
     accounts = await listAccounts();
     unreadTotal = await totalUnread();
@@ -255,17 +397,10 @@
     if (searchQuery) {
       await handleSearch(searchQuery);
     } else {
-      conversations = sortConversations(
-        await listConversations(
-          selectedAccountId ?? undefined,
-          selectedWorkspace ?? undefined,
-          selectedPriority ?? undefined,
-          showArchived
-        )
-      );
+      listTotal = 0;
+      await loadConversationPage(true);
       searchMessageHits = [];
     }
-    queueAvatarFetches(conversations);
   }
 
   const avatarQueued = new Set<string>();
@@ -288,11 +423,8 @@
     }
     await markRead(convId);
     unreadTotal = await totalUnread();
-    conversations = await listConversations(
-      selectedAccountId ?? undefined,
-      selectedWorkspace ?? undefined,
-      selectedPriority ?? undefined,
-      showArchived
+    conversations = conversations.map((c) =>
+      c.id === convId ? { ...c, unread_count: 0 } : c
     );
   }
 
@@ -313,6 +445,7 @@
     listFocusId = id;
     mobileView = 'thread';
     contactOpen = false;
+    messages = [];
     const conv = conversations.find((c) => c.id === id);
     if (conv) await activateAccount(conv.account_id);
     await loadMessages(id);
@@ -341,14 +474,8 @@
     searchQuery = q;
     if (!q) {
       searchMessageHits = [];
-      conversations = sortConversations(
-        await listConversations(
-          selectedAccountId ?? undefined,
-          selectedWorkspace ?? undefined,
-          selectedPriority ?? undefined,
-          showArchived
-        )
-      );
+      listTotal = 0;
+      await loadConversationPage(true);
       return;
     }
     const results = await searchMessages(
@@ -396,14 +523,26 @@
 
   async function handleSend() {
     if (!draft.trim() || !selectedConversation) return;
-    const text = normalizeRichText(draft.trim(), connectorForAccount(selectedConversation.account_id));
+    const conversation = selectedConversation;
+    const text = normalizeRichText(draft.trim(), connectorForAccount(conversation.account_id));
     draft = '';
     sendError = null;
     try {
-      await sendMessage(selectedConversation.account_id, selectedConversation.id, text);
+      const sent = await sendMessage(conversation.account_id, conversation.id, text);
+      if (selectedConversationId === conversation.id) {
+        const exists = messages.some((m) => m.id === sent.id);
+        if (!exists) messages = [...messages, sent];
+      }
+      patchConversation({
+        ...conversation,
+        last_message_at: sent.timestamp,
+        last_message_preview: sent.body,
+      });
+      const latestMessages = await getMessages(conversation.id);
+      if (selectedConversationId === conversation.id) messages = latestMessages;
     } catch (e) {
       sendError = e instanceof Error ? e.message : String(e);
-      await loadMessages(selectedConversation.id);
+      await loadMessages(conversation.id);
       const saved = messages.some(
         (m) =>
           m.direction === 'outbound' &&
@@ -413,7 +552,6 @@
       if (!saved) draft = text;
       return;
     }
-    await loadMessages(selectedConversation.id);
   }
 
   async function handleSendAttachment(attachment: AttachmentPayload) {
@@ -859,6 +997,85 @@
           );
         }
       }
+      if (event.kind === 'status.feed') {
+        const accountId =
+          typeof event.payload.account_id === 'string' ? event.payload.account_id : undefined;
+        const items = event.payload.items as StatusItem[] | undefined;
+        const upsert = event.payload.upsert as StatusItem | undefined;
+        // Ignore empty snapshots so a failed/empty poll does not wipe a good feed.
+        if (Array.isArray(items) && items.length > 0) {
+          const stamped = items.map((item) => ({
+            ...item,
+            account_id: item.account_id ?? accountId,
+          }));
+          if (accountId) {
+            statusFeed = [
+              ...stamped,
+              ...statusFeed.filter((s) => s.account_id && s.account_id !== accountId),
+            ];
+          } else {
+            statusFeed = stamped;
+          }
+        }
+        if (upsert?.sender_id) {
+          const prev = statusFeed.find((s) => s.sender_id === upsert.sender_id);
+          const nextCount = (prev?.count ?? 0) + 1;
+          const posts = [...(prev?.posts ?? [])];
+          if (upsert.posts?.[0]) {
+            const p = upsert.posts[0];
+            if (p.id && !posts.some((x) => x.id === p.id)) posts.push(p);
+          } else if (upsert.media_type || upsert.preview) {
+            posts.push({
+              id: '',
+              media_type: upsert.media_type || 'text',
+              text: upsert.preview || '',
+              timestamp: upsert.timestamp,
+            });
+          }
+          statusFeed = [
+            {
+              ...upsert,
+              account_id: upsert.account_id ?? accountId ?? prev?.account_id,
+              count: nextCount,
+              posts: posts.length ? posts : prev?.posts,
+            },
+            ...statusFeed.filter((s) => s.sender_id !== upsert.sender_id),
+          ];
+        }
+      }
+      if (event.kind === 'status.media') {
+        const accountId = event.payload.account_id;
+        const messageId = event.payload.message_id;
+        const path = event.payload.media_path;
+        const err = event.payload.error;
+        if (typeof accountId !== 'string' || typeof messageId !== 'string') {
+          // ignore
+        } else {
+          const key = statusMediaKey(accountId, messageId);
+          if (typeof err === 'string' && err) {
+            resolveStatusMediaWaiters(key, null);
+          } else if (typeof path === 'string' && path) {
+            try {
+              const url = await readMessageMedia(path);
+              statusMediaCache.set(key, url);
+              resolveStatusMediaWaiters(key, url);
+            } catch {
+              resolveStatusMediaWaiters(key, null);
+            }
+          } else {
+            resolveStatusMediaWaiters(key, null);
+          }
+        }
+      }
+      if (event.kind === 'account.avatar') {
+        const accountId = event.payload.account_id;
+        const data = event.payload.avatar_data;
+        if (typeof accountId === 'string' && typeof data === 'string' && data.length > 8) {
+          accounts = accounts.map((a) =>
+            a.id === accountId ? { ...a, metadata: { ...a.metadata, avatar_data: data } } : a
+          );
+        }
+      }
       if (event.kind === 'message.received' || event.kind === 'message.sent') {
         applyPushedMessage(event.payload);
       }
@@ -875,14 +1092,25 @@
       if (event.kind === 'call.ended' || event.kind === 'call.error') {
         activeCall = null;
       }
+      if (event.kind === 'chat.synced') {
+        const remote = event.payload.remote_id;
+        const conv = conversations.find((c) => c.id === selectedConversationId);
+        if (
+          selectedConversationId &&
+          conv &&
+          (typeof remote !== 'string' || !remote || conv.remote_id === remote)
+        ) {
+          messages = await getMessages(selectedConversationId);
+        }
+      }
       if (
         event.kind === 'history.sync.completed' ||
         event.kind === 'inbox.catchup' ||
+        event.kind === 'status.feed' ||
         event.kind === 'reminder.fired' ||
         event.kind === 'scheduled_message.sent'
       ) {
         await refresh();
-        if (selectedConversationId) messages = await getMessages(selectedConversationId);
       }
       if (event.kind === 'account.connected' || event.kind === 'account.status') {
         accounts = await listAccounts();
@@ -912,7 +1140,7 @@
   {/if}
   <div class="sidebar-wrap" class:hidden-mobile={mobileView === 'thread'}>
     <Sidebar
-      {accounts}
+      accounts={accountsForRail}
       selected={selectedAccountId}
       onselect={selectAccount}
       onadd={() => (showSetup = true)}
@@ -965,6 +1193,9 @@
         {searchQuery}
         searchScope={searchScope}
         {searchMessageHits}
+        hasMore={listHasMore}
+        loadingMore={listLoadingMore}
+        onloadmore={loadMoreConversations}
         onsearch={handleSearch}
         onsearchscope={handleSearchScope}
         onsearchhit={jumpToSearchHit}
@@ -979,6 +1210,8 @@
         datetimeFormat={appConfig.appearance.datetime_format || '12h_full'}
         {focusSearchNonce}
         highlightId={listFocusId}
+        statuses={statusFeed}
+        onstatus={openStatusViewer}
       />
     </div>
 
@@ -1097,6 +1330,15 @@
   onselect={(id) => menuAction(id)}
 />
 
+<StatusViewer
+  open={statusViewerOpen}
+  feed={statusFeed}
+  startSenderId={statusViewerStartId}
+  {conversations}
+  onclose={() => (statusViewerOpen = false)}
+  requestMedia={requestStatusMedia}
+/>
+
 {#if forwardOpen}
   <div class="modal-backdrop" onclick={() => (forwardOpen = false)} role="presentation">
     <div
@@ -1213,11 +1455,13 @@
 <style>
   .app {
     display: flex;
+    flex: 1 1 auto;
     flex-direction: row;
     flex-wrap: nowrap;
-    height: 100vh;
-    height: 100dvh;
-    width: 100vw;
+    align-items: stretch;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
     overflow: hidden;
     background: var(--bg-main);
     position: relative;
@@ -1261,6 +1505,7 @@
     flex: 1 1 0;
     display: flex;
     flex-direction: row;
+    align-items: stretch;
     min-width: 0;
     min-height: 0;
     overflow: hidden;
@@ -1270,15 +1515,17 @@
     flex-direction: column;
     flex: 0 0 var(--list-width);
     width: var(--list-width);
+    min-width: 0;
     min-height: 0;
     overflow: hidden;
   }
   .list-pane :global(.conv-list) {
-    flex: 1;
+    flex: 1 1 auto;
     width: 100%;
     min-width: 0;
     max-width: none;
     min-height: 0;
+    height: auto;
   }
   .thread-pane, .settings-pane {
     display: flex;
@@ -1298,6 +1545,7 @@
     width: 100%;
     min-width: 0;
     height: 100%;
+    max-height: 100%;
   }
   .thread-pane.extras-top { flex-direction: column; }
   .thread-pane.extras-top :global(.thread) {
@@ -1333,8 +1581,8 @@
     display: flex;
     flex: 0 0 var(--rail-width);
     width: var(--rail-width);
+    min-width: 0;
     min-height: 0;
-    align-self: stretch;
     overflow: hidden;
   }
   .modal-backdrop {
@@ -1386,25 +1634,77 @@
     cursor: pointer;
   }
   .modal .cancel { text-align: center; margin-top: 8px; }
-  @media (max-width: 768px) {
+  @media (min-width: 640px) {
+    .app {
+      display: grid;
+      grid-template-columns: var(--rail-width) minmax(0, 1fr);
+      grid-template-rows: minmax(0, 1fr);
+      height: 100%;
+      min-height: 0;
+    }
+    .sidebar-wrap {
+      grid-column: 1;
+      grid-row: 1;
+      order: 0;
+      flex: none;
+      width: var(--rail-width);
+      height: 100%;
+      min-height: 0;
+      max-height: 100%;
+    }
+    .main {
+      grid-column: 2;
+      grid-row: 1;
+      display: grid;
+      grid-template-columns: var(--list-width) minmax(0, 1fr);
+      grid-template-rows: minmax(0, 1fr);
+      flex: none;
+      width: auto;
+      height: 100%;
+      min-width: 0;
+      min-height: 0;
+    }
+    .list-pane {
+      grid-column: 1;
+      grid-row: 1;
+      flex: none;
+      width: auto;
+      height: 100%;
+      min-height: 0;
+    }
+    .thread-pane {
+      grid-column: 2;
+      grid-row: 1;
+      flex: none;
+      width: auto;
+      height: 100%;
+      min-height: 0;
+      flex-direction: row;
+    }
+    .settings-pane.visible {
+      grid-column: 1 / -1;
+      grid-row: 1;
+      height: 100%;
+      min-height: 0;
+    }
+  }
+
+  @media (max-width: 639px) {
     .app { flex-direction: column; }
     .sidebar-wrap {
       order: 2;
       flex: 0 0 auto;
       width: 100%;
-      height: auto;
     }
     .main {
       order: 1;
       flex: 1 1 0;
       min-height: 0;
       width: 100%;
-      height: auto;
     }
     .list-pane, .thread-pane, .settings-pane {
       flex: 1 1 0;
       width: 100%;
-      height: auto;
       min-height: 0;
     }
     .thread-pane { flex-direction: column; }

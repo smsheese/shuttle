@@ -941,6 +941,19 @@ impl ConnectorManager {
         Ok(())
     }
 
+    pub fn download_status_media(&self, account_id: &str, message_id: &str) -> Result<(), String> {
+        if message_id.trim().is_empty() {
+            return Err("Missing status message id".into());
+        }
+        self.send_to_connector(
+            account_id,
+            &ConnectorRequest::DownloadStatusMedia {
+                account_id: account_id.to_string(),
+                message_id: message_id.to_string(),
+            },
+        )
+    }
+
     pub fn fetch_conversation_avatar(
         &self,
         account_id: &str,
@@ -1079,7 +1092,7 @@ impl ConnectorManager {
             title.trim().to_string()
         };
         self.db
-            .upsert_conversation(account_id, &remote, &label, ctype, None, None, None, None, false)
+            .upsert_conversation(account_id, &remote, &label, ctype, None, None, None, None, false, false)
             .map_err(|e| e.to_string())
     }
 
@@ -1087,6 +1100,12 @@ impl ConnectorManager {
         self.do_not_restart.lock().insert(account_id.to_string());
         self.sleeping.lock().remove(account_id);
         self.detach_account(account_id, true);
+    }
+
+    fn stop_child(child: &mut Child) {
+        if let Some(pid) = child.id() {
+            process_lock::kill_process(pid as i32);
+        }
     }
 
     /// Tear down every sidecar (and recorded GOWA) — call on app quit.
@@ -1100,7 +1119,7 @@ impl ConnectorManager {
                 encode_line(&ConnectorRequest::Shutdown)
                     .unwrap_or_else(|_| "{\"type\":\"shutdown\"}\n".into()),
             );
-            let _ = running.child.start_kill();
+            Self::stop_child(&mut running.child);
             process_lock::clear_pid(&self.data_dir, &connector_id);
         }
         drop(map);
@@ -1138,7 +1157,7 @@ impl ConnectorManager {
                             .unwrap_or_else(|_| "{\"type\":\"shutdown\"}\n".into()),
                     );
                 }
-                let _ = running.child.start_kill();
+                Self::stop_child(&mut running.child);
                 process_lock::clear_pid(&self.data_dir, &key);
             }
         }
@@ -1243,8 +1262,7 @@ fn value_to_string(value: Option<&serde_json::Value>) -> Option<String> {
 
 fn parse_ts(value: Option<&str>) -> DateTime<Utc> {
     value
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-        .map(|d| d.with_timezone(&Utc))
+        .and_then(crate::db::parse_stored_datetime)
         .unwrap_or_else(Utc::now)
 }
 
@@ -1266,6 +1284,28 @@ fn unix_to_utc(n: i64) -> DateTime<Utc> {
     let secs = if n.abs() > 10_000_000_000 { n / 1000 } else { n };
     DateTime::from_timestamp(secs, 0).unwrap_or_else(Utc::now)
 }
+
+// #region agent log
+fn agent_dbg(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
+    use std::io::Write;
+    let line = serde_json::json!({
+        "sessionId": "d17e9a",
+        "runId": "post-fix",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": Utc::now().timestamp_millis(),
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/home/tfsbs/Documents/shuttle/.cursor/debug-d17e9a.log")
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+// #endregion
 
 fn ts_str(value: Option<&serde_json::Value>) -> Option<String> {
     match value {
@@ -1332,6 +1372,9 @@ async fn handle_connector_event(
             };
             let last_at = ts_str(payload.get("last_message_at"));
             let last_at = last_at.as_deref();
+            if remote_id.starts_with("status@") {
+                return;
+            }
             let preview = payload.get("preview").and_then(|v| v.as_str());
             let archived = payload.get("archived").and_then(|v| v.as_bool());
             let pinned = payload.get("pinned").and_then(|v| v.as_bool());
@@ -1339,6 +1382,15 @@ async fn handle_connector_event(
                 .get("force_recency")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let history = payload
+                .get("history")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let replace_title = history
+                || payload
+                    .get("replace_title")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
             if let Ok(conv) = db.upsert_conversation(
                 account_id,
                 &remote_id,
@@ -1349,6 +1401,7 @@ async fn handle_connector_event(
                 archived,
                 pinned,
                 force_recency,
+                replace_title,
             ) {
                 if let Some(rank) = payload.get("list_rank").and_then(|v| v.as_i64()) {
                     let _ = db.merge_conversation_metadata(
@@ -1358,10 +1411,34 @@ async fn handle_connector_event(
                     );
                 }
                 if let Some(unread) = payload.get("unread_count").and_then(|v| v.as_i64()) {
-                    let _ = db.set_unread_count(&conv.id, unread.max(0));
+                    let history = payload
+                        .get("history")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    // History/backup unreadCount is often stale vs WhatsApp Web.
+                    // Only apply unread from live conversation.updated events.
+                    if !history {
+                        let _ = db.set_unread_count(&conv.id, unread.max(0));
+                    }
                 }
                 let conv = db.get_conversation(&conv.id).unwrap_or(conv);
                 let history = payload.get("history").and_then(|v| v.as_bool()).unwrap_or(false);
+                // #region agent log
+                agent_dbg(
+                    "H4",
+                    "connectors/mod.rs:conversation.updated",
+                    "upsert conversation",
+                    serde_json::json!({
+                        "history": history,
+                        "force_recency": force_recency,
+                        "last_at": last_at,
+                        "preview_len": preview.map(|s| s.len()),
+                        "list_rank": payload.get("list_rank"),
+                        "remote_tail": remote_id.chars().rev().take(40).collect::<String>().chars().rev().collect::<String>(),
+                        "stored_last_at": conv.last_message_at.map(|t| t.to_rfc3339()),
+                    }),
+                );
+                // #endregion
                 if !history {
                     let _ = event_tx.send(AppEvent {
                         kind: "conversation.updated".into(),
@@ -1375,6 +1452,9 @@ async fn handle_connector_event(
                 .or_else(|| value_to_string(payload.get("remote_id")))
                 .unwrap_or_default();
             if remote_jid.is_empty() {
+                return;
+            }
+            if remote_jid.starts_with("status@") {
                 return;
             }
             let msg_obj = payload.get("message").cloned().unwrap_or(payload.clone());
@@ -1434,6 +1514,7 @@ async fn handle_connector_event(
                 None,
                 None,
                 false,
+                false,
             ) {
                 Ok(c) => c,
                 Err(e) => {
@@ -1442,6 +1523,15 @@ async fn handle_connector_event(
                 }
             };
             let history = payload.get("history").and_then(|v| v.as_bool()).unwrap_or(false);
+            let has_media = msg_obj
+                .get("media_type")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty() && s != "text")
+                .unwrap_or(false);
+            // Skip protocol stubs / empty rows — they create blank threads (UI hides empty bodies).
+            if body.trim().is_empty() && !has_media {
+                return;
+            }
             let msg = Message {
                 id: Uuid::new_v4().to_string(),
                 conversation_id: conv.id.clone(),
@@ -1468,6 +1558,27 @@ async fn handle_connector_event(
                 pinned: false,
             };
             let inserted = db.insert_message(&msg).unwrap_or(false);
+            // #region agent log
+            agent_dbg(
+                "H2",
+                "connectors/mod.rs:message.received",
+                "persist message",
+                serde_json::json!({
+                    "event": event,
+                    "history": history,
+                    "inserted": inserted,
+                    "from_me": from_me,
+                    "remote_tail": remote_jid.chars().rev().take(40).collect::<String>().chars().rev().collect::<String>(),
+                    "ts": ts.to_rfc3339(),
+                    "last_at": conv.last_message_at.map(|t| t.to_rfc3339()),
+                    "body_len": body.len(),
+                }),
+            );
+            // #endregion
+            if inserted && from_me && !history {
+                // Sending in a chat marks it read (matches WhatsApp).
+                let _ = db.set_unread_count(&conv.id, 0);
+            }
             if inserted && !from_me && !history {
                 let _ = db.increment_unread(&conv.id);
                 let cfg = config.get();
@@ -1479,7 +1590,9 @@ async fn handle_connector_event(
                 }
                 apply_forward_rules(db, &conv, &msg);
             }
-            if !history {
+            // Only push UI events for newly inserted live/catch-up rows. Catch-up
+            // re-fetches recent messages every ~30s; emitting on duplicates floods the UI.
+            if inserted && !history {
                 let conv = db.get_conversation(&conv.id).unwrap_or(conv);
                 let unread_total = db.total_unread().unwrap_or(0);
                 let _ = event_tx.send(AppEvent {
@@ -1500,6 +1613,38 @@ async fn handle_connector_event(
                 payload: serde_json::json!({ "account_id": account_id }),
             });
         }
+        "chat.synced" => {
+            let _ = event_tx.send(AppEvent {
+                kind: "chat.synced".into(),
+                payload: serde_json::json!({
+                    "account_id": account_id,
+                    "remote_id": payload.get("remote_id"),
+                }),
+            });
+        }
+        "status.feed" => {
+            let _ = event_tx.send(AppEvent {
+                kind: "status.feed".into(),
+                payload: serde_json::json!({
+                    "account_id": account_id,
+                    "items": payload.get("items"),
+                    "upsert": payload.get("upsert"),
+                }),
+            });
+        }
+        "status.media" => {
+            let _ = event_tx.send(AppEvent {
+                kind: "status.media".into(),
+                payload: serde_json::json!({
+                    "account_id": account_id,
+                    "message_id": payload.get("message_id"),
+                    "media_type": payload.get("media_type"),
+                    "media_path": payload.get("media_path"),
+                    "filename": payload.get("filename"),
+                    "error": payload.get("error"),
+                }),
+            });
+        }
         "account.connected" => {
             let _ = db.update_account_status(account_id, AccountStatus::Connected);
             if let Some(identity) = payload.get("identity").and_then(|v| v.as_str()) {
@@ -1516,6 +1661,7 @@ async fn handle_connector_event(
         }
         "history.sync.completed" => {
             let _ = db.refresh_conversation_previews(account_id);
+            let _ = db.refresh_conversation_titles_from_contacts(account_id);
             if let Ok(account) = db.get_account(account_id) {
                 if let Some(identity) = account.identity.as_deref() {
                     let _ = db.fix_self_conversation_titles(account_id, identity);
@@ -1550,6 +1696,28 @@ async fn handle_connector_event(
                         "conversation_id": conv.id,
                         "remote_id": remote_id,
                         "avatar_data": conv.metadata.get("avatar_data"),
+                    }),
+                });
+            }
+        }
+        "account.avatar" => {
+            let mut patch = serde_json::Map::new();
+            if let Some(data) = payload.get("avatar_data").and_then(|v| v.as_str()) {
+                if !data.is_empty() {
+                    patch.insert("avatar_data".into(), serde_json::Value::String(data.to_string()));
+                }
+            }
+            if patch.is_empty() {
+                return;
+            }
+            if let Ok(account) =
+                db.merge_account_metadata(account_id, &serde_json::Value::Object(patch))
+            {
+                let _ = event_tx.send(AppEvent {
+                    kind: "account.avatar".into(),
+                    payload: serde_json::json!({
+                        "account_id": account_id,
+                        "avatar_data": account.metadata.get("avatar_data"),
                     }),
                 });
             }
@@ -1615,8 +1783,13 @@ async fn handle_connector_event(
                     let _ = db.upsert_contact(account_id, &remote_id, name);
                 }
             }
+            let _ = db.refresh_conversation_titles_from_contacts(account_id);
             let _ = event_tx.send(AppEvent {
                 kind: "contacts.synced".into(),
+                payload: serde_json::json!({ "account_id": account_id }),
+            });
+            let _ = event_tx.send(AppEvent {
+                kind: "inbox.catchup".into(),
                 payload: serde_json::json!({ "account_id": account_id }),
             });
         }

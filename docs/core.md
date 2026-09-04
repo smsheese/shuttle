@@ -93,7 +93,7 @@ Unique constraint: `(account_id, remote_id)`.
 
 Unique index: `(conversation_id, remote_id)` where `remote_id IS NOT NULL`. History sync and live events share this; duplicates are ignored. `list_messages` takes the latest *n* rows then reverses so the UI gets chronological order.
 
-History-tagged sidecar events (`payload.history = true`) are persisted without incrementing unread or emitting `message.received` to the UI.
+History-tagged sidecar events (`payload.history = true`) are persisted without incrementing unread or emitting `message.received` to the UI. Live inbound WhatsApp traffic is delivered via a loopback GOWA webhook (plus a short REST catch-up); `chat.synced` tells the UI to reload the open thread after `sync_chat`.
 
 ### Contacts
 
@@ -222,7 +222,11 @@ The core forwards internal events to the frontend via Tauri `emit("shuttle-event
 | `account.connected` | Session ready | `account_id` |
 | `history.sync.started` | Core requested history, or sidecar began paging | `account_id` |
 | `history.sync.completed` | Sidecar finished paging | `account_id` (passthrough) |
+| `status.feed` | WhatsApp status/stories snapshot or one new status | `account_id`, `items[]` (each with `posts[]`) and/or `upsert` |
+| `status.media` | Downloaded status media for the story viewer | `account_id`, `message_id`, `media_path` / `error` |
+| `account.avatar` | Connected account profile photo for the rail | `account_id`, `avatar_data` (data URL) |
 | `conversation.updated` | Chat upserted from sidecar | `account_id`, `conversation` |
+| `chat.synced` | Open-chat history pull finished | `account_id`, `remote_id` |
 | `message.received` | Live inbound message persisted | `account_id`, `conversation_id`, `message` |
 | `message.sent` | Live outbound message persisted | `account_id`, `conversation_id`, `message` |
 | `reminder.fired` | Due reminder delivered | `reminder_id`, `conversation_id`, `account_id` |
@@ -287,7 +291,7 @@ Built with `./connectors/build.sh` for local dev launchers, or run directly — 
 
 | Binary | Source | Auth | Backend |
 |--------|--------|------|---------|
-| `whatsapp-connector` | `connectors/whatsapp-connector.py` | Live QR via GOWA | [GOWA](https://github.com/aldinokemal/go-whatsapp-web-multidevice) REST + WebSocket on `127.0.0.1` |
+| `whatsapp-connector` | `connectors/whatsapp-connector.py` | Live QR via GOWA | [GOWA](https://github.com/aldinokemal/go-whatsapp-web-multidevice) REST, loopback webhook, and WebSocket on `127.0.0.1` |
 | `telegram-connector` | `connectors/telegram-connector.py` | Phone + code, optional 2FA | TDLib `tdjson` (own `api_id` / `api_hash`) |
 | `signal-connector` | `connectors/signal-connector.py` | Phone registration | signal-cli JSON-RPC |
 | `messenger-connector` | `connectors/messenger-connector.py` | Email + password | `fbchat` (unofficial) |
@@ -301,8 +305,9 @@ Built with `./connectors/build.sh` for local dev launchers, or run directly — 
 2. Shuttle starts `whatsapp rest --host=127.0.0.1` with basic auth. It is not bound to the LAN.
 3. Each Shuttle account is a GOWA device (`POST /devices`).
 4. QR login uses `GET /devices/{id}/login`. The PNG is sent to the UI as a data URI.
-5. Events come from `/ws?device_id=…`. Chats sync from `GET /chats` and `GET /chat/{jid}/messages`.
+5. Live chat events come from a loopback webhook (`PATCH /devices/{id}/webhook`) because GOWA’s `/ws` often only carries login codes. Catch-up still polls `GET /chats` + `GET /chat/{jid}/messages`.
 6. Sending uses `POST /send/message`.
+7. The conversation list is WhatsApp app-state (`GET /chats`, including `last_message_time`). Message bodies are only what GOWA stored in chatstorage plus `history-*.json` dumps from companion history sync. `GET /chat/{jid}/messages` pages that local store. It does not fetch on-demand history the way WhatsApp Web does when you open a chat. Opening a thread re-reads GOWA sqlite and the history JSON for that JID, then emits `chat.synced`.
 
 If GOWA is already running locally, set `SHUTTLE_GOWA_URL` (loopback only) and optional `SHUTTLE_GOWA_USER` / `SHUTTLE_GOWA_PASSWORD`.
 

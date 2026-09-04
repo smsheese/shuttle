@@ -10,7 +10,7 @@
   } from '$lib/api';
   import { listPreview } from '$lib/messageMedia';
   import NetworkIcon from '$lib/components/NetworkIcon.svelte';
-  import { CONNECTOR_COLORS, type Account, type Contact, type Conversation, type SearchMessageHit, type SearchScope } from '$lib/types';
+  import { CONNECTOR_COLORS, type Account, type Contact, type Conversation, type SearchMessageHit, type SearchScope, type StatusItem } from '$lib/types';
 
   interface Props {
     conversations: Conversation[];
@@ -29,11 +29,16 @@
     oncompose?: () => void;
     onarchivedtoggle?: () => void;
     onrefresh?: () => void;
+    onloadmore?: () => void;
+    hasMore?: boolean;
+    loadingMore?: boolean;
     oncontext?: (conv: Conversation, x: number, y: number) => void;
     channelColor?: (connectorId: string) => string;
     datetimeFormat?: string;
     focusSearchNonce?: number;
     highlightId?: string | null;
+    statuses?: StatusItem[];
+    onstatus?: (item: StatusItem) => void;
   }
 
   let {
@@ -53,11 +58,16 @@
     oncompose,
     onarchivedtoggle,
     onrefresh,
+    onloadmore,
+    hasMore = false,
+    loadingMore = false,
     oncontext,
     channelColor,
     datetimeFormat = '12h_full',
     focusSearchNonce = 0,
     highlightId = null,
+    statuses = [],
+    onstatus,
   }: Props = $props();
 
   let searchExpanded = $state(false);
@@ -71,6 +81,37 @@
   let groupTitle = $state('');
   let groupPicked = $state<string[]>([]);
   let composeBusy = $state(false);
+  let statusRowEl = $state<HTMLDivElement | undefined>();
+  let statusDragging = $state(false);
+  let statusDragStartX = 0;
+  let statusDragScrollLeft = 0;
+  let listEl = $state<HTMLDivElement | undefined>();
+  let loadSentinel = $state<HTMLDivElement | undefined>();
+
+  function listRank(conv: Conversation): number {
+    const rank = conv.metadata?.list_rank;
+    return typeof rank === 'number' ? rank : 999999;
+  }
+
+  function hasListRank(conv: Conversation): boolean {
+    return typeof conv.metadata?.list_rank === 'number';
+  }
+
+  function convTime(conv: Conversation): number {
+    if (!conv.last_message_at) return 0;
+    const t = new Date(conv.last_message_at).getTime();
+    return Number.isFinite(t) ? t : 0;
+  }
+
+  function compareConversations(a: Conversation, b: Conversation): number {
+    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+    const byTime = convTime(b) - convTime(a);
+    if (byTime !== 0) return byTime;
+    const rankA = hasListRank(a);
+    const rankB = hasListRank(b);
+    if (rankA !== rankB) return rankA ? -1 : 1;
+    return listRank(a) - listRank(b);
+  }
 
   const CONNECTOR_LABELS: Record<string, string> = {
     whatsapp: 'WhatsApp',
@@ -104,17 +145,18 @@
     return !!account && !!filterAccount && account.connector_id === filterAccount.connector_id;
   }
 
+  function isStatusRemote(remoteId: string | null | undefined): boolean {
+    const id = (remoteId || '').toLowerCase();
+    return id.startsWith('status@');
+  }
+
   const sortedConversations = $derived(
-    [...conversations].sort((a, b) => {
-      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-      const ta = a.last_message_at ? new Date(a.last_message_at).getTime() : 0;
-      const tb = b.last_message_at ? new Date(b.last_message_at).getTime() : 0;
-      return tb - ta;
-    })
+    [...conversations]
+      .filter((c) => !isStatusRemote(c.remote_id))
+      .sort(compareConversations)
   );
 
   const pinnedConversations = $derived(sortedConversations.filter((c) => c.pinned));
-  const unpinnedConversations = $derived(sortedConversations.filter((c) => !c.pinned));
 
   const headerTitle = $derived(
     showArchived
@@ -234,6 +276,37 @@
     }
   }
 
+  function statusAvatar(item: StatusItem): string | null {
+    const conv = conversations.find((c) => c.remote_id === item.sender_id);
+    return conv ? conversationAvatar(conv) : null;
+  }
+
+  function onStatusWheel(e: WheelEvent) {
+    if (!statusRowEl) return;
+    if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+    e.preventDefault();
+    statusRowEl.scrollLeft += e.deltaY;
+  }
+
+  function onStatusPointerDown(e: PointerEvent) {
+    if (!statusRowEl || e.button !== 0) return;
+    statusDragging = true;
+    statusDragStartX = e.clientX;
+    statusDragScrollLeft = statusRowEl.scrollLeft;
+    statusRowEl.setPointerCapture(e.pointerId);
+  }
+
+  function onStatusPointerMove(e: PointerEvent) {
+    if (!statusDragging || !statusRowEl) return;
+    statusRowEl.scrollLeft = statusDragScrollLeft - (e.clientX - statusDragStartX);
+  }
+
+  function onStatusPointerEnd(e: PointerEvent) {
+    if (!statusDragging) return;
+    statusDragging = false;
+    statusRowEl?.releasePointerCapture(e.pointerId);
+  }
+
   function openSearch() {
     searchExpanded = true;
     requestAnimationFrame(() => searchInputEl?.focus());
@@ -254,6 +327,19 @@
       el?.select();
     });
   });
+
+  $effect(() => {
+    if (!loadSentinel || !onloadmore || !hasMore || loadingMore || searchQuery) return;
+    const root = listEl;
+    const obs = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) onloadmore?.();
+      },
+      { root, rootMargin: '160px', threshold: 0 }
+    );
+    obs.observe(loadSentinel);
+    return () => obs.disconnect();
+  });
 </script>
 
 {#snippet convRow(conv: Conversation)}
@@ -272,14 +358,11 @@
     }}
   >
     <div class="avatar-wrap">
-      {#if conv.unread_count > 0}
-        <span class="unread-dot" aria-hidden="true"></span>
-      {/if}
-      <div class="avatar" class:has-unread={conv.unread_count > 0} style="background: {avatarColor(conv.title)}">
+      <div class="avatar" style="background: {avatarColor(conv.title || conv.remote_id)}">
         {#if conversationAvatar(conv)}
           <img class="avatar-img" src={conversationAvatar(conv) ?? ''} alt="" />
         {:else}
-          {getInitials(conv.title)}
+          {getInitials(conv.title || conv.remote_id)}
         {/if}
       </div>
       {#if account}
@@ -300,7 +383,7 @@
               <path d="M16 9V4h1a1 1 0 0 0 0-2H7a1 1 0 0 0 0 2h1v5c0 1.66-1.34 3-3 3v2h5v6l1-1 1 1v-6h5v-2c-1.66 0-3-1.34-3-3z"/>
             </svg>
           {/if}
-          <span class="title">{conv.title}</span>
+          <span class="title">{conv.title || conv.remote_id}</span>
         </span>
         <span class="time">{formatTime(conv.last_message_at, datetimeFormat)}</span>
       </div>
@@ -397,7 +480,7 @@
             onclick={() => onselect(conv.id)}
             type="button"
           >
-            <span class="pinned-chip-avatar" class:has-unread={conv.unread_count > 0} style="background: {avatarColor(conv.title)}">
+            <span class="pinned-chip-avatar" style="background: {avatarColor(conv.title || conv.remote_id)}">
               {#if conversationAvatar(conv)}
                 <img class="avatar-img" src={conversationAvatar(conv) ?? ''} alt="" />
               {:else}
@@ -583,19 +666,57 @@
     </div>
   {/if}
 
-  <div class="list" role="list">
-    {#if pinnedConversations.length > 0}
-      <div class="section-label section-label-desktop">Pinned</div>
-      {#each pinnedConversations as conv (conv.id)}
-        <div class="conv-row-desktop">
-          {@render convRow(conv)}
-        </div>
+  {#if statuses.length > 0 && !searchQuery && !showArchived}
+    <div
+      class="status-row"
+      class:dragging={statusDragging}
+      bind:this={statusRowEl}
+      role="list"
+      aria-label="Status updates"
+      onwheel={onStatusWheel}
+      onpointerdown={onStatusPointerDown}
+      onpointermove={onStatusPointerMove}
+      onpointerup={onStatusPointerEnd}
+      onpointercancel={onStatusPointerEnd}
+    >
+      {#each statuses as item (item.sender_id)}
+        <button
+          type="button"
+          class="status-chip"
+          class:mine={item.from_me}
+          title={item.sender_name}
+          onclick={() => onstatus?.(item)}
+        >
+          <span class="status-avatar-wrap">
+            <span class="status-avatar" style="background: {avatarColor(item.sender_name)}">
+              {#if statusAvatar(item)}
+                <img class="avatar-img" src={statusAvatar(item) ?? ''} alt="" />
+              {:else}
+                {getInitials(item.sender_name)}
+              {/if}
+            </span>
+            {#if (item.count ?? 0) > 1}
+              <span class="status-count">{item.count}</span>
+            {/if}
+          </span>
+          <span class="status-name">{item.sender_name}</span>
+        </button>
       {/each}
-    {/if}
+    </div>
+  {/if}
 
-    {#each unpinnedConversations as conv (conv.id)}
+  <div class="list" role="list" bind:this={listEl}>
+    {#each sortedConversations as conv (conv.id)}
       {@render convRow(conv)}
     {/each}
+
+    {#if hasMore && !searchQuery}
+      <div class="list-sentinel" bind:this={loadSentinel} aria-hidden="true">
+        {#if loadingMore}
+          <span class="list-loading">Loading more…</span>
+        {/if}
+      </div>
+    {/if}
 
     {#if searchMessageHits.length > 0}
       <div class="section-label section-label-desktop">Messages</div>
@@ -623,15 +744,17 @@
 
 <style>
   .conv-list {
-    width: var(--list-width);
-    min-width: 300px;
-    max-width: 400px;
+    width: 100%;
+    min-width: 0;
+    max-width: none;
+    min-height: 0;
     background: var(--bg-panel);
     border-right: 1px solid var(--border-subtle);
     display: flex;
     flex-direction: column;
-    flex-shrink: 0;
+    flex: 1 1 auto;
     position: relative;
+    overflow: hidden;
   }
 
   .search-scope {
@@ -1042,53 +1165,12 @@
     }
   }
 
-  @keyframes unread-ring-breathe {
-    0%,
-    100% {
-      box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent);
-    }
-    50% {
-      box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 0%, transparent);
-    }
-  }
-
-  @keyframes unread-dot-glow {
-    0%,
-    100% {
-      transform: scale(1);
-      box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 70%, transparent);
-    }
-    50% {
-      transform: scale(1.15);
-      box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 0%, transparent);
-    }
-  }
-
   .header-badge-pulse,
   .unread-badge-pulse,
   .pinned-chip-badge-pulse {
     animation: unread-breathe 1.8s ease-in-out infinite;
   }
 
-  .unread-dot {
-    position: absolute;
-    top: -2px;
-    left: -2px;
-    width: 12px;
-    height: 12px;
-    border-radius: 50%;
-    background: var(--accent);
-    border: 2px solid var(--bg-panel);
-    z-index: 4;
-    pointer-events: none;
-    animation: unread-dot-glow 1.8s ease-in-out infinite;
-  }
-
-  .avatar.has-unread {
-    animation: unread-ring-breathe 2.4s ease-in-out infinite;
-  }
-
-  .conv-item.muted .unread-dot,
   .conv-item.muted .unread-badge-pulse {
     opacity: 0.72;
   }
@@ -1211,18 +1293,131 @@
   }
 
   .list {
-    flex: 1;
+    flex: 1 1 auto;
+    min-height: 0;
     overflow-y: auto;
+    overflow-x: hidden;
     overscroll-behavior: contain;
     padding: 4px 0;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    z-index: 0;
+    background: var(--bg-panel);
+  }
+
+  .list-sentinel {
+    flex-shrink: 0;
+    min-height: 1px;
+    padding: 8px 16px 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .list-loading {
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .status-row {
+    display: flex;
+    flex: 0 0 auto;
+    flex-shrink: 0;
+    align-self: stretch;
+    gap: 12px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 6px 14px 12px;
+    border-bottom: 1px solid var(--border-subtle);
+    background: var(--bg-panel);
+    scrollbar-width: thin;
+    cursor: grab;
+    touch-action: pan-x;
+    position: relative;
+    z-index: 2;
+    isolation: isolate;
+  }
+
+  .status-row.dragging {
+    cursor: grabbing;
+    user-select: none;
+  }
+
+  .status-chip {
+    flex: 0 0 auto;
+    width: 72px;
+    border: none;
+    background: transparent;
+    padding: 0;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    color: var(--text);
+  }
+
+  .status-avatar-wrap {
+    position: relative;
+    flex-shrink: 0;
+  }
+
+  .status-avatar {
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-on-accent, #fff);
+    overflow: hidden;
+    box-shadow: 0 0 0 2px var(--bg-panel), 0 0 0 3px var(--border);
+  }
+
+  .status-chip.mine .status-avatar {
+    box-shadow: 0 0 0 2px var(--bg-panel), 0 0 0 3px color-mix(in srgb, var(--accent) 55%, var(--border));
+  }
+
+  .status-count {
+    position: absolute;
+    top: -2px;
+    right: -2px;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: var(--radius-full);
+    background: var(--accent);
+    color: var(--text-on-accent);
+    font-size: 10px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 2px solid var(--bg-panel);
+    line-height: 1;
+  }
+
+  .status-name {
+    font-size: 11px;
+    line-height: 1.2;
+    max-width: 72px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-muted);
   }
 
   .conv-item {
     width: calc(100% - 12px);
     margin: 0 6px;
     display: flex;
+    flex-shrink: 0;
+    align-items: center;
     gap: 11px;
     padding: 9px 10px;
+    min-height: 62px;
     border: none;
     border-radius: var(--radius-md);
     background: transparent;
@@ -1247,11 +1442,12 @@
   }
 
   .conv-item.unread {
-    box-shadow: inset 3px 0 0 var(--accent);
+    background: color-mix(in srgb, var(--accent-muted) 22%, transparent);
   }
 
   .conv-item.unread.selected {
-    box-shadow: inset 3px 0 0 var(--accent), inset 0 0 0 1px var(--border-subtle);
+    background: color-mix(in srgb, var(--accent-muted) 18%, var(--bg-active));
+    box-shadow: inset 0 0 0 1px var(--border-subtle);
   }
 
   .avatar-wrap {
@@ -1322,6 +1518,7 @@
   .title {
     font-size: 1rem;
     font-weight: 500;
+    color: var(--text);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1383,7 +1580,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    flex-shrink: 0;
+    flex: 0 0 auto;
     box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 40%, transparent);
   }
 
@@ -1413,7 +1610,7 @@
     font-weight: 400;
   }
 
-  @media (max-width: 768px) {
+  @media (max-width: 639px) {
     .conv-list {
       width: 100%;
       min-width: 0;
@@ -1482,10 +1679,6 @@
       color: white;
       letter-spacing: -0.02em;
       transition: transform 0.1s ease;
-    }
-
-    .pinned-chip-avatar.has-unread {
-      animation: unread-ring-breathe 2.4s ease-in-out infinite;
     }
 
     .pinned-chip-badge {
@@ -1598,15 +1791,12 @@
   @media (prefers-reduced-motion: reduce) {
     .header-badge-pulse,
     .unread-badge-pulse,
-    .pinned-chip-badge-pulse,
-    .unread-dot,
-    .avatar.has-unread,
-    .pinned-chip-avatar.has-unread {
+    .pinned-chip-badge-pulse {
       animation: none;
     }
   }
 
-  @media (min-width: 769px) {
+  @media (min-width: 640px) {
     .filters-desktop {
       display: flex;
     }

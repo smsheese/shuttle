@@ -148,10 +148,33 @@ pub fn list_conversations(
     workspace_id: Option<String>,
     priority_group: Option<String>,
     archived_only: Option<bool>,
+    offset: Option<i64>,
+    limit: Option<i64>,
 ) -> Result<Vec<Conversation>, String> {
     state
         .db
         .list_conversations(
+            account_id.as_deref(),
+            workspace_id.as_deref(),
+            priority_group.as_deref(),
+            archived_only.unwrap_or(false),
+            offset.unwrap_or(0),
+            limit.unwrap_or(30),
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn count_conversations(
+    state: State<'_, AppState>,
+    account_id: Option<String>,
+    workspace_id: Option<String>,
+    priority_group: Option<String>,
+    archived_only: Option<bool>,
+) -> Result<i64, String> {
+    state
+        .db
+        .count_conversations(
             account_id.as_deref(),
             workspace_id.as_deref(),
             priority_group.as_deref(),
@@ -168,7 +191,7 @@ pub fn get_messages(
 ) -> Result<Vec<Message>, String> {
     state
         .db
-        .list_messages(&conversation_id, limit.unwrap_or(100))
+        .list_messages(&conversation_id, limit.unwrap_or(500))
         .map_err(|e| e.to_string())
 }
 
@@ -307,6 +330,17 @@ pub fn download_message_media(
     state
         .connectors
         .download_message_media(&account_id, &conversation_id, &message_id)
+}
+
+#[tauri::command]
+pub fn download_status_media(
+    state: State<'_, AppState>,
+    account_id: String,
+    message_id: String,
+) -> Result<(), String> {
+    state
+        .connectors
+        .download_status_media(&account_id, &message_id)
 }
 
 #[tauri::command]

@@ -13,11 +13,11 @@ export interface AttributionSection {
 
 export const SHUTTLE_LICENSE = {
   name: 'Shuttle',
-  license: 'GNU Affero General Public License v3.0 (AGPL-3.0)',
-  url: 'https://www.gnu.org/licenses/agpl-3.0.html',
+  license: 'AGPL-3.0-or-later',
+  url: 'https://github.com/smsheese/shuttle/blob/main/LICENSE',
   summary:
-    'Shuttle is free/open source. You may use, modify, and redistribute it under AGPL-3.0. If you run a modified version as a network service, you must offer corresponding source to users interacting with it over the network.',
-  sourceUrl: 'https://github.com/shuttle/shuttle',
+    'Shuttle is free and open source under the GNU AGPL v3 or later. A separate commercial license is available for products that cannot meet the AGPL terms.',
+  sourceUrl: 'https://github.com/smsheese/shuttle',
 } as const;
 
 export const ATTRIBUTION_SECTIONS: AttributionSection[] = [
@@ -43,10 +43,28 @@ export const ATTRIBUTION_SECTIONS: AttributionSection[] = [
         url: 'https://github.com/vitejs/vite',
       },
       {
+        name: 'emoji-picker-element',
+        role: 'Emoji picker',
+        license: 'Apache-2.0',
+        url: 'https://github.com/nolanlawson/emoji-picker-element',
+      },
+      {
+        name: 'Giphy JS SDK',
+        role: 'GIF and sticker search',
+        license: 'MIT',
+        url: 'https://github.com/Giphy/giphy-js',
+      },
+      {
+        name: 'SunCalc',
+        role: 'Sunrise and sunset times for the automatic theme',
+        license: 'BSD-2-Clause',
+        url: 'https://github.com/mourner/suncalc',
+      },
+      {
         name: 'Rust ecosystem',
         role: 'Core app (rusqlite, tokio, serde, keyring, age, notify-rust, …)',
-        license: 'MIT OR Apache-2.0 (per crate)',
-        url: 'https://github.com/shuttle/shuttle',
+        license: 'MIT, Apache-2.0, BSD, ISC, Zlib, MPL-2.0 and others (per crate)',
+        url: 'https://github.com/smsheese/shuttle',
         notes: 'Full crate list in shuttle-app/src-tauri/Cargo.lock',
       },
       {

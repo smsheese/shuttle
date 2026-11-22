@@ -1,7 +1,11 @@
+mod forward;
+mod message_ops;
 mod process_lock;
 mod process_tree;
 mod protocol;
 
+pub use forward::{ForwardResult, ForwardTarget};
+pub use message_ops::{message_actions, MessageOpResult};
 pub use protocol::*;
 
 use crate::components::ComponentManager;
@@ -13,14 +17,14 @@ use crate::telemetry::TelemetryManager;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
 #[derive(Clone, serde::Serialize)]
@@ -53,6 +57,8 @@ pub struct ConnectorManager {
     event_tx: broadcast::Sender<AppEvent>,
     components: Arc<ComponentManager>,
     data_dir: PathBuf,
+    /// Message ops waiting for the connector's `ok` / `error`, by request id.
+    pending_ops: Mutex<HashMap<String, oneshot::Sender<Result<(), String>>>>,
 }
 
 impl ConnectorManager {
@@ -80,6 +86,7 @@ impl ConnectorManager {
             event_tx,
             components,
             data_dir,
+            pending_ops: Mutex::new(HashMap::new()),
         }
     }
 
@@ -160,6 +167,7 @@ impl ConnectorManager {
                     "read_receipts".into(),
                     "groups".into(),
                 ],
+                actions: message_actions("whatsapp"),
             },
             ConnectorInfo {
                 id: "telegram".into(),
@@ -173,6 +181,7 @@ impl ConnectorManager {
                     "groups".into(),
                     "channels".into(),
                 ],
+                actions: message_actions("telegram"),
             },
             ConnectorInfo {
                 id: "signal".into(),
@@ -185,6 +194,7 @@ impl ConnectorManager {
                     "read_receipts".into(),
                     "groups".into(),
                 ],
+                actions: message_actions("signal"),
             },
             ConnectorInfo {
                 id: "messenger".into(),
@@ -192,6 +202,7 @@ impl ConnectorManager {
                 description: "Log in with Facebook email and password".into(),
                 auth_type: "password".into(),
                 capabilities: vec!["text".into(), "groups".into()],
+                actions: message_actions("messenger"),
             },
             ConnectorInfo {
                 id: "instagram".into(),
@@ -199,6 +210,7 @@ impl ConnectorManager {
                 description: "Log in to Instagram DMs".into(),
                 auth_type: "password".into(),
                 capabilities: vec!["text".into()],
+                actions: message_actions("instagram"),
             },
             ConnectorInfo {
                 id: "email".into(),
@@ -206,6 +218,7 @@ impl ConnectorManager {
                 description: "Connect IMAP and SMTP".into(),
                 auth_type: "email".into(),
                 capabilities: vec!["text".into()],
+                actions: message_actions("email"),
             },
             ConnectorInfo {
                 id: "matrix".into(),
@@ -213,6 +226,7 @@ impl ConnectorManager {
                 description: "Log in to a Matrix homeserver".into(),
                 auth_type: "password".into(),
                 capabilities: vec!["text".into(), "groups".into(), "channels".into()],
+                actions: message_actions("matrix"),
             },
         ]
     }
@@ -223,6 +237,25 @@ impl ConnectorManager {
 
     fn connector_script(&self, connector_id: &str) -> Result<PathBuf, String> {
         self.components().connector_script(connector_id)
+    }
+
+    /// An older build kept message previews in the user's Documents folder. Copy them into
+    /// the account cache once, so chats show them without waiting for the dump backfill.
+    fn migrate_legacy_previews(&self, connector_id: &str, account_id: &str, files_dir: &Path) {
+        let Ok(account) = self.db.get_account(account_id) else {
+            return;
+        };
+        let label = self
+            .list_connectors()
+            .into_iter()
+            .find(|c| c.id == connector_id)
+            .map(|c| c.name)
+            .unwrap_or_default();
+        let legacy = crate::media_store::legacy_account_dirs(&label, account_id, &account.name);
+        let copied = crate::media_store::migrate_legacy_previews(&legacy, &files_dir.join("thumbs"));
+        if copied > 0 {
+            tracing::info!("migrated {copied} message previews out of the legacy folder");
+        }
     }
 
     fn spawn_connector_process(
@@ -253,8 +286,10 @@ impl ConnectorManager {
         } else {
             Command::new(&entry)
         };
-        let files_dir = crate::media_store::account_files_root(account_id);
-        let _ = crate::media_store::ensure_account_dirs(account_id);
+        // Downloads go to the app-private cache next to the app data, never to Documents.
+        let files_dir = crate::media_store::account_cache_root(&self.data_dir, account_id);
+        crate::media_store::ensure_account_dirs(&files_dir).map_err(|e| e.to_string())?;
+        self.migrate_legacy_previews(connector_id, account_id, &files_dir);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -262,6 +297,10 @@ impl ConnectorManager {
             .env("SHUTTLE_ACCOUNT_ID", account_id)
             .env("SHUTTLE_DATA_DIR", &self.data_dir)
             .env("SHUTTLE_FILES_DIR", &files_dir)
+            .env(
+                "SHUTTLE_FILES_ROOT",
+                crate::media_store::media_cache_root(&self.data_dir),
+            )
             .env("SHUTTLE_GOWA_BIN", self.components.gowa_binary())
             .env("SHUTTLE_TDLIB", self.components.tdlib_path())
             .env("SHUTTLE_SIGNAL_CLI", self.components.signal_cli());
@@ -382,8 +421,12 @@ impl ConnectorManager {
                     if event == "message.received" || event == "message.sent" {
                         this.touch_activity(&account_id);
                     }
-                    handle_connector_event(&db, &config, &event_tx, &event, &account_id, payload).await;
+                    handle_connector_event(&db, &config, &event_tx, &event, &account_id, payload)
+                        .await;
                 } else if let Ok(resp) = decode_line::<ConnectorResponse>(&line) {
+                    if this.settle_op(&resp) {
+                        continue;
+                    }
                     match resp {
                         ConnectorResponse::AuthRequired {
                             method,
@@ -430,7 +473,58 @@ impl ConnectorManager {
                                 }),
                             });
                         }
-                        ConnectorResponse::Error { message, account_id: resp_account } => {
+                        ConnectorResponse::Ok {
+                            request_id: Some(rid),
+                            message_id: Some(mid),
+                            account_id: resp_account,
+                            ..
+                        } => match db.reconcile_send_ok(resp_account.as_deref(), &rid, &mid) {
+                            Ok(r) => emit_send_reconcile(
+                                &db,
+                                &event_tx,
+                                resp_account.as_deref().unwrap_or(&account_id_owned),
+                                r,
+                            ),
+                            Err(e) => tracing::warn!("send reply {rid}: {e}"),
+                        },
+                        // A send reply (it names the chat) without a message id: the send
+                        // went through, the id comes later with the echo.
+                        ConnectorResponse::Ok {
+                            request_id: Some(rid),
+                            message_id: None,
+                            conversation_id: Some(_),
+                            account_id: resp_account,
+                        } => match db.mark_send_accepted(resp_account.as_deref(), &rid) {
+                            Ok(r) => emit_send_reconcile(
+                                &db,
+                                &event_tx,
+                                resp_account.as_deref().unwrap_or(&account_id_owned),
+                                r,
+                            ),
+                            Err(e) => tracing::warn!("send reply {rid}: {e}"),
+                        },
+                        ConnectorResponse::Error {
+                            message,
+                            account_id: resp_account,
+                            request_id: Some(rid),
+                        } => {
+                            // Answers one send: fail that row, leave the account status alone.
+                            tracing::warn!("send {rid} failed: {message}");
+                            match db.reconcile_send_error(resp_account.as_deref(), &rid) {
+                                Ok(r) => emit_send_reconcile(
+                                    &db,
+                                    &event_tx,
+                                    resp_account.as_deref().unwrap_or(&account_id_owned),
+                                    r,
+                                ),
+                                Err(e) => tracing::warn!("send error reply {rid}: {e}"),
+                            }
+                        }
+                        ConnectorResponse::Error {
+                            message,
+                            account_id: resp_account,
+                            ..
+                        } => {
                             let aid = resp_account.unwrap_or_else(|| account_id_owned.clone());
                             let _ = db.update_account_status(&aid, AccountStatus::Error);
                             let _ = event_tx.send(AppEvent {
@@ -474,6 +568,11 @@ impl ConnectorManager {
 
         let auth_req = ConnectorRequest::Authenticate {
             account_id: account_id.to_string(),
+            files_dir: Some(
+                crate::media_store::account_cache_root(&self.data_dir, account_id)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             credentials,
         };
         let line = encode_line(&auth_req).map_err(|e| e.to_string())?;
@@ -482,7 +581,11 @@ impl ConnectorManager {
         Ok("Connector started".into())
     }
 
-    pub fn submit_auth(&self, account_id: &str, credentials: serde_json::Value) -> Result<(), String> {
+    pub fn submit_auth(
+        &self,
+        account_id: &str,
+        credentials: serde_json::Value,
+    ) -> Result<(), String> {
         self.send_to_connector(
             account_id,
             &ConnectorRequest::SubmitAuth {
@@ -504,7 +607,22 @@ impl ConnectorManager {
     }
 
     fn send_to_connector(&self, account_id: &str, req: &ConnectorRequest) -> Result<(), String> {
-        let line = encode_line(req).map_err(|e| e.to_string())?;
+        let mut request = serde_json::to_value(req).map_err(|e| e.to_string())?;
+        if self
+            .db
+            .get_account(account_id)
+            .map_err(|e| e.to_string())?
+            .connector_id
+            == "whatsapp"
+        {
+            // Resolve on each request so account renames and duplicate labels stay isolated
+            // even while several accounts share one connector process.
+            request["files_dir"] = serde_json::json!(crate::media_store::account_cache_root(
+                &self.data_dir,
+                account_id
+            ));
+        }
+        let line = encode_line(&request).map_err(|e| e.to_string())?;
         let map = self.processes.lock();
         let proc = map
             .values()
@@ -529,6 +647,11 @@ impl ConnectorManager {
         };
         let auth_req = ConnectorRequest::Authenticate {
             account_id: account_id.to_string(),
+            files_dir: Some(
+                crate::media_store::account_cache_root(&self.data_dir, account_id)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             credentials,
         };
         let line = encode_line(&auth_req).map_err(|e| e.to_string())?;
@@ -613,7 +736,10 @@ impl ConnectorManager {
     fn resolved_sleep(&self, account: &Account) -> (bool, u32, u32) {
         let cfg = self.config.get().sleep;
         let enabled = account.sleep_enabled.unwrap_or(cfg.enabled);
-        let after = account.sleep_after_minutes.unwrap_or(cfg.after_minutes).max(1);
+        let after = account
+            .sleep_after_minutes
+            .unwrap_or(cfg.after_minutes)
+            .max(1);
         let check = account.sleep_check_minutes.unwrap_or(cfg.check_minutes);
         (enabled, after, check)
     }
@@ -660,10 +786,7 @@ impl ConnectorManager {
                 self.sleep_account(&account.id);
                 continue;
             }
-            if !running
-                && self.sleeping.lock().contains(&account.id)
-                && check_min > 0
-            {
+            if !running && self.sleeping.lock().contains(&account.id) && check_min > 0 {
                 let due = self
                     .last_check
                     .lock()
@@ -689,14 +812,37 @@ impl ConnectorManager {
         }
     }
 
+    /// Resolve the message a send answers (`reply_to_message_id`, a local id) into what is
+    /// stored on the outgoing message and what the connector needs. It must be in this chat.
+    fn reply_for_send(
+        &self,
+        conversation_id: &str,
+        reply_to_message_id: Option<&str>,
+    ) -> Result<Option<crate::db::ReplyTarget>, String> {
+        let Some(id) = reply_to_message_id.filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        let target = self.db.reply_target(id).map_err(|e| e.to_string())?;
+        if target.conversation_id != conversation_id {
+            return Err("The message to reply to is in another chat".into());
+        }
+        Ok(Some(target))
+    }
+
     pub async fn send_message(
         self: &Arc<Self>,
         account_id: &str,
         conversation_id: &str,
         text: &str,
+        reply_to_message_id: Option<&str>,
+        forwarded: bool,
     ) -> Result<Message, String> {
         self.ensure_running(account_id)?;
-        let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
+        let conv = self
+            .db
+            .get_conversation(conversation_id)
+            .map_err(|e| e.to_string())?;
+        let reply = self.reply_for_send(conversation_id, reply_to_message_id)?;
         let mut msg = Message {
             id: Uuid::new_v4().to_string(),
             conversation_id: conversation_id.to_string(),
@@ -707,11 +853,18 @@ impl ConnectorManager {
             body: text.to_string(),
             timestamp: Utc::now(),
             status: MessageStatus::Pending,
-            metadata: serde_json::json!({}),
+            metadata: match &reply {
+                Some(r) => serde_json::json!({ "reply_to": r.meta }),
+                None if forwarded => serde_json::json!({ "forwarded": true }),
+                None => serde_json::json!({}),
+            },
             starred: false,
             pinned: false,
+            reactions: Vec::new(),
+            reply: None,
         };
         self.db.insert_message(&msg).map_err(|e| e.to_string())?;
+        self.db.resolve_reply(&mut msg);
         self.touch_activity(account_id);
         let conv = self.db.get_conversation(conversation_id).unwrap_or(conv);
 
@@ -721,14 +874,16 @@ impl ConnectorManager {
                 account_id: account_id.to_string(),
                 conversation_id: conv.remote_id.clone(),
                 text: text.to_string(),
+                reply_to_id: reply.as_ref().map(|r| r.remote_id.clone()),
+                reply_to_sender: reply.as_ref().and_then(|r| r.sender.clone()),
+                request_id: Some(msg.id.clone()),
+                forwarded,
             },
         ) {
             tracing::error!("[send_message] send_to_connector failed: {e}");
-            let _ = self.db.update_message_status(
-                conversation_id,
-                &msg.id,
-                MessageStatus::Failed,
-            );
+            let _ = self
+                .db
+                .update_message_status(conversation_id, &msg.id, MessageStatus::Failed);
             msg.status = MessageStatus::Failed;
             self.emit(
                 "message.sent",
@@ -769,9 +924,20 @@ impl ConnectorManager {
         question: Option<&str>,
         options: Vec<String>,
         max_answer: Option<i32>,
+        reply_to_message_id: Option<&str>,
+        path: Option<&str>,
+        forwarded: bool,
     ) -> Result<Message, String> {
+        if let Some(p) = path {
+            let roots = crate::media_store::media_read_roots(&self.data_dir);
+            crate::media_store::validated_media_path(std::path::Path::new(p), &roots)?;
+        }
         self.ensure_running(account_id)?;
-        let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
+        let conv = self
+            .db
+            .get_conversation(conversation_id)
+            .map_err(|e| e.to_string())?;
+        let reply = self.reply_for_send(conversation_id, reply_to_message_id)?;
         let body = match kind {
             "location" => caption
                 .filter(|s| !s.is_empty())
@@ -804,9 +970,9 @@ impl ConnectorManager {
         let mut metadata = serde_json::json!({
             "media_type": kind,
         });
-        let resolved_filename = filename.map(str::to_string).or_else(|| {
-            mime.map(|m| format!("file{}", crate::media_store::mime_to_ext(m)))
-        });
+        let resolved_filename = filename
+            .map(str::to_string)
+            .or_else(|| mime.map(|m| format!("file{}", crate::media_store::mime_to_ext(m))));
         if let Some(name) = resolved_filename.as_deref() {
             metadata["filename"] = serde_json::Value::String(name.to_string());
         }
@@ -825,9 +991,17 @@ impl ConnectorManager {
         }
         if let Some(b64) = data_base64.filter(|s| !s.is_empty()) {
             let mime_type = mime.unwrap_or("application/octet-stream");
-            metadata["media_data"] = serde_json::Value::String(format!(
-                "data:{mime_type};base64,{b64}"
-            ));
+            metadata["media_data"] =
+                serde_json::Value::String(format!("data:{mime_type};base64,{b64}"));
+        }
+        if let Some(r) = &reply {
+            metadata["reply_to"] = r.meta.clone();
+        }
+        if let Some(p) = path {
+            metadata["media_path"] = serde_json::Value::String(p.to_string());
+        }
+        if forwarded {
+            metadata["forwarded"] = serde_json::Value::Bool(true);
         }
         let mut msg = Message {
             id: Uuid::new_v4().to_string(),
@@ -842,14 +1016,21 @@ impl ConnectorManager {
             metadata,
             starred: false,
             pinned: false,
+            reactions: Vec::new(),
+            reply: None,
         };
         self.db.insert_message(&msg).map_err(|e| e.to_string())?;
+        self.db.resolve_reply(&mut msg);
         self.touch_activity(account_id);
         let conv = self.db.get_conversation(conversation_id).unwrap_or(conv);
 
         let b64_len = data_base64.map(|s| s.len()).unwrap_or(0);
-        tracing::info!("[send_attachment] kind={kind} mime={} b64_len={b64_len} filename={:?} remote_id={}",
-            mime.unwrap_or("none"), resolved_filename, conv.remote_id);
+        tracing::info!(
+            "[send_attachment] kind={kind} mime={} b64_len={b64_len} filename={:?} remote_id={}",
+            mime.unwrap_or("none"),
+            resolved_filename,
+            conv.remote_id
+        );
         if let Err(e) = self.send_to_connector(
             account_id,
             &ConnectorRequest::SendAttachment {
@@ -861,20 +1042,22 @@ impl ConnectorManager {
                 filename: resolved_filename,
                 mime: mime.map(str::to_string),
                 data_base64: data_base64.map(str::to_string),
-                path: None,
+                path: path.map(str::to_string),
                 latitude,
                 longitude,
                 question: question.map(str::to_string),
                 options,
                 max_answer,
+                reply_to_id: reply.as_ref().map(|r| r.remote_id.clone()),
+                reply_to_sender: reply.as_ref().and_then(|r| r.sender.clone()),
+                request_id: Some(msg.id.clone()),
+                forwarded,
             },
         ) {
             tracing::error!("[send_attachment] send_to_connector failed: {e}");
-            let _ = self.db.update_message_status(
-                conversation_id,
-                &msg.id,
-                MessageStatus::Failed,
-            );
+            let _ = self
+                .db
+                .update_message_status(conversation_id, &msg.id, MessageStatus::Failed);
             msg.status = MessageStatus::Failed;
             self.emit(
                 "message.sent",
@@ -901,44 +1084,348 @@ impl ConnectorManager {
         Ok(msg)
     }
 
+    /// Forward messages of one chat to chats on any account, now or (with `send_at`) later.
+    /// Returns one result per (target, source message), targets in the given order and sources
+    /// in chat order.
+    pub async fn forward_messages(
+        self: &Arc<Self>,
+        source_conversation_id: &str,
+        message_ids: &[String],
+        targets: &[ForwardTarget],
+        send_at: Option<&str>,
+    ) -> Result<Vec<ForwardResult>, String> {
+        let source = self
+            .db
+            .get_conversation(source_conversation_id)
+            .map_err(|e| e.to_string())?;
+        let sources = forward::resolve_sources(&self.db, source_conversation_id, message_ids);
+        if let Some(at) = send_at {
+            return Ok(forward::schedule_forward(
+                &self.db,
+                &source.account_id,
+                source_conversation_id,
+                &sources,
+                targets,
+                at,
+            ));
+        }
+        Ok(self.run_forward(&source.account_id, sources, targets).await)
+    }
+
+    /// Send a scheduled forward that is due: the source message as it is stored now.
+    pub async fn send_scheduled_forward(self: &Arc<Self>, msg: &ScheduledMessage) -> Result<(), String> {
+        let (Some(account_id), Some(conversation_id), Some(message_id)) = (
+            msg.source_account_id.as_deref(),
+            msg.source_conversation_id.as_deref(),
+            msg.source_message_id.as_deref(),
+        ) else {
+            return Err("The forwarded message is missing".into());
+        };
+        let sources =
+            forward::resolve_sources(&self.db, conversation_id, &[message_id.to_string()]);
+        let target = ForwardTarget {
+            account_id: msg.dest_account_id.clone(),
+            conversation_id: msg.dest_conversation_id.clone(),
+        };
+        let results = self.run_forward(account_id, sources, &[target]).await;
+        match results.into_iter().next().map(|r| r.outcome) {
+            Some(forward::ForwardOutcome::Sent) => Ok(()),
+            Some(forward::ForwardOutcome::NotForwardable { reason }) => Err(reason),
+            Some(forward::ForwardOutcome::Failed { error }) => Err(error),
+            _ => Err("The forwarded message is missing".into()),
+        }
+    }
+
+    async fn run_forward(
+        self: &Arc<Self>,
+        source_account_id: &str,
+        sources: Vec<(String, Result<(Message, forward::ForwardItem), String>)>,
+        targets: &[ForwardTarget],
+    ) -> Vec<ForwardResult> {
+        forward::run_forward(
+            sources,
+            targets,
+            |msg| {
+                let (this, account_id) = (self.clone(), source_account_id.to_string());
+                async move { this.cached_media_path(&account_id, &msg).await }
+            },
+            |target, item| {
+                let this = self.clone();
+                async move { this.send_forward_item(&target, item).await }
+            },
+        )
+        .await
+    }
+
+    async fn send_forward_item(
+        self: &Arc<Self>,
+        target: &ForwardTarget,
+        item: forward::ForwardItem,
+    ) -> Result<(), String> {
+        let (account_id, conversation_id) = (&target.account_id, &target.conversation_id);
+        match item {
+            forward::ForwardItem::Text(text) => self
+                .send_message(account_id, conversation_id, &text, None, true)
+                .await
+                .map(drop),
+            forward::ForwardItem::Media(m) => self
+                .send_attachment(
+                    account_id,
+                    conversation_id,
+                    &m.kind,
+                    m.caption.as_deref(),
+                    m.filename.as_deref(),
+                    m.mime.as_deref(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                    None,
+                    m.path.as_deref(),
+                    true,
+                )
+                .await
+                .map(drop),
+        }
+    }
+
+    /// Download a message's media through the normal download path and wait for the file.
+    async fn cached_media_path(self: &Arc<Self>, account_id: &str, msg: &Message) -> Result<String, String> {
+        const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+        let cached = |m: &Message| {
+            m.metadata
+                .get("media_path")
+                .and_then(|v| v.as_str())
+                .filter(|p| std::path::Path::new(p).is_file())
+                .map(str::to_string)
+        };
+        let mut events = self.subscribe();
+        self.ensure_running(account_id)?;
+        self.download_message_media(account_id, &msg.conversation_id, &msg.id, false)?;
+        let wait = async {
+            loop {
+                match events.recv().await {
+                    Ok(ev) if ev.kind == "media.downloaded" => {
+                        let Some(done) = ev
+                            .payload
+                            .get("message")
+                            .and_then(|m| serde_json::from_value::<Message>(m.clone()).ok())
+                            .filter(|m| m.id == msg.id)
+                        else {
+                            continue;
+                        };
+                        return cached(&done).ok_or_else(|| {
+                            done.metadata
+                                .get("media_error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("no file was saved")
+                                .to_string()
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let stored = self.db.get_message(&msg.conversation_id, &msg.id);
+                        if let Some(path) = stored.ok().as_ref().and_then(cached) {
+                            return Ok(path);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Err("the app is shutting down".to_string())
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(DOWNLOAD_TIMEOUT, wait)
+            .await
+            .map_err(|_| "the download timed out".to_string())?
+    }
+
     pub fn mark_read_remote(&self, account_id: &str, conversation_id: &str) -> Result<(), String> {
-        let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
+        let conv = self
+            .db
+            .get_conversation(conversation_id)
+            .map_err(|e| e.to_string())?;
+        let message_id = self
+            .db
+            .last_inbound_remote_id(conversation_id)
+            .ok()
+            .flatten();
         self.send_to_connector(
             account_id,
             &ConnectorRequest::MarkRead {
                 account_id: account_id.to_string(),
                 conversation_id: conv.remote_id,
+                message_id,
             },
         )
     }
 
+    /// Apply one action to messages of one chat and report each message's outcome. Every message
+    /// is checked against its network's action table first. The stored result arrives through
+    /// the connector's facts, the same way a change made on the phone does.
+    pub async fn apply_message_op(
+        self: &Arc<Self>,
+        conversation_id: &str,
+        message_ids: &[String],
+        op: MessageOp,
+    ) -> Result<Vec<MessageOpResult>, String> {
+        let conv = self
+            .db
+            .get_conversation(conversation_id)
+            .map_err(|e| e.to_string())?;
+        let account = self
+            .db
+            .get_account(&conv.account_id)
+            .map_err(|e| e.to_string())?;
+        let actions = message_actions(&account.connector_id);
+        self.ensure_running(&account.id)?;
+        self.touch_activity(&account.id);
+        let now = Utc::now();
+        let one = |message_id: String| {
+            let (account_id, conv, op) = (&account.id, &conv, &op);
+            async move {
+                let outcome = async {
+                    let msg = self
+                        .db
+                        .get_message(&conv.id, &message_id)
+                        .map_err(|e| e.to_string())?;
+                    message_ops::check_op(&actions, &msg, op, now).map_err(|r| r.to_string())?;
+                    self.request_op(
+                        account_id,
+                        &conv.remote_id,
+                        msg.remote_id.as_deref().unwrap_or_default(),
+                        op,
+                    )
+                    .await
+                }
+                .await;
+                MessageOpResult {
+                    message_id,
+                    error: outcome.err(),
+                }
+            }
+        };
+        Ok(futures_util::future::join_all(message_ids.iter().cloned().map(one)).await)
+    }
+
+    async fn request_op(
+        &self,
+        account_id: &str,
+        conversation_remote: &str,
+        message_remote: &str,
+        op: &MessageOp,
+    ) -> Result<(), String> {
+        const OP_TIMEOUT: Duration = Duration::from_secs(30);
+        let request_id = Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel();
+        self.pending_ops.lock().insert(request_id.clone(), tx);
+        let sent = self.send_to_connector(
+            account_id,
+            &ConnectorRequest::MessageOp {
+                account_id: account_id.to_string(),
+                conversation_id: conversation_remote.to_string(),
+                message_id: message_remote.to_string(),
+                op: op.clone(),
+                request_id: request_id.clone(),
+            },
+        );
+        let reply = match sent {
+            Ok(()) => tokio::time::timeout(OP_TIMEOUT, rx).await,
+            Err(e) => {
+                self.pending_ops.lock().remove(&request_id);
+                return Err(e);
+            }
+        };
+        self.pending_ops.lock().remove(&request_id);
+        match reply {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("The connector stopped before answering".into()),
+            Err(_) => Err("The network did not answer in time".into()),
+        }
+    }
+
+    /// Hand a connector reply to the message op waiting for it. False when none is waiting.
+    fn settle_op(&self, resp: &ConnectorResponse) -> bool {
+        let (rid, result) = match resp {
+            ConnectorResponse::Ok {
+                request_id: Some(rid),
+                ..
+            } => (rid, Ok(())),
+            ConnectorResponse::Error {
+                request_id: Some(rid),
+                message,
+                ..
+            } => (rid, Err(message.clone())),
+            _ => return false,
+        };
+        match self.pending_ops.lock().remove(rid) {
+            Some(tx) => {
+                let _ = tx.send(result);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Ask the connector to download one message's media into the cache.
+    ///
+    /// `auto` marks a download nobody asked for (rendering a thread): it only goes ahead when the
+    /// effective auto-download setting (chat override, else account default, else built-in)
+    /// allows that kind. User-initiated downloads (`auto == false`) always run. Returns whether
+    /// a download was requested.
     pub fn download_message_media(
         &self,
         account_id: &str,
         conversation_id: &str,
         message_id: &str,
-    ) -> Result<(), String> {
-        let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
+        auto: bool,
+    ) -> Result<bool, String> {
+        let conv = self
+            .db
+            .get_conversation(conversation_id)
+            .map_err(|e| e.to_string())?;
         let msg = self
             .db
             .get_message(conversation_id, message_id)
             .map_err(|e| e.to_string())?;
+        if auto {
+            let account = self.db.get_account(account_id).map_err(|e| e.to_string())?;
+            let kind = msg
+                .metadata
+                .get("media_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if !crate::models::AutoDownloadPrefs::allows_auto(
+                kind,
+                &conv.auto_download,
+                &account.auto_download,
+            ) {
+                return Ok(false);
+            }
+        }
         let remote_id = msg
             .remote_id
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "Message has no remote id".to_string())?;
-        if self.send_to_connector(
-            account_id,
-            &ConnectorRequest::DownloadMedia {
-                account_id: account_id.to_string(),
-                conversation_id: conv.remote_id.clone(),
-                message_id: remote_id.clone(),
-            },
-        ).is_err() {
-            let _ = self.db.mark_message_media_error(conversation_id, &msg.id, "connector unavailable");
+        if self
+            .send_to_connector(
+                account_id,
+                &ConnectorRequest::DownloadMedia {
+                    account_id: account_id.to_string(),
+                    conversation_id: conv.remote_id.clone(),
+                    message_id: remote_id.clone(),
+                },
+            )
+            .is_err()
+        {
+            let _ =
+                self.db
+                    .mark_message_media_error(conversation_id, &msg.id, "connector unavailable");
             return Err("Connector is not running for this account".into());
         }
-        Ok(())
+        Ok(true)
     }
 
     pub fn download_status_media(&self, account_id: &str, message_id: &str) -> Result<(), String> {
@@ -959,7 +1446,10 @@ impl ConnectorManager {
         account_id: &str,
         conversation_id: &str,
     ) -> Result<(), String> {
-        let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
+        let conv = self
+            .db
+            .get_conversation(conversation_id)
+            .map_err(|e| e.to_string())?;
         self.send_to_connector(
             account_id,
             &ConnectorRequest::FetchAvatar {
@@ -970,8 +1460,15 @@ impl ConnectorManager {
     }
 
     pub fn sync_conversation(&self, account_id: &str, conversation_id: &str) -> Result<(), String> {
-        let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
-        let since_message_id = self.db.last_inbound_remote_id(conversation_id).ok().flatten();
+        let conv = self
+            .db
+            .get_conversation(conversation_id)
+            .map_err(|e| e.to_string())?;
+        let since_message_id = self
+            .db
+            .last_inbound_remote_id(conversation_id)
+            .ok()
+            .flatten();
         self.send_to_connector(
             account_id,
             &ConnectorRequest::SyncChat {
@@ -987,7 +1484,10 @@ impl ConnectorManager {
         account_id: &str,
         conversation_id: &str,
     ) -> Result<(), String> {
-        let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
+        let conv = self
+            .db
+            .get_conversation(conversation_id)
+            .map_err(|e| e.to_string())?;
         self.send_to_connector(
             account_id,
             &ConnectorRequest::FetchContactProfile {
@@ -1004,7 +1504,10 @@ impl ConnectorManager {
         mode: &str,
         share_screen: bool,
     ) -> Result<CallState, String> {
-        let conv = self.db.get_conversation(conversation_id).map_err(|e| e.to_string())?;
+        let conv = self
+            .db
+            .get_conversation(conversation_id)
+            .map_err(|e| e.to_string())?;
         let call_id = Uuid::new_v4().to_string();
         self.send_to_connector(
             account_id,
@@ -1024,7 +1527,10 @@ impl ConnectorManager {
             status: "ringing".into(),
             remote_name: Some(conv.title.clone()),
         };
-        self.emit("call.ringing", serde_json::to_value(&state).unwrap_or_default());
+        self.emit(
+            "call.ringing",
+            serde_json::to_value(&state).unwrap_or_default(),
+        );
         Ok(state)
     }
 
@@ -1074,13 +1580,30 @@ impl ConnectorManager {
         )
     }
 
+    /// Fire a `check_number` request; the connector answers with a `number.checked` event.
+    pub fn check_number(
+        &self,
+        account_id: &str,
+        phone: &str,
+        request_id: &str,
+    ) -> Result<(), String> {
+        self.send_to_connector(
+            account_id,
+            &ConnectorRequest::CheckNumber {
+                account_id: account_id.to_string(),
+                phone: phone.to_string(),
+                request_id: request_id.to_string(),
+            },
+        )
+    }
+
     pub fn start_conversation(
         &self,
         account_id: &str,
         remote_id: &str,
         title: &str,
     ) -> Result<Conversation, String> {
-        let remote = normalize_remote_id(remote_id);
+        let remote = normalize_remote_id(remote_id)?;
         let ctype = if remote.ends_with("@g.us") {
             ConversationType::Group
         } else {
@@ -1092,7 +1615,7 @@ impl ConnectorManager {
             title.trim().to_string()
         };
         self.db
-            .upsert_conversation(account_id, &remote, &label, ctype, None, None, None, None, false, false)
+            .ensure_conversation(account_id, &remote, &label, ctype)
             .map_err(|e| e.to_string())
     }
 
@@ -1145,7 +1668,9 @@ impl ConnectorManager {
                 encode_line(&ConnectorRequest::Disconnect {
                     account_id: account_id.to_string(),
                 })
-                .unwrap_or_else(|_| format!("{{\"type\":\"disconnect\",\"account_id\":\"{account_id}\"}}\n")),
+                .unwrap_or_else(|_| {
+                    format!("{{\"type\":\"disconnect\",\"account_id\":\"{account_id}\"}}\n")
+                }),
             );
             running.accounts.is_empty()
         };
@@ -1181,11 +1706,7 @@ impl ConnectorManager {
             .filter(|id| {
                 !self.do_not_restart.lock().contains(id)
                     && !self.sleeping.lock().contains(id)
-                    && self
-                        .db
-                        .get_account(id)
-                        .ok()
-                        .is_some_and(|a| !a.disabled)
+                    && self.db.get_account(id).ok().is_some_and(|a| !a.disabled)
             })
             .collect();
         if restart.is_empty() {
@@ -1219,7 +1740,9 @@ impl ConnectorManager {
             let creds = crate::secrets::load(&self.data_dir, &account_id);
             if let Err(e) = self.start_connector(connector_id, &account_id, creds) {
                 tracing::warn!("restart {account_id}: {e}");
-                let _ = self.db.update_account_status(&account_id, AccountStatus::Error);
+                let _ = self
+                    .db
+                    .update_account_status(&account_id, AccountStatus::Error);
                 self.emit(
                     "account.error",
                     serde_json::json!({
@@ -1232,17 +1755,19 @@ impl ConnectorManager {
     }
 }
 
-fn normalize_remote_id(raw: &str) -> String {
+/// A typed number or a JID, as a JID. A bare number loses spaces, dashes, brackets, a leading `+`
+/// and the `00` international prefix, and must then be a plausible E.164 length (7 to 15 digits).
+fn normalize_remote_id(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.contains('@') {
-        return trimmed.to_string();
+        return Ok(trimmed.to_string());
     }
     let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        trimmed.to_string()
-    } else {
-        format!("{digits}@s.whatsapp.net")
+    let digits = digits.strip_prefix("00").unwrap_or(&digits);
+    if !(7..=15).contains(&digits.len()) {
+        return Err("Enter the full number with country code, e.g. +974 8899 8899".to_string());
     }
+    Ok(format!("{digits}@s.whatsapp.net"))
 }
 
 fn value_to_string(value: Option<&serde_json::Value>) -> Option<String> {
@@ -1260,186 +1785,158 @@ fn value_to_string(value: Option<&serde_json::Value>) -> Option<String> {
     }
 }
 
-fn parse_ts(value: Option<&str>) -> DateTime<Utc> {
+fn parse_ts_opt(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
+    let dt = match value {
+        Some(serde_json::Value::String(s)) => match s.trim().parse::<i64>() {
+            Ok(n) => unix_to_utc(n),
+            Err(_) => crate::db::parse_stored_datetime(s),
+        },
+        Some(serde_json::Value::Number(n)) => n.as_i64().and_then(unix_to_utc),
+        _ => None,
+    };
+    dt.filter(|t| t.timestamp() > 0)
+}
+
+fn unix_to_utc(n: i64) -> Option<DateTime<Utc>> {
+    if n <= 0 {
+        return None;
+    }
+    let secs = if n > 10_000_000_000 { n / 1000 } else { n };
+    DateTime::from_timestamp(secs, 0)
+}
+
+fn string_list(value: Option<&serde_json::Value>) -> Vec<String> {
     value
-        .and_then(crate::db::parse_stored_datetime)
-        .unwrap_or_else(Utc::now)
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| value_to_string(Some(v)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-fn parse_ts_value(value: Option<&serde_json::Value>) -> DateTime<Utc> {
-    match value {
-        Some(serde_json::Value::String(s)) => {
-            if let Ok(n) = s.parse::<i64>() {
-                unix_to_utc(n)
-            } else {
-                parse_ts(Some(s))
-            }
-        }
-        Some(serde_json::Value::Number(n)) => unix_to_utc(n.as_i64().unwrap_or(0)),
-        _ => Utc::now(),
-    }
-}
-
-fn unix_to_utc(n: i64) -> DateTime<Utc> {
-    let secs = if n.abs() > 10_000_000_000 { n / 1000 } else { n };
-    DateTime::from_timestamp(secs, 0).unwrap_or_else(Utc::now)
-}
-
-// #region agent log
-fn agent_dbg(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
-    use std::io::Write;
-    let line = serde_json::json!({
-        "sessionId": "d17e9a",
-        "runId": "post-fix",
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": Utc::now().timestamp_millis(),
-    });
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/home/tfsbs/Documents/shuttle/.cursor/debug-d17e9a.log")
-    {
-        let _ = writeln!(f, "{line}");
-    }
-}
-// #endregion
-
-fn ts_str(value: Option<&serde_json::Value>) -> Option<String> {
-    match value {
-        None | Some(serde_json::Value::Null) => None,
-        other => {
-            let s = parse_ts_value(other).to_rfc3339();
-            if s.starts_with("0001-") || s.starts_with("0000-") {
-                None
-            } else {
-                Some(s)
-            }
-        }
-    }
-}
-
-async fn handle_connector_event(
+fn emit_merges(
     db: &Database,
-    config: &ConfigStore,
     event_tx: &broadcast::Sender<AppEvent>,
-    event: &str,
     account_id: &str,
-    payload: serde_json::Value,
+    merged: &[crate::db::MergedAway],
 ) {
-    match event {
-        "conversation.updated" => {
-            let remote_id = value_to_string(payload.get("remote_id")).unwrap_or_default();
-            if remote_id.is_empty() {
-                return;
-            }
-            let mut title = payload
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or(remote_id.as_str())
-                .to_string();
-            if let Ok(account) = db.get_account(account_id) {
-                if let Some(identity) = account.identity.as_deref() {
-                    if crate::media_store::jids_same(&remote_id, identity) {
-                        if let Ok(contacts) = db.list_contacts(account_id) {
-                            for contact in contacts {
-                                if crate::media_store::jids_same(&contact.remote_id, &remote_id) {
-                                    title = format!("{} (You)", contact.display_name);
-                                    break;
-                                }
-                            }
-                        }
-                        if !title.ends_with("(You)") {
-                            if let Some(name) = payload
-                                .get("title")
-                                .and_then(|v| v.as_str())
-                                .filter(|t| !t.chars().all(|c| c.is_ascii_digit() || "+- ()".contains(c)))
-                            {
-                                if !name.is_empty() && !crate::media_store::jids_same(name, &remote_id) {
-                                    title = format!("{name} (You)");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            let ctype = match payload.get("conversation_type").and_then(|v| v.as_str()) {
-                Some("group") => ConversationType::Group,
-                Some("channel") => ConversationType::Channel,
-                _ => ConversationType::Direct,
-            };
-            let last_at = ts_str(payload.get("last_message_at"));
-            let last_at = last_at.as_deref();
-            if remote_id.starts_with("status@") {
-                return;
-            }
-            let preview = payload.get("preview").and_then(|v| v.as_str());
-            let archived = payload.get("archived").and_then(|v| v.as_bool());
-            let pinned = payload.get("pinned").and_then(|v| v.as_bool());
-            let force_recency = payload
-                .get("force_recency")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let history = payload
-                .get("history")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let replace_title = history
-                || payload
-                    .get("replace_title")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-            if let Ok(conv) = db.upsert_conversation(
-                account_id,
-                &remote_id,
-                &title,
-                ctype,
-                last_at,
-                preview,
-                archived,
-                pinned,
-                force_recency,
-                replace_title,
-            ) {
-                if let Some(rank) = payload.get("list_rank").and_then(|v| v.as_i64()) {
-                    let _ = db.merge_conversation_metadata(
-                        account_id,
-                        &remote_id,
-                        &serde_json::json!({ "list_rank": rank }),
-                    );
-                }
-                if let Some(unread) = payload.get("unread_count").and_then(|v| v.as_i64()) {
-                    let history = payload
-                        .get("history")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    // History/backup unreadCount is often stale vs WhatsApp Web.
-                    // Only apply unread from live conversation.updated events.
-                    if !history {
-                        let _ = db.set_unread_count(&conv.id, unread.max(0));
-                    }
-                }
-                let conv = db.get_conversation(&conv.id).unwrap_or(conv);
-                let history = payload.get("history").and_then(|v| v.as_bool()).unwrap_or(false);
-                // #region agent log
-                agent_dbg(
-                    "H4",
-                    "connectors/mod.rs:conversation.updated",
-                    "upsert conversation",
-                    serde_json::json!({
-                        "history": history,
-                        "force_recency": force_recency,
-                        "last_at": last_at,
-                        "preview_len": preview.map(|s| s.len()),
-                        "list_rank": payload.get("list_rank"),
-                        "remote_tail": remote_id.chars().rev().take(40).collect::<String>().chars().rev().collect::<String>(),
-                        "stored_last_at": conv.last_message_at.map(|t| t.to_rfc3339()),
-                    }),
-                );
-                // #endregion
-                if !history {
+    for m in merged {
+        let _ = event_tx.send(AppEvent {
+            kind: "conversation.removed".into(),
+            payload: serde_json::json!({
+                "account_id": account_id,
+                "conversation_id": m.removed_id,
+                "into_conversation_id": m.into_id,
+            }),
+        });
+    }
+    let mut seen = HashSet::new();
+    for m in merged {
+        if !seen.insert(m.into_id.clone()) {
+            continue;
+        }
+        if let Ok(conv) = db.get_conversation(&m.into_id) {
+            let _ = event_tx.send(AppEvent {
+                kind: "conversation.updated".into(),
+                payload: serde_json::json!({ "account_id": account_id, "conversation": conv }),
+            });
+        }
+    }
+}
+
+fn emit_send_reconcile(
+    db: &Database,
+    event_tx: &broadcast::Sender<AppEvent>,
+    account_id: &str,
+    result: crate::db::SendReconcile,
+) {
+    use crate::db::SendReconcile;
+    let account_of = |conversation_id: &str| {
+        db.conversation_account(conversation_id)
+            .unwrap_or_else(|_| account_id.to_string())
+    };
+    match result {
+        SendReconcile::Updated {
+            conversation_id,
+            message,
+        } => {
+            let _ = event_tx.send(AppEvent {
+                kind: "message.updated".into(),
+                payload: serde_json::json!({
+                    "account_id": account_of(&conversation_id),
+                    "conversation_id": conversation_id,
+                    "message": message,
+                }),
+            });
+        }
+        SendReconcile::Removed {
+            conversation_id,
+            message_id,
+        } => {
+            let _ = event_tx.send(AppEvent {
+                kind: "message.removed".into(),
+                payload: serde_json::json!({
+                    "account_id": account_of(&conversation_id),
+                    "conversation_id": conversation_id,
+                    "message_id": message_id,
+                }),
+            });
+        }
+        SendReconcile::Nothing => {}
+    }
+}
+
+fn handle_conversation_event(
+    db: &Database,
+    event_tx: &broadcast::Sender<AppEvent>,
+    account_id: &str,
+    payload: &serde_json::Value,
+) {
+    let remote_id = value_to_string(payload.get("remote_id")).unwrap_or_default();
+    if remote_id.is_empty() || remote_id.starts_with("status@") {
+        return;
+    }
+    let history = payload
+        .get("history")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let ev = crate::db::ConversationEvent {
+        remote_id,
+        alt_remote_ids: string_list(payload.get("alt_remote_ids")),
+        names: payload.get("names").and_then(|v| v.as_object()).cloned(),
+        is_self: payload
+            .get("is_self")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        legacy_title: payload
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        conversation_type: match payload.get("conversation_type").and_then(|v| v.as_str()) {
+            Some("group") => Some(ConversationType::Group),
+            Some("channel") => Some(ConversationType::Channel),
+            Some("direct") => Some(ConversationType::Direct),
+            _ => None,
+        },
+        last_message_at: parse_ts_opt(payload.get("last_message_at")),
+        preview: payload
+            .get("preview")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        archived: payload.get("archived").and_then(|v| v.as_bool()),
+        pinned: payload.get("pinned").and_then(|v| v.as_bool()),
+        announce_only: payload.get("announce_only").and_then(|v| v.as_bool()),
+        self_is_admin: payload.get("self_is_admin").and_then(|v| v.as_bool()),
+        history,
+    };
+    match db.apply_conversation_event(account_id, &ev) {
+        Ok(out) => {
+            emit_merges(db, event_tx, account_id, &out.merged);
+            if out.changed && out.merged.is_empty() && !history {
+                if let Some(conv) = out.conversation {
                     let _ = event_tx.send(AppEvent {
                         kind: "conversation.updated".into(),
                         payload: serde_json::json!({ "account_id": account_id, "conversation": conv }),
@@ -1447,153 +1944,156 @@ async fn handle_connector_event(
                 }
             }
         }
-        "message.received" | "message.sent" => {
-            let remote_jid = value_to_string(payload.get("conversation_id"))
-                .or_else(|| value_to_string(payload.get("remote_id")))
-                .unwrap_or_default();
-            if remote_jid.is_empty() {
-                return;
-            }
-            if remote_jid.starts_with("status@") {
-                return;
-            }
-            let msg_obj = payload.get("message").cloned().unwrap_or(payload.clone());
-            let from_me = msg_obj
-                .get("from_me")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(event == "message.sent");
-            let body = msg_obj
-                .get("text")
-                .and_then(|t| t.as_str())
-                .or_else(|| msg_obj.get("body").and_then(|t| t.as_str()))
-                .unwrap_or("")
-                .to_string();
-            let title = msg_obj
-                .get("sender_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or(remote_jid.as_str());
-            let ctype = if remote_jid.ends_with("@g.us") {
-                ConversationType::Group
-            } else {
-                ConversationType::Direct
-            };
-            let ts = parse_ts_value(msg_obj.get("timestamp"));
-            let title = db
-                .get_conversation_by_remote(account_id, &remote_jid)
-                .ok()
-                .flatten()
-                .map(|c| c.title)
-                .unwrap_or_else(|| title.to_string());
-            let preview = msg_obj
-                .get("preview")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .unwrap_or_else(|| {
-                    let mut meta = msg_obj.clone();
-                    if meta.get("media_type").is_none() {
-                        if let Some(obj) = meta.as_object_mut() {
-                            if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
-                                if t.starts_with('[') && t.ends_with(']') {
-                                    obj.insert(
-                                        "media_type".into(),
-                                        serde_json::Value::String(t[1..t.len() - 1].to_string()),
-                                    );
-                                }
-                            }
+        Err(e) => tracing::warn!("conversation event: {e}"),
+    }
+}
+
+fn handle_message_event(
+    db: &Database,
+    config: &ConfigStore,
+    event_tx: &broadcast::Sender<AppEvent>,
+    event: &str,
+    account_id: &str,
+    payload: &serde_json::Value,
+) {
+    let remote_jid = value_to_string(payload.get("conversation_id"))
+        .or_else(|| value_to_string(payload.get("remote_id")))
+        .unwrap_or_default();
+    if remote_jid.is_empty() || remote_jid.starts_with("status@") {
+        return;
+    }
+    let msg_obj = payload.get("message").cloned().unwrap_or(payload.clone());
+    let from_me = msg_obj
+        .get("from_me")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(event == "message.sent");
+    let body = msg_obj
+        .get("text")
+        .and_then(|t| t.as_str())
+        .or_else(|| msg_obj.get("body").and_then(|t| t.as_str()))
+        .unwrap_or("")
+        .to_string();
+    let history = payload
+        .get("history")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let has_media = msg_obj
+        .get("media_type")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty() && s != "text")
+        .unwrap_or(false);
+    // Skip protocol stubs / empty rows: they would create blank threads.
+    if body.trim().is_empty() && !has_media {
+        return;
+    }
+    // R1: bulk-sync rows need a real time; live rows without one are stamped now.
+    let ts = match parse_ts_opt(msg_obj.get("timestamp")) {
+        Some(t) => t,
+        None if history => {
+            tracing::warn!("dropping history message without a valid timestamp in {remote_jid}");
+            return;
+        }
+        None => Utc::now(),
+    };
+    let preview = msg_obj
+        .get("preview")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            let mut meta = msg_obj.clone();
+            if meta.get("media_type").is_none() {
+                if let Some(obj) = meta.as_object_mut() {
+                    if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
+                        if t.starts_with('[') && t.ends_with(']') {
+                            obj.insert(
+                                "media_type".into(),
+                                serde_json::Value::String(t[1..t.len() - 1].to_string()),
+                            );
                         }
                     }
-                    crate::db::message_preview(&body, &meta)
-                });
-            let conv = match db.upsert_conversation(
-                account_id,
-                &remote_jid,
-                &title,
-                ctype,
-                Some(&ts.to_rfc3339()),
-                Some(preview.as_str()),
-                None,
-                None,
-                false,
-                false,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("upsert conversation: {e}");
-                    return;
                 }
-            };
-            let history = payload.get("history").and_then(|v| v.as_bool()).unwrap_or(false);
-            let has_media = msg_obj
-                .get("media_type")
-                .and_then(|v| v.as_str())
-                .map(|s| !s.is_empty() && s != "text")
-                .unwrap_or(false);
-            // Skip protocol stubs / empty rows — they create blank threads (UI hides empty bodies).
-            if body.trim().is_empty() && !has_media {
+            }
+            crate::db::message_preview(&body, &meta)
+        });
+    let fallback_title = msg_obj
+        .get("sender_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(remote_jid.as_str())
+        .to_string();
+    let msg = Message {
+        id: Uuid::new_v4().to_string(),
+        conversation_id: String::new(),
+        remote_id: value_to_string(msg_obj.get("id")),
+        sender_id: value_to_string(msg_obj.get("sender_id")),
+        sender_name: msg_obj
+            .get("sender_name")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        direction: if from_me {
+            MessageDirection::Outbound
+        } else {
+            MessageDirection::Inbound
+        },
+        body,
+        timestamp: ts,
+        status: if from_me {
+            MessageStatus::Sent
+        } else {
+            MessageStatus::Delivered
+        },
+        metadata: msg_obj.clone(),
+        starred: false,
+        pinned: false,
+        reactions: Vec::new(),
+        reply: None,
+    };
+    let alts = string_list(payload.get("alt_remote_ids"));
+    let outcome = match db.ingest_message(
+        account_id,
+        &remote_jid,
+        &alts,
+        history,
+        msg,
+        &preview,
+        &fallback_title,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!("ingest message: {e}");
+            return;
+        }
+    };
+    emit_merges(db, event_tx, account_id, &outcome.merged);
+    match outcome.kind {
+        crate::db::IngestKind::Inserted => {
+            let (Some(conv), Some(mut msg)) = (outcome.conversation, outcome.message) else {
                 return;
-            }
-            let msg = Message {
-                id: Uuid::new_v4().to_string(),
-                conversation_id: conv.id.clone(),
-                remote_id: value_to_string(msg_obj.get("id")),
-                sender_id: value_to_string(msg_obj.get("sender_id")),
-                sender_name: msg_obj
-                    .get("sender_name")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                direction: if from_me {
-                    MessageDirection::Outbound
-                } else {
-                    MessageDirection::Inbound
-                },
-                body: body.clone(),
-                timestamp: ts,
-                status: if from_me {
-                    MessageStatus::Sent
-                } else {
-                    MessageStatus::Delivered
-                },
-                metadata: msg_obj.clone(),
-                starred: false,
-                pinned: false,
             };
-            let inserted = db.insert_message(&msg).unwrap_or(false);
-            // #region agent log
-            agent_dbg(
-                "H2",
-                "connectors/mod.rs:message.received",
-                "persist message",
-                serde_json::json!({
-                    "event": event,
-                    "history": history,
-                    "inserted": inserted,
-                    "from_me": from_me,
-                    "remote_tail": remote_jid.chars().rev().take(40).collect::<String>().chars().rev().collect::<String>(),
-                    "ts": ts.to_rfc3339(),
-                    "last_at": conv.last_message_at.map(|t| t.to_rfc3339()),
-                    "body_len": body.len(),
-                }),
-            );
-            // #endregion
-            if inserted && from_me && !history {
-                // Sending in a chat marks it read (matches WhatsApp).
-                let _ = db.set_unread_count(&conv.id, 0);
-            }
-            if inserted && !from_me && !history {
-                let _ = db.increment_unread(&conv.id);
-                let cfg = config.get();
-                if notifications::should_notify_ids(db, &cfg, account_id, &conv.id) {
-                    notifications::notify_message(
-                        msg.sender_name.as_deref().unwrap_or("New message"),
-                        &msg.body,
-                    );
+            db.resolve_reply(&mut msg);
+            // A reaction can be stored before its message arrives; show it from the start.
+            if let Some(rid) = msg.remote_id.clone() {
+                if let Ok(mut map) = db.reactions_for_targets(&conv.id, std::slice::from_ref(&rid)) {
+                    if let Some(groups) = map.remove(&rid) {
+                        msg.reactions = groups;
+                    }
                 }
-                apply_forward_rules(db, &conv, &msg);
             }
-            // Only push UI events for newly inserted live/catch-up rows. Catch-up
-            // re-fetches recent messages every ~30s; emitting on duplicates floods the UI.
-            if inserted && !history {
-                let conv = db.get_conversation(&conv.id).unwrap_or(conv);
+            if !from_me {
+                if outcome.notify_eligible {
+                    let cfg = config.get();
+                    if notifications::should_notify_ids(db, &cfg, account_id, &conv.id) {
+                        notifications::notify_message(
+                            msg.sender_name.as_deref().unwrap_or("New message"),
+                            &msg.body,
+                        );
+                    }
+                }
+                if !history {
+                    apply_forward_rules(db, &conv, &msg);
+                }
+            }
+            // Old bulk-sync rows stay silent; catch-up duplicates never reach this point.
+            if outcome.emit_new {
                 let unread_total = db.total_unread().unwrap_or(0);
                 let _ = event_tx.send(AppEvent {
                     kind: event.to_string(),
@@ -1607,6 +2107,273 @@ async fn handle_connector_event(
                 });
             }
         }
+        crate::db::IngestKind::Adopted => {
+            if let Some(msg) = outcome.message {
+                let _ = event_tx.send(AppEvent {
+                    kind: "message.updated".into(),
+                    payload: serde_json::json!({
+                        "account_id": account_id,
+                        "conversation_id": msg.conversation_id,
+                        "message": msg,
+                    }),
+                });
+            }
+        }
+        crate::db::IngestKind::Duplicate => {
+            if let (Some(conv), true) = (outcome.conversation, outcome.merged.is_empty()) {
+                let _ = event_tx.send(AppEvent {
+                    kind: "conversation.updated".into(),
+                    payload: serde_json::json!({ "account_id": account_id, "conversation": conv }),
+                });
+            }
+        }
+    }
+}
+
+/// `reaction`: store the facts. Never touches the chat row (time, preview, unread); the UI is
+/// told which messages now carry different reactions so an open thread updates in place.
+fn handle_reaction_event(
+    db: &Database,
+    event_tx: &broadcast::Sender<AppEvent>,
+    account_id: &str,
+    payload: &serde_json::Value,
+) {
+    let remote_id = value_to_string(payload.get("remote_id"))
+        .or_else(|| value_to_string(payload.get("conversation_id")))
+        .unwrap_or_default();
+    if remote_id.is_empty() || remote_id.starts_with("status@") {
+        return;
+    }
+    let facts: Vec<crate::db::ReactionFact> = payload
+        .get("reactions")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| {
+                    let target = value_to_string(r.get("target_message_id"))?;
+                    let reactor = value_to_string(r.get("reactor_id"))?;
+                    Some(crate::db::ReactionFact {
+                        target_remote_id: target,
+                        reactor_id: reactor,
+                        reactor_name: value_to_string(r.get("reactor_name")),
+                        emoji: r
+                            .get("emoji")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        at: parse_ts_opt(r.get("timestamp")).unwrap_or_else(Utc::now),
+                        from_me: r.get("from_me").and_then(|v| v.as_bool()).unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if facts.is_empty() {
+        return;
+    }
+    let alts = string_list(payload.get("alt_remote_ids"));
+    let history = payload
+        .get("history")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let out = match db.apply_reactions(account_id, &remote_id, &alts, &facts) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!("reaction: {e}");
+            return;
+        }
+    };
+    let Some(conversation_id) = out.conversation_id else {
+        return;
+    };
+    if out.changed_targets.is_empty() || (history && out.changed_targets.len() > 200) {
+        // Bulk history imports are picked up by the next message-list load.
+        return;
+    }
+    let updates = match db.reactions_for_targets(&conversation_id, &out.changed_targets) {
+        Ok(map) => out
+            .changed_targets
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "remote_id": t,
+                    "reactions": map.get(t).cloned().unwrap_or_default(),
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::warn!("reaction readback: {e}");
+            return;
+        }
+    };
+    let _ = event_tx.send(AppEvent {
+        kind: "message.reactions".into(),
+        payload: serde_json::json!({
+            "account_id": account_id,
+            "conversation_id": conversation_id,
+            "updates": updates,
+        }),
+    });
+}
+
+/// `poll.changed`: a vote, an edited question or an added option, folded into the poll message
+/// that already exists. Never creates a message, so a vote never lands in the thread as text.
+fn handle_poll_event(
+    db: &Database,
+    event_tx: &broadcast::Sender<AppEvent>,
+    account_id: &str,
+    payload: &serde_json::Value,
+) {
+    let remote = value_to_string(payload.get("remote_id"))
+        .or_else(|| value_to_string(payload.get("conversation_id")))
+        .unwrap_or_default();
+    let poll_id = value_to_string(payload.get("poll_id")).unwrap_or_default();
+    if remote.is_empty() || remote.starts_with("status@") || poll_id.is_empty() {
+        return;
+    }
+    let definition = payload
+        .get("poll")
+        .and_then(|v| serde_json::from_value::<crate::models::PollData>(v.clone()).ok())
+        .filter(|d| !d.question.trim().is_empty() || !d.options.is_empty());
+    let vote = payload.get("vote").map(|v| crate::db::PollVoteFact {
+        voter_id: value_to_string(v.get("voter_id")).unwrap_or_default(),
+        voter_name: value_to_string(v.get("voter_name")),
+        selected: string_list(v.get("selected")),
+    });
+    if definition.is_none() && vote.is_none() {
+        return;
+    }
+    let alts = string_list(payload.get("alt_remote_ids"));
+    let out = match db.apply_poll_change(
+        account_id,
+        &remote,
+        &alts,
+        &poll_id,
+        definition.as_ref(),
+        vote.as_ref(),
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!("poll.changed: {e}");
+            return;
+        }
+    };
+    if !out.changed {
+        if out.message.is_none() && out.conversation_id.is_some() {
+            tracing::debug!("poll.changed: poll message {poll_id} is not stored yet, dropping");
+        }
+        return;
+    }
+    let Some(conversation_id) = out.conversation_id else {
+        return;
+    };
+    if let Some(msg) = out.message {
+        let _ = event_tx.send(AppEvent {
+            kind: "message.updated".into(),
+            payload: serde_json::json!({
+                "account_id": account_id,
+                "conversation_id": conversation_id,
+                "message": msg,
+            }),
+        });
+    }
+    if let Some(conv) = out.conversation {
+        let _ = event_tx.send(AppEvent {
+            kind: "conversation.updated".into(),
+            payload: serde_json::json!({ "account_id": account_id, "conversation": conv }),
+        });
+    }
+}
+
+/// `message.changed`: a stored message was edited, deleted for everyone, or deleted for me.
+fn handle_message_change_event(
+    db: &Database,
+    event_tx: &broadcast::Sender<AppEvent>,
+    account_id: &str,
+    payload: &serde_json::Value,
+) {
+    let remote_id = value_to_string(payload.get("remote_id"))
+        .or_else(|| value_to_string(payload.get("conversation_id")))
+        .unwrap_or_default();
+    let target = value_to_string(payload.get("message_id")).unwrap_or_default();
+    if remote_id.is_empty() || remote_id.starts_with("status@") || target.is_empty() {
+        return;
+    }
+    let change: crate::db::MessageChange =
+        match serde_json::from_value(payload.get("change").cloned().unwrap_or_default()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("message.changed: {e}");
+                return;
+            }
+        };
+    let alts = string_list(payload.get("alt_remote_ids"));
+    match db.apply_message_change(account_id, &remote_id, &alts, &target, &change) {
+        Ok(out) => {
+            emit_send_reconcile(db, event_tx, account_id, out.message);
+            if let Some(conv) = out.conversation {
+                let _ = event_tx.send(AppEvent {
+                    kind: "conversation.updated".into(),
+                    payload: serde_json::json!({ "account_id": account_id, "conversation": conv }),
+                });
+            }
+        }
+        Err(e) => tracing::warn!("message.changed: {e}"),
+    }
+}
+
+fn handle_chat_read(
+    db: &Database,
+    event_tx: &broadcast::Sender<AppEvent>,
+    account_id: &str,
+    payload: &serde_json::Value,
+) {
+    let remote_id = value_to_string(payload.get("remote_id")).unwrap_or_default();
+    let Some(read_through) = parse_ts_opt(payload.get("read_through")) else {
+        return;
+    };
+    if remote_id.is_empty() || remote_id.starts_with("status@") {
+        return;
+    }
+    let alts = string_list(payload.get("alt_remote_ids"));
+    match db.apply_chat_read(account_id, &remote_id, &alts, read_through) {
+        Ok(out) => {
+            emit_merges(db, event_tx, account_id, &out.merged);
+            if out.changed && out.merged.is_empty() {
+                if let Some(conv) = out.conversation {
+                    let unread_total = db.total_unread().unwrap_or(0);
+                    let _ = event_tx.send(AppEvent {
+                        kind: "conversation.updated".into(),
+                        payload: serde_json::json!({
+                            "account_id": account_id,
+                            "conversation": conv,
+                            "unread_total": unread_total,
+                        }),
+                    });
+                }
+            }
+        }
+        Err(e) => tracing::warn!("chat.read: {e}"),
+    }
+}
+
+async fn handle_connector_event(
+    db: &Database,
+    config: &ConfigStore,
+    event_tx: &broadcast::Sender<AppEvent>,
+    event: &str,
+    account_id: &str,
+    payload: serde_json::Value,
+) {
+    match event {
+        "conversation.updated" => handle_conversation_event(db, event_tx, account_id, &payload),
+        "message.received" | "message.sent" => {
+            handle_message_event(db, config, event_tx, event, account_id, &payload)
+        }
+        "chat.read" => handle_chat_read(db, event_tx, account_id, &payload),
+        "reaction" => handle_reaction_event(db, event_tx, account_id, &payload),
+        "poll.changed" => handle_poll_event(db, event_tx, account_id, &payload),
+        "message.changed" => handle_message_change_event(db, event_tx, account_id, &payload),
         "inbox.catchup" => {
             let _ = event_tx.send(AppEvent {
                 kind: "inbox.catchup".into(),
@@ -1661,12 +2428,7 @@ async fn handle_connector_event(
         }
         "history.sync.completed" => {
             let _ = db.refresh_conversation_previews(account_id);
-            let _ = db.refresh_conversation_titles_from_contacts(account_id);
-            if let Ok(account) = db.get_account(account_id) {
-                if let Some(identity) = account.identity.as_deref() {
-                    let _ = db.fix_self_conversation_titles(account_id, identity);
-                }
-            }
+            let _ = db.refresh_titles(account_id);
             let _ = event_tx.send(AppEvent {
                 kind: "history.sync.completed".into(),
                 payload: serde_json::json!({ "account_id": account_id }),
@@ -1680,15 +2442,20 @@ async fn handle_connector_event(
             let mut patch = serde_json::Map::new();
             if let Some(data) = payload.get("avatar_data").and_then(|v| v.as_str()) {
                 if !data.is_empty() {
-                    patch.insert("avatar_data".into(), serde_json::Value::String(data.to_string()));
+                    patch.insert(
+                        "avatar_data".into(),
+                        serde_json::Value::String(data.to_string()),
+                    );
                 }
             }
             if patch.is_empty() {
                 return;
             }
-            if let Ok(Some(conv)) =
-                db.merge_conversation_metadata(account_id, &remote_id, &serde_json::Value::Object(patch))
-            {
+            if let Ok(Some(conv)) = db.merge_conversation_metadata(
+                account_id,
+                &remote_id,
+                &serde_json::Value::Object(patch),
+            ) {
                 let _ = event_tx.send(AppEvent {
                     kind: "avatar.updated".into(),
                     payload: serde_json::json!({
@@ -1704,7 +2471,10 @@ async fn handle_connector_event(
             let mut patch = serde_json::Map::new();
             if let Some(data) = payload.get("avatar_data").and_then(|v| v.as_str()) {
                 if !data.is_empty() {
-                    patch.insert("avatar_data".into(), serde_json::Value::String(data.to_string()));
+                    patch.insert(
+                        "avatar_data".into(),
+                        serde_json::Value::String(data.to_string()),
+                    );
                 }
             }
             if patch.is_empty() {
@@ -1734,7 +2504,11 @@ async fn handle_connector_event(
             }
             if let Some(path) = payload.get("media_path").and_then(|v| v.as_str()) {
                 if !path.is_empty() {
-                    patch.insert("media_path".into(), serde_json::Value::String(path.to_string()));
+                    patch.insert(
+                        "media_path".into(),
+                        serde_json::Value::String(path.to_string()),
+                    );
+                    patch.insert("media_error".into(), serde_json::Value::Null);
                 }
             }
             if let Some(data) = payload.get("media_data").cloned() {
@@ -1769,6 +2543,46 @@ async fn handle_connector_event(
                 });
             }
         }
+        "media.thumbnails" => {
+            // Previews the connector extracted for messages it already reported (facts only).
+            let mut touched = false;
+            for item in payload
+                .get("items")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let jid = value_to_string(item.get("conversation_id")).unwrap_or_default();
+                let message_id = value_to_string(item.get("message_id")).unwrap_or_default();
+                let path = item
+                    .get("thumbnail_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if message_id.is_empty() || path.is_empty() {
+                    continue;
+                }
+                let patch = serde_json::json!({ "thumbnail_path": path });
+                let hit = (!jid.is_empty())
+                    .then(|| {
+                        db.merge_message_metadata_by_remote(account_id, &jid, &message_id, &patch)
+                            .ok()
+                            .flatten()
+                    })
+                    .flatten()
+                    .or_else(|| {
+                        db.merge_message_metadata_by_remote_id(account_id, &message_id, &patch)
+                            .ok()
+                            .flatten()
+                    });
+                touched |= hit.is_some();
+            }
+            if touched {
+                let _ = event_tx.send(AppEvent {
+                    kind: "media.thumbnails".into(),
+                    payload: serde_json::json!({ "account_id": account_id }),
+                });
+            }
+        }
         "contacts.synced" => {
             if let Some(rows) = payload.get("contacts").and_then(|v| v.as_array()) {
                 for row in rows {
@@ -1780,10 +2594,11 @@ async fn handle_connector_event(
                     if remote_id.is_empty() || name.is_empty() {
                         continue;
                     }
-                    let _ = db.upsert_contact(account_id, &remote_id, name);
+                    let saved = row.get("saved").and_then(|v| v.as_bool());
+                    let _ = db.upsert_contact_flagged(account_id, &remote_id, name, saved);
                 }
             }
-            let _ = db.refresh_conversation_titles_from_contacts(account_id);
+            let _ = db.refresh_titles(account_id);
             let _ = event_tx.send(AppEvent {
                 kind: "contacts.synced".into(),
                 payload: serde_json::json!({ "account_id": account_id }),
@@ -1796,7 +2611,7 @@ async fn handle_connector_event(
         e if e.starts_with("call.") => {
             let _ = event_tx.send(AppEvent {
                 kind: e.to_string(),
-                payload: payload,
+                payload,
             });
         }
         _ => {
@@ -1818,10 +2633,7 @@ fn apply_forward_rules(db: &Database, conv: &Conversation, msg: &Message) {
         .as_deref()
         .or_else(|| account.as_ref().and_then(|a| a.workspace_id.as_deref()))
         .unwrap_or("default");
-    let already_forwarded = msg
-        .metadata
-        .get("forwarded_from")
-        .is_some();
+    let already_forwarded = msg.metadata.get("forwarded_from").is_some();
 
     for rule in rules {
         if !rule.enabled {
@@ -1830,7 +2642,10 @@ fn apply_forward_rules(db: &Database, conv: &Conversation, msg: &Message) {
         if rule.inbound_only && msg.direction != MessageDirection::Inbound {
             continue;
         }
-        if !rule.include_self && rule.dest_account_id == conv.account_id && rule.dest_conversation_id == conv.id {
+        if !rule.include_self
+            && rule.dest_account_id == conv.account_id
+            && rule.dest_conversation_id == conv.id
+        {
             continue;
         }
         if let Some(source_account_id) = &rule.source_account_id {
@@ -1881,7 +2696,8 @@ fn apply_forward_rules(db: &Database, conv: &Conversation, msg: &Message) {
             }
         }
 
-        let send_at = (Utc::now() + chrono::TimeDelta::seconds(rule.delay_seconds.max(0))).to_rfc3339();
+        let send_at =
+            (Utc::now() + chrono::TimeDelta::seconds(rule.delay_seconds.max(0))).to_rfc3339();
         let _ = db.schedule_message(&ScheduleMessageDraft {
             source_account_id: Some(conv.account_id.clone()),
             source_conversation_id: Some(conv.id.clone()),
@@ -1890,7 +2706,32 @@ fn apply_forward_rules(db: &Database, conv: &Conversation, msg: &Message) {
             dest_conversation_id: rule.dest_conversation_id.clone(),
             body,
             send_at,
+            forward: false,
         });
     }
 }
 
+#[cfg(test)]
+mod remote_id_tests {
+    use super::normalize_remote_id;
+
+    #[test]
+    fn typed_numbers_become_phone_jids() {
+        for raw in ["+974 8899 8899", "00974-8899-8899", " (974) 88998899 ", "97488998899"] {
+            assert_eq!(normalize_remote_id(raw).unwrap(), "97488998899@s.whatsapp.net", "{raw}");
+        }
+    }
+
+    #[test]
+    fn jids_pass_through() {
+        assert_eq!(normalize_remote_id("123@lid").unwrap(), "123@lid");
+        assert_eq!(normalize_remote_id("120363@g.us").unwrap(), "120363@g.us");
+    }
+
+    #[test]
+    fn implausible_numbers_are_rejected() {
+        for raw in ["", "abc", "12345", "1234567890123456", "+00"] {
+            assert!(normalize_remote_id(raw).is_err(), "{raw}");
+        }
+    }
+}

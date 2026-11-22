@@ -48,6 +48,16 @@ const GLOBAL_ALLOWED: &[&str] = &[
     "memory_avg_mb",
     "memory_p95_mb",
     "event",
+    "conversation_count_bucket",
+    "largest_account_message_bucket",
+    "sidecar_cpu_avg",
+    "sidecar_memory_avg_mb",
+    "sidecar_memory_p95_mb",
+    "sidecar_count",
+    "count",
+    "p50_ms",
+    "p95_ms",
+    "max_ms",
 ];
 
 pub fn sanitize_value(value: &Value) -> Value {
@@ -129,19 +139,14 @@ pub fn is_globally_allowed_key(key: &str) -> bool {
 
 fn value_contains_sensitive(value: &Value) -> bool {
     match value {
-        Value::String(s) => {
-            EMAIL.is_match(s) || PHONE.is_match(s) || looks_like_path_with_home(s)
-        }
+        Value::String(s) => EMAIL.is_match(s) || PHONE.is_match(s) || looks_like_path_with_home(s),
         Value::Object(map) => map.keys().any(|k| is_sensitive_key(k)),
         _ => false,
     }
 }
 
 fn looks_like_path_with_home(s: &str) -> bool {
-    s.contains("/home/")
-        || s.contains("\\Users\\")
-        || s.contains("/Users/")
-        || s.starts_with("~/")
+    s.contains("/home/") || s.contains("\\Users\\") || s.contains("/Users/") || s.starts_with("~/")
 }
 
 #[cfg(test)]

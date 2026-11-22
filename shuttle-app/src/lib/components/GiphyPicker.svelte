@@ -72,7 +72,7 @@
 
 <div class="giphy-picker">
   {#if !giphyConfigured()}
-    <p class="hint">Add <code>VITE_GIPHY_API_KEY</code> to enable Giphy search.</p>
+    <p class="hint">Add your Giphy API key in Settings to enable search.</p>
   {:else}
     <input
       type="search"
@@ -154,9 +154,5 @@
     color: var(--text-muted);
     text-align: center;
     padding: 12px 4px;
-  }
-
-  .hint code {
-    font-size: 11px;
   }
 </style>

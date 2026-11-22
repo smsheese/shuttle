@@ -1,7 +1,14 @@
 const CONV_SELECT: &str = "SELECT c.id, c.account_id, c.remote_id, c.contact_id, c.title, c.conversation_type,
         c.unread_count, c.last_message_at, c.last_message_preview, c.pinned, c.archived, c.muted, c.metadata,
-        c.workspace_id, c.priority_group, c.notes, c.notify_enabled, c.send_receipts
+        c.workspace_id, c.priority_group, c.notes, c.notify_enabled, c.send_receipts,
+        c.auto_download, c.last_message_from_me, c.last_message_sender_id, c.last_message_sender_name
  FROM conversations c";
+
+const ACCOUNT_SELECT: &str =
+    "SELECT id, connector_id, name, identity, status, metadata, created_at, updated_at,
+        disabled, muted, workspace_id, notify_enabled, send_receipts,
+        sleep_enabled, sleep_after_minutes, sleep_check_minutes, auto_download
+ FROM accounts";
 
 use crate::models::*;
 use chrono::{DateTime, Utc};
@@ -13,7 +20,20 @@ use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
+mod chat;
+mod notes;
+mod reactions;
+mod replies;
 mod schema;
+#[cfg(test)]
+mod tests;
+
+pub use chat::{
+    is_revoked, ConversationEvent, IngestKind, MergedAway, MessageChange, PollVoteFact,
+    SendReconcile,
+};
+pub use reactions::ReactionFact;
+pub use replies::ReplyTarget;
 
 #[derive(Error, Debug)]
 pub enum DbError {
@@ -44,7 +64,9 @@ impl Conn {
             }
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
+        )?;
         if inbox {
             schema::migrate_inbox(&conn)?;
         } else {
@@ -57,10 +79,15 @@ impl Conn {
 }
 
 /// Catalog of accounts plus one SQLite inbox file per account.
+/// Channels and status updates are feeds, not conversations needing a reply: the sidebar badges skip them.
+const BADGE_COUNTS: &str = "conversation_type != 'channel' AND remote_id NOT LIKE '%@newsletter' AND remote_id != 'status@broadcast'";
+
 pub struct Database {
     data_dir: PathBuf,
     catalog: Conn,
     inboxes: Mutex<HashMap<String, Arc<Conn>>>,
+    /// Conversation id -> account id, so hot paths need not scan every inbox.
+    conv_index: Mutex<HashMap<String, String>>,
 }
 
 impl Database {
@@ -77,12 +104,17 @@ impl Database {
             data_dir: data_dir.to_path_buf(),
             catalog,
             inboxes: Mutex::new(HashMap::new()),
+            conv_index: Mutex::new(HashMap::new()),
         };
         migrate_legacy(data_dir, &db.catalog)?;
         if let Ok(accounts) = db.list_accounts() {
             for account in accounts {
                 let _ = db.inbox(&account.id);
             }
+        }
+        // Old per-chat notes text becomes note items (retried on the next start on failure).
+        if let Err(e) = db.migrate_legacy_notes() {
+            tracing::warn!("migrate legacy chat notes: {e}");
         }
         Ok(db)
     }
@@ -141,10 +173,34 @@ impl Database {
         self.update_account_status(&tg.id, AccountStatus::Connected)?;
         let now = Utc::now().to_rfc3339();
         let seed = [
-            (&wa.id, "Sarah Chen", "Hey, are we still on for lunch tomorrow?", 2_i64, "direct"),
-            (&wa.id, "Design Team", "Alex: Updated the mockups in Figma", 5_i64, "group"),
-            (&tg.id, "Mom", "Don't forget to call grandma this weekend ❤️", 1_i64, "direct"),
-            (&tg.id, "Rust Developers", "New async patterns discussion thread", 12_i64, "group"),
+            (
+                &wa.id,
+                "Sarah Chen",
+                "Hey, are we still on for lunch tomorrow?",
+                2_i64,
+                "direct",
+            ),
+            (
+                &wa.id,
+                "Design Team",
+                "Alex: Updated the mockups in Figma",
+                5_i64,
+                "group",
+            ),
+            (
+                &tg.id,
+                "Mom",
+                "Don't forget to call grandma this weekend ❤️",
+                1_i64,
+                "direct",
+            ),
+            (
+                &tg.id,
+                "Rust Developers",
+                "New async patterns discussion thread",
+                12_i64,
+                "group",
+            ),
         ];
         for (account_id, title, preview, unread, ctype) in seed {
             let inbox = self.inbox(account_id)?;
@@ -167,32 +223,8 @@ impl Database {
 
     pub fn list_accounts(&self) -> Result<Vec<Account>, DbError> {
         let conn = self.catalog.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, connector_id, name, identity, status, metadata, created_at, updated_at,
-                    disabled, muted, workspace_id, notify_enabled, send_receipts,
-                    sleep_enabled, sleep_after_minutes, sleep_check_minutes
-             FROM accounts ORDER BY name",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(Account {
-                id: row.get(0)?,
-                connector_id: row.get(1)?,
-                name: row.get(2)?,
-                identity: row.get(3)?,
-                status: parse_account_status(&row.get::<_, String>(4)?),
-                metadata: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                created_at: row.get::<_, String>(6)?.parse().unwrap_or_else(|_| Utc::now()),
-                updated_at: row.get::<_, String>(7)?.parse().unwrap_or_else(|_| Utc::now()),
-                disabled: row.get::<_, i64>(8)? != 0,
-                muted: row.get::<_, i64>(9)? != 0,
-                workspace_id: row.get(10)?,
-                notify_enabled: opt_bool(row.get(11)?),
-                send_receipts: row.get::<_, i64>(12)? != 0,
-                sleep_enabled: opt_bool(row.get(13)?),
-                sleep_after_minutes: opt_u32(row.get(14)?),
-                sleep_check_minutes: opt_u32(row.get(15)?),
-            })
-        })?;
+        let mut stmt = conn.prepare(&format!("{ACCOUNT_SELECT} ORDER BY name"))?;
+        let rows = stmt.query_map([], map_account_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
     }
 
@@ -225,6 +257,7 @@ impl Database {
             sleep_enabled: None,
             sleep_after_minutes: None,
             sleep_check_minutes: None,
+            auto_download: AutoDownloadPrefs::default(),
         })
     }
 
@@ -284,6 +317,7 @@ impl Database {
             let conn = self.catalog.conn.lock();
             conn.execute("DELETE FROM chat_todos WHERE account_id = ?1", params![id])?;
             conn.execute("DELETE FROM reminders WHERE account_id = ?1", params![id])?;
+            conn.execute("DELETE FROM chat_notes WHERE account_id = ?1", params![id])?;
             conn.execute(
                 "DELETE FROM scheduled_messages WHERE dest_account_id = ?1 OR source_account_id = ?1",
                 params![id],
@@ -299,6 +333,7 @@ impl Database {
             }
         }
         self.inboxes.lock().remove(id);
+        self.conv_index.lock().retain(|_, account| account != id);
         let dir = self.data_dir.join("accounts").join(id);
         if dir.exists() {
             std::fs::remove_dir_all(dir)?;
@@ -306,92 +341,52 @@ impl Database {
         Ok(())
     }
 
-    pub fn list_conversations(
-        &self,
-        account_id: Option<&str>,
-        workspace_id: Option<&str>,
-        priority_group: Option<&str>,
-        archived_only: bool,
-        offset: i64,
-        limit: i64,
-    ) -> Result<Vec<Conversation>, DbError> {
-        let all = self.filtered_conversations(
-            account_id,
-            workspace_id,
-            priority_group,
-            archived_only,
-        )?;
-        let off = offset.max(0) as usize;
-        let lim = limit.max(1) as usize;
-        Ok(all.into_iter().skip(off).take(lim).collect())
-    }
-
-    pub fn count_conversations(
-        &self,
-        account_id: Option<&str>,
-        workspace_id: Option<&str>,
-        priority_group: Option<&str>,
-        archived_only: bool,
-    ) -> Result<i64, DbError> {
-        let all = self.filtered_conversations(
-            account_id,
-            workspace_id,
-            priority_group,
-            archived_only,
-        )?;
-        Ok(all.len() as i64)
-    }
-
-    fn filtered_conversations(
-        &self,
-        account_id: Option<&str>,
-        workspace_id: Option<&str>,
-        priority_group: Option<&str>,
-        archived_only: bool,
-    ) -> Result<Vec<Conversation>, DbError> {
-        let accounts = self.list_accounts()?;
-        let mut all = if let Some(aid) = account_id {
-            let inbox = self.inbox(aid)?;
-            let conn = inbox.conn.lock();
-            list_conversations_in(&conn, Some(aid), archived_only)?
-        } else {
-            self.for_each_inbox(|aid, inbox| {
-                let conn = inbox.conn.lock();
-                list_conversations_in(&conn, Some(aid), archived_only)
-            })?
-        };
-        all.retain(|c| {
-            let rid = c.remote_id.to_lowercase();
-            !rid.starts_with("status@")
-        });
-        if let Some(ws) = workspace_id {
-            all.retain(|c| {
-                let acct = accounts.iter().find(|a| a.id == c.account_id);
-                effective_workspace(c, acct) == ws
-            });
-        }
-        if let Some(pg) = priority_group {
-            all.retain(|c| c.priority_group.as_deref() == Some(pg));
-        }
-        all.sort_by(|a, b| compare_conversations(a, b));
-        Ok(all)
-    }
-
     pub fn get_conversation(&self, id: &str) -> Result<Conversation, DbError> {
-        let accounts = self.list_accounts()?;
-        for account in accounts {
+        let cached = self.conv_index.lock().get(id).cloned();
+        if let Some(account_id) = cached {
+            if let Ok(inbox) = self.inbox(&account_id) {
+                let found = get_conversation_locked(&inbox.conn.lock(), id);
+                if let Ok(conv) = found {
+                    return Ok(conv);
+                }
+            }
+            self.conv_index.lock().remove(id);
+        }
+        for account in self.list_accounts()? {
             let inbox = self.inbox(&account.id)?;
-            let conn = inbox.conn.lock();
-            if let Ok(conv) = get_conversation_locked(&conn, id) {
+            let found = get_conversation_locked(&inbox.conn.lock(), id);
+            if let Ok(conv) = found {
+                self.remember_conversation(id, &account.id);
                 return Ok(conv);
             }
         }
         Err(DbError::NotFound(id.to_string()))
     }
 
-    pub fn list_messages(&self, conversation_id: &str, limit: i64) -> Result<Vec<Message>, DbError> {
-        let conv = self.get_conversation(conversation_id)?;
-        let inbox = self.inbox(&conv.account_id)?;
+    /// Account that owns a conversation, without loading the row when it is already known.
+    pub fn conversation_account(&self, id: &str) -> Result<String, DbError> {
+        if let Some(account_id) = self.conv_index.lock().get(id).cloned() {
+            return Ok(account_id);
+        }
+        Ok(self.get_conversation(id)?.account_id)
+    }
+
+    fn remember_conversation(&self, id: &str, account_id: &str) {
+        self.conv_index
+            .lock()
+            .insert(id.to_string(), account_id.to_string());
+    }
+
+    fn forget_conversation(&self, id: &str) {
+        self.conv_index.lock().remove(id);
+    }
+    pub fn list_messages(
+        &self,
+        conversation_id: &str,
+        limit: i64,
+    ) -> Result<Vec<Message>, DbError> {
+        let account_id = self.conversation_account(conversation_id)?;
+        let inbox = self.inbox(&account_id)?;
         let conn = inbox.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, conversation_id, remote_id, sender_id, sender_name, direction, body, timestamp, status, metadata, starred, pinned
@@ -402,6 +397,15 @@ impl Database {
             .query_map(params![conversation_id, limit], map_message_row)?
             .collect::<Result<Vec<_>, _>>()?;
         rows.reverse();
+        let mut reactions = reactions::reactions_by_target(&conn, conversation_id)?;
+        if !reactions.is_empty() {
+            for m in &mut rows {
+                if let Some(groups) = m.remote_id.as_ref().and_then(|rid| reactions.remove(rid)) {
+                    m.reactions = groups;
+                }
+            }
+        }
+        replies::resolve_in_conversation(&conn, conversation_id, &mut rows)?;
         Ok(rows)
     }
 
@@ -433,8 +437,8 @@ impl Database {
         kind: &str,
         limit: i64,
     ) -> Result<Vec<Message>, DbError> {
-        let conv = self.get_conversation(conversation_id)?;
-        let inbox = self.inbox(&conv.account_id)?;
+        let account_id = self.conversation_account(conversation_id)?;
+        let inbox = self.inbox(&account_id)?;
         let conn = inbox.conn.lock();
         let sql = match kind {
             "media" => "SELECT id, conversation_id, remote_id, sender_id, sender_name, direction, body, timestamp, status, metadata, starred, pinned
@@ -493,7 +497,8 @@ impl Database {
 
         match scope {
             SearchScope::Conversation => {
-                let cid = conversation_id.ok_or_else(|| DbError::InvalidInput("conversation_id required".into()))?;
+                let cid = conversation_id
+                    .ok_or_else(|| DbError::InvalidInput("conversation_id required".into()))?;
                 let conv = self.get_conversation(cid)?;
                 let inbox = self.inbox(&conv.account_id)?;
                 let conn = inbox.conn.lock();
@@ -516,13 +521,15 @@ impl Database {
                 }
             }
             SearchScope::Account => {
-                let aid = account_id.ok_or_else(|| DbError::InvalidInput("account_id required".into()))?;
+                let aid = account_id
+                    .ok_or_else(|| DbError::InvalidInput("account_id required".into()))?;
                 let inbox = self.inbox(aid)?;
                 let conn = inbox.conn.lock();
                 let mut stmt = conn.prepare(
                     "SELECT DISTINCT c.id, c.account_id, c.remote_id, c.contact_id, c.title, c.conversation_type,
                             c.unread_count, c.last_message_at, c.last_message_preview, c.pinned, c.archived, c.muted, c.metadata,
-                            c.workspace_id, c.priority_group, c.notes, c.notify_enabled, c.send_receipts
+                            c.workspace_id, c.priority_group, c.notes, c.notify_enabled, c.send_receipts,
+                            c.auto_download, c.last_message_from_me, c.last_message_sender_id, c.last_message_sender_name
                      FROM conversations c
                      LEFT JOIN messages m ON m.conversation_id = c.id
                      WHERE c.account_id = ?1 AND (c.title LIKE ?2 OR m.body LIKE ?2 OR m.sender_name LIKE ?2)
@@ -550,11 +557,15 @@ impl Database {
                             sender_name: row.get(4)?,
                             direction: parse_direction(&row.get::<_, String>(5)?),
                             body: row.get(6)?,
-                            timestamp: parse_stored_datetime(&row.get::<_, String>(7)?).unwrap_or_else(Utc::now),
+                            timestamp: parse_stored_datetime(&row.get::<_, String>(7)?)
+                                .unwrap_or_else(Utc::now),
                             status: parse_message_status(&row.get::<_, String>(8)?),
-                            metadata: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
+                            metadata: serde_json::from_str(&row.get::<_, String>(9)?)
+                                .unwrap_or_default(),
                             starred: row.get::<_, i64>(10)? != 0,
                             pinned: row.get::<_, i64>(11)? != 0,
+                            reactions: Vec::new(),
+                            reply: None,
                         },
                         conversation_title: row.get(12)?,
                         account_id: row.get(13)?,
@@ -589,6 +600,8 @@ impl Database {
                                 metadata: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
                                 starred: row.get::<_, i64>(10)? != 0,
                                 pinned: row.get::<_, i64>(11)? != 0,
+                                reactions: Vec::new(),
+                                reply: None,
                             },
                             conversation_title: row.get(12)?,
                             account_id: aid.to_string(),
@@ -607,183 +620,6 @@ impl Database {
         })
     }
 
-    pub fn insert_message(&self, msg: &Message) -> Result<bool, DbError> {
-        let conv = self.get_conversation(&msg.conversation_id)?;
-        let inbox = self.inbox(&conv.account_id)?;
-        let conn = inbox.conn.lock();
-        conn.execute(
-            "INSERT OR IGNORE INTO messages (id, conversation_id, remote_id, sender_id, sender_name, direction, body, timestamp, status, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                msg.id,
-                msg.conversation_id,
-                msg.remote_id,
-                msg.sender_id,
-                msg.sender_name,
-                direction_str(&msg.direction),
-                msg.body,
-                msg.timestamp.to_rfc3339(),
-                message_status_str(&msg.status),
-                msg.metadata.to_string(),
-            ],
-        )?;
-        let inserted = conn.changes() > 0;
-        let preview = message_preview(&msg.body, &msg.metadata);
-        let ts = msg.timestamp.to_rfc3339();
-        let advance = conv
-            .last_message_at
-            .map(|existing| msg.timestamp >= existing)
-            .unwrap_or(true);
-        if inserted || msg.remote_id.is_some() {
-            if inserted && !advance {
-                // Keep a newer chat-list timestamp (GOWA often knows recency before the body lands).
-            } else if advance {
-                conn.execute(
-                    "UPDATE conversations SET last_message_preview = ?1, last_message_at = ?2, updated_at = ?2 WHERE id = ?3",
-                    params![preview, ts, msg.conversation_id],
-                )?;
-            }
-            if !inserted {
-                if let Some(remote) = &msg.remote_id {
-                    merge_message_metadata_locked(&conn, &msg.conversation_id, remote, &msg.metadata)?;
-                }
-            }
-        }
-        Ok(inserted)
-    }
-
-    pub fn refresh_conversation_previews(&self, account_id: &str) -> Result<(), DbError> {
-        let inbox = self.inbox(account_id)?;
-        let conn = inbox.conn.lock();
-        let mut stmt = conn.prepare("SELECT id FROM conversations WHERE account_id = ?1")?;
-        let ids = stmt
-            .query_map(params![account_id], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
-        for id in ids {
-            let mut msg_stmt = conn.prepare(
-                "SELECT body, timestamp, metadata FROM messages WHERE conversation_id = ?1
-                 ORDER BY timestamp DESC LIMIT 1",
-            )?;
-            let row = msg_stmt
-                .query_row(params![&id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })
-                .optional()?;
-            if let Some((body, ts, meta_raw)) = row {
-                let meta: serde_json::Value =
-                    serde_json::from_str(&meta_raw).unwrap_or_else(|_| serde_json::json!({}));
-                let preview = message_preview(&body, &meta);
-                let existing: Option<String> = conn.query_row(
-                    "SELECT last_message_at FROM conversations WHERE id = ?1",
-                    params![&id],
-                    |row| row.get(0),
-                )?;
-                let msg_dt = parse_stored_datetime(&ts);
-                let existing_dt = existing.as_deref().and_then(parse_stored_datetime);
-                let advance = match (existing_dt, msg_dt) {
-                    (None, _) => true,
-                    (_, None) => false,
-                    (Some(ex), Some(incoming)) => incoming >= ex,
-                };
-                if advance {
-                    conn.execute(
-                        "UPDATE conversations SET last_message_at = ?1, last_message_preview = ?2, updated_at = ?1 WHERE id = ?3",
-                        params![ts, preview, id],
-                    )?;
-                } else {
-                    conn.execute(
-                        "UPDATE conversations SET last_message_preview = COALESCE(last_message_preview, ?1) WHERE id = ?2",
-                        params![preview, id],
-                    )?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn upsert_conversation(
-        &self,
-        account_id: &str,
-        remote_id: &str,
-        title: &str,
-        conversation_type: ConversationType,
-        last_message_at: Option<&str>,
-        preview: Option<&str>,
-        archived: Option<bool>,
-        pinned: Option<bool>,
-        force_recency: bool,
-        replace_title: bool,
-    ) -> Result<Conversation, DbError> {
-        let inbox = self.inbox(account_id)?;
-        let conn = inbox.conn.lock();
-        if let Some(existing) = get_conversation_by_remote_locked(&conn, account_id, remote_id)? {
-            let now = Utc::now().to_rfc3339();
-            let last_message_at = normalize_stored_ts(last_message_at);
-            let force = if force_recency { 1 } else { 0 };
-            let stored_title =
-                pick_conversation_title(&existing.title, title, remote_id, replace_title);
-            conn.execute(
-                "UPDATE conversations SET title = ?1,
-                 last_message_preview = CASE
-                    WHEN ?8 = 1 AND ?3 IS NOT NULL THEN ?3
-                    WHEN ?3 IS NULL THEN last_message_preview
-                    WHEN last_message_preview IS NULL THEN ?3
-                    WHEN last_message_at IS NULL OR last_message_at LIKE '0001-%' OR (?2 IS NOT NULL AND last_message_at < ?2) THEN ?3
-                    ELSE last_message_preview
-                 END,
-                 last_message_at = CASE
-                    WHEN ?8 = 1 AND ?2 IS NOT NULL THEN ?2
-                    WHEN ?2 IS NULL THEN last_message_at
-                    WHEN last_message_at IS NULL OR last_message_at LIKE '0001-%' OR last_message_at < ?2 THEN ?2
-                    ELSE last_message_at
-                 END,
-                 archived = COALESCE(?4, archived),
-                 pinned = COALESCE(?5, pinned),
-                 updated_at = ?6
-                 WHERE id = ?7",
-                params![
-                    stored_title,
-                    last_message_at,
-                    preview,
-                    archived.map(|v| if v { 1 } else { 0 }),
-                    pinned.map(|v| if v { 1 } else { 0 }),
-                    now,
-                    existing.id,
-                    force,
-                ],
-            )?;
-            return get_conversation_locked(&conn, &existing.id);
-        }
-        let id = Uuid::new_v4().to_string();
-        let ctype = match conversation_type {
-            ConversationType::Group => "group",
-            ConversationType::Channel => "channel",
-            ConversationType::Direct => "direct",
-        };
-        conn.execute(
-            "INSERT INTO conversations (id, account_id, remote_id, title, conversation_type, unread_count,
-             last_message_at, last_message_preview, pinned, archived, muted, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, 0, '{}')",
-            params![
-                id,
-                account_id,
-                remote_id,
-                title,
-                ctype,
-                normalize_stored_ts(last_message_at),
-                preview,
-                if pinned.unwrap_or(false) { 1 } else { 0 },
-                if archived.unwrap_or(false) { 1 } else { 0 }
-            ],
-        )?;
-        get_conversation_locked(&conn, &id)
-    }
-
     pub fn get_conversation_by_remote(
         &self,
         account_id: &str,
@@ -794,9 +630,46 @@ impl Database {
         get_conversation_by_remote_locked(&conn, account_id, remote_id)
     }
 
+    /// A group member as a contact: their direct chat on this account (by JID or a recorded
+    /// alias) and their address-book entry. Reads only; it never creates a chat.
+    pub fn sender_contact(
+        &self,
+        account_id: &str,
+        sender_id: &str,
+    ) -> Result<SenderContact, DbError> {
+        let inbox = self.inbox(account_id)?;
+        let conn = inbox.conn.lock();
+        let conversation_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM conversations
+                 WHERE account_id = ?1 AND conversation_type = 'direct' AND (remote_id = ?2
+                   OR EXISTS (SELECT 1 FROM json_each(conversations.metadata, '$.alt_remote_ids')
+                              WHERE value = ?2))
+                 ORDER BY remote_id = ?2 DESC LIMIT 1",
+                params![account_id, sender_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let conversation = conversation_id
+            .map(|id| get_conversation_locked(&conn, &id))
+            .transpose()?;
+        let contact = conn
+            .query_row(
+                "SELECT id, account_id, remote_id, display_name, avatar_url, metadata
+                 FROM contacts WHERE account_id = ?1 AND remote_id = ?2",
+                params![account_id, sender_id],
+                map_contact_row,
+            )
+            .optional()?;
+        Ok(SenderContact {
+            conversation,
+            contact,
+        })
+    }
+
     pub fn get_message(&self, conversation_id: &str, message_id: &str) -> Result<Message, DbError> {
-        let conv = self.get_conversation(conversation_id)?;
-        let inbox = self.inbox(&conv.account_id)?;
+        let account_id = self.conversation_account(conversation_id)?;
+        let inbox = self.inbox(&account_id)?;
         let conn = inbox.conn.lock();
         get_message_locked(&conn, conversation_id, message_id)
     }
@@ -809,7 +682,8 @@ impl Database {
     ) -> Result<Option<Conversation>, DbError> {
         let inbox = self.inbox(account_id)?;
         let conn = inbox.conn.lock();
-        let Some(existing) = get_conversation_by_remote_locked(&conn, account_id, remote_id)? else {
+        let Some(existing) = get_conversation_by_remote_locked(&conn, account_id, remote_id)?
+        else {
             return Ok(None);
         };
         let merged = merge_json_objects(existing.metadata.clone(), patch.clone());
@@ -829,7 +703,9 @@ impl Database {
     ) -> Result<Option<Message>, DbError> {
         let inbox = self.inbox(account_id)?;
         let conn = inbox.conn.lock();
-        let Some(conv) = get_conversation_by_remote_locked(&conn, account_id, conversation_remote_id)? else {
+        let Some(conv) =
+            get_conversation_by_remote_locked(&conn, account_id, conversation_remote_id)?
+        else {
             return Ok(None);
         };
         merge_message_metadata_locked(&conn, &conv.id, message_remote_id, patch)?;
@@ -837,9 +713,13 @@ impl Database {
             "SELECT id, conversation_id, remote_id, sender_id, sender_name, direction, body, timestamp, status, metadata
              FROM messages WHERE conversation_id = ?1 AND remote_id = ?2 LIMIT 1",
         )?;
-        stmt.query_row(params![conv.id, message_remote_id], map_message_row)
-            .optional()
-            .map_err(DbError::from)
+        let mut msg = stmt
+            .query_row(params![conv.id, message_remote_id], map_message_row)
+            .optional()?;
+        if let Some(m) = msg.as_mut() {
+            replies::resolve_in_conversation(&conn, &conv.id, std::slice::from_mut(m))?;
+        }
+        Ok(msg)
     }
 
     pub fn merge_message_metadata_by_remote_id(
@@ -867,9 +747,13 @@ impl Database {
             "SELECT id, conversation_id, remote_id, sender_id, sender_name, direction, body, timestamp, status, metadata
              FROM messages WHERE conversation_id = ?1 AND remote_id = ?2 LIMIT 1",
         )?;
-        stmt.query_row(params![conversation_id, message_remote_id], map_message_row)
-            .optional()
-            .map_err(DbError::from)
+        let mut msg = stmt
+            .query_row(params![conversation_id, message_remote_id], map_message_row)
+            .optional()?;
+        if let Some(m) = msg.as_mut() {
+            replies::resolve_in_conversation(&conn, &conversation_id, std::slice::from_mut(m))?;
+        }
+        Ok(msg)
     }
 
     pub fn mark_message_media_error(
@@ -878,8 +762,8 @@ impl Database {
         message_id: &str,
         error: &str,
     ) -> Result<Option<Message>, DbError> {
-        let conv = self.get_conversation(conversation_id)?;
-        let inbox = self.inbox(&conv.account_id)?;
+        let account_id = self.conversation_account(conversation_id)?;
+        let inbox = self.inbox(&account_id)?;
         let conn = inbox.conn.lock();
         let existing: Option<String> = conn
             .query_row(
@@ -905,14 +789,59 @@ impl Database {
         }
     }
 
+    /// Forget cached files that retention just deleted: every message whose `media_path` is one
+    /// of `purged` loses it, so the UI shows the thumbnail and a download button again (the
+    /// message itself and its network copy are untouched). Returns, per account, how many
+    /// messages were reset.
+    pub fn clear_media_paths(
+        &self,
+        purged: &std::collections::HashSet<String>,
+    ) -> Result<Vec<(String, u64)>, DbError> {
+        if purged.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.for_each_inbox(|account_id, inbox| {
+            let conn = inbox.conn.lock();
+            let ids: Vec<String> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id, json_extract(metadata, '$.media_path') FROM messages
+                     WHERE json_extract(metadata, '$.media_path') IS NOT NULL",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                })?;
+                let mut ids = Vec::new();
+                for row in rows {
+                    let (id, path) = row?;
+                    if path.is_some_and(|p| purged.contains(&p)) {
+                        ids.push(id);
+                    }
+                }
+                ids
+            };
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let tx = conn.unchecked_transaction()?;
+            for id in &ids {
+                tx.execute(
+                    "UPDATE messages SET metadata = json_remove(metadata, '$.media_path') WHERE id = ?1",
+                    params![id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(vec![(account_id.to_string(), ids.len() as u64)])
+        })
+    }
+
     pub fn update_message_status(
         &self,
         conversation_id: &str,
         message_id: &str,
         status: MessageStatus,
     ) -> Result<(), DbError> {
-        let conv = self.get_conversation(conversation_id)?;
-        let inbox = self.inbox(&conv.account_id)?;
+        let account_id = self.conversation_account(conversation_id)?;
+        let inbox = self.inbox(&account_id)?;
         let conn = inbox.conn.lock();
         conn.execute(
             "UPDATE messages SET status = ?1 WHERE id = ?2 AND conversation_id = ?3",
@@ -927,14 +856,33 @@ impl Database {
         remote_id: &str,
         display_name: &str,
     ) -> Result<Contact, DbError> {
+        self.upsert_contact_flagged(account_id, remote_id, display_name, None)
+    }
+
+    /// `saved` is the connector's fact: the name comes from the address book (true) or only from
+    /// a push name seen in a group (false). `None` leaves the stored flag untouched.
+    pub fn upsert_contact_flagged(
+        &self,
+        account_id: &str,
+        remote_id: &str,
+        display_name: &str,
+        saved: Option<bool>,
+    ) -> Result<Contact, DbError> {
         let inbox = self.inbox(account_id)?;
         let conn = inbox.conn.lock();
         let id = Uuid::new_v4().to_string();
+        let meta = match saved {
+            Some(v) => serde_json::json!({ "saved": v }).to_string(),
+            None => "{}".to_string(),
+        };
         conn.execute(
             "INSERT INTO contacts (id, account_id, remote_id, display_name, avatar_url, metadata)
-             VALUES (?1, ?2, ?3, ?4, NULL, '{}')
-             ON CONFLICT(account_id, remote_id) DO UPDATE SET display_name = excluded.display_name",
-            params![id, account_id, remote_id, display_name],
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5)
+             ON CONFLICT(account_id, remote_id) DO UPDATE SET display_name = excluded.display_name,
+               metadata = CASE WHEN ?6 THEN json_set(contacts.metadata, '$.saved', json(CASE WHEN ?7 THEN 'true' ELSE 'false' END)) ELSE contacts.metadata END
+             WHERE contacts.display_name != excluded.display_name
+                OR (?6 AND json_extract(contacts.metadata, '$.saved') IS NOT ?7)",
+            params![id, account_id, remote_id, display_name, meta, saved.is_some(), saved.unwrap_or(true) as i64],
         )?;
         let mut stmt = conn.prepare(
             "SELECT id, account_id, remote_id, display_name, avatar_url, metadata
@@ -944,99 +892,37 @@ impl Database {
             .map_err(DbError::from)
     }
 
-    /// Replace placeholder (and stale) conversation titles with saved contact names.
-    pub fn refresh_conversation_titles_from_contacts(&self, account_id: &str) -> Result<(), DbError> {
-        let contacts = self.list_contacts(account_id)?;
-        let inbox = self.inbox(account_id)?;
-        let conn = inbox.conn.lock();
-        for contact in contacts {
-            let name = contact.display_name.trim();
-            if name.is_empty() || is_placeholder_title(name, &contact.remote_id) {
-                continue;
-            }
-            if let Some(conv) =
-                get_conversation_by_remote_locked(&conn, account_id, &contact.remote_id)?
-            {
-                // Always prefer the address book for 1:1 chats — WhatsApp Business
-                // accounts often leak their own brand into other conversation titles.
-                if conv.title != name {
-                    conn.execute(
-                        "UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3",
-                        params![name, Utc::now().to_rfc3339(), conv.id],
-                    )?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn fix_self_conversation_titles(&self, account_id: &str, identity: &str) -> Result<(), DbError> {
-        let contacts = self.list_contacts(account_id)?;
-        let inbox = self.inbox(account_id)?;
-        let conn = inbox.conn.lock();
-        let mut stmt = conn.prepare("SELECT id, remote_id, title FROM conversations WHERE account_id = ?1")?;
-        let rows = stmt.query_map(params![account_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (id, remote_id, title) = row?;
-            if !crate::media_store::jids_same(&remote_id, identity) {
-                continue;
-            }
-            if title.ends_with("(You)") {
-                continue;
-            }
-            let new_title = contacts
-                .iter()
-                .find(|c| crate::media_store::jids_same(&c.remote_id, &remote_id))
-                .map(|c| format!("{} (You)", c.display_name))
-                .unwrap_or_else(|| "Message yourself".to_string());
-            conn.execute(
-                "UPDATE conversations SET title = ?1 WHERE id = ?2",
-                params![new_title, id],
-            )?;
-        }
-        Ok(())
-    }
-
+    /// Address-book rows for the New chat picker. Each row also carries two derived facts in
+    /// `metadata`: `has_chat` (a direct chat with it exists) and, from that chat, `avatar_url`.
     pub fn list_contacts(&self, account_id: &str) -> Result<Vec<Contact>, DbError> {
         let inbox = self.inbox(account_id)?;
         let conn = inbox.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, account_id, remote_id, display_name, avatar_url, metadata
-             FROM contacts WHERE account_id = ?1 ORDER BY display_name COLLATE NOCASE ASC",
+            "SELECT k.id, k.account_id, k.remote_id, k.display_name,
+                    COALESCE(k.avatar_url, json_extract(c.metadata, '$.avatar_data')), k.metadata,
+                    c.id IS NOT NULL
+             FROM contacts k
+             LEFT JOIN conversations c ON c.account_id = k.account_id AND c.remote_id = k.remote_id
+                  AND c.conversation_type = 'direct'
+             WHERE k.account_id = ?1 AND k.remote_id NOT LIKE 'status@%'
+             ORDER BY k.display_name COLLATE NOCASE ASC",
         )?;
-        let rows = stmt.query_map(params![account_id], map_contact_row)?;
+        let rows = stmt.query_map(params![account_id], |row| {
+            let mut contact = map_contact_row(row)?;
+            let has_chat: bool = row.get(6)?;
+            if let Some(map) = contact.metadata.as_object_mut() {
+                map.insert("has_chat".into(), serde_json::Value::Bool(has_chat));
+            } else {
+                contact.metadata = serde_json::json!({ "has_chat": has_chat });
+            }
+            Ok(contact)
+        })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
     }
 
-    pub fn increment_unread(&self, conversation_id: &str) -> Result<(), DbError> {
-        let conv = self.get_conversation(conversation_id)?;
-        let inbox = self.inbox(&conv.account_id)?;
-        inbox.conn.lock().execute(
-            "UPDATE conversations SET unread_count = unread_count + 1 WHERE id = ?1",
-            params![conversation_id],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_unread_count(&self, conversation_id: &str, count: i64) -> Result<(), DbError> {
-        let conv = self.get_conversation(conversation_id)?;
-        let inbox = self.inbox(&conv.account_id)?;
-        inbox.conn.lock().execute(
-            "UPDATE conversations SET unread_count = ?1 WHERE id = ?2",
-            params![count.max(0), conversation_id],
-        )?;
-        Ok(())
-    }
-
     pub fn last_inbound_remote_id(&self, conversation_id: &str) -> Result<Option<String>, DbError> {
-        let conv = self.get_conversation(conversation_id)?;
-        let inbox = self.inbox(&conv.account_id)?;
+        let account_id = self.conversation_account(conversation_id)?;
+        let inbox = self.inbox(&account_id)?;
         let conn = inbox.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT remote_id FROM messages WHERE conversation_id = ?1 AND direction = 'inbound' AND remote_id IS NOT NULL
@@ -1047,16 +933,6 @@ impl Database {
             .map_err(DbError::from)
     }
 
-    pub fn mark_conversation_read(&self, conversation_id: &str) -> Result<(), DbError> {
-        let conv = self.get_conversation(conversation_id)?;
-        let inbox = self.inbox(&conv.account_id)?;
-        inbox.conn.lock().execute(
-            "UPDATE conversations SET unread_count = 0 WHERE id = ?1",
-            params![conversation_id],
-        )?;
-        Ok(())
-    }
-
     pub fn search(&self, query: &str) -> Result<Vec<Conversation>, DbError> {
         let pattern = format!("%{query}%");
         let mut all = self.for_each_inbox(|_aid, inbox| {
@@ -1064,7 +940,8 @@ impl Database {
             let mut stmt = conn.prepare(
                 "SELECT DISTINCT c.id, c.account_id, c.remote_id, c.contact_id, c.title, c.conversation_type,
                         c.unread_count, c.last_message_at, c.last_message_preview, c.pinned, c.archived, c.muted, c.metadata,
-                        c.workspace_id, c.priority_group, c.notes, c.notify_enabled, c.send_receipts
+                        c.workspace_id, c.priority_group, c.notes, c.notify_enabled, c.send_receipts,
+                        c.auto_download, c.last_message_from_me, c.last_message_sender_id, c.last_message_sender_name
                  FROM conversations c
                  LEFT JOIN messages m ON m.conversation_id = c.id
                  WHERE c.title LIKE ?1 OR m.body LIKE ?1
@@ -1086,7 +963,7 @@ impl Database {
             }
             let inbox = self.inbox(&account.id)?;
             let count: i64 = inbox.conn.lock().query_row(
-                "SELECT COALESCE(SUM(unread_count), 0) FROM conversations WHERE archived = 0 AND muted = 0",
+                &format!("SELECT COALESCE(SUM(unread_count), 0) FROM conversations WHERE archived = 0 AND muted = 0 AND {BADGE_COUNTS}"),
                 [],
                 |r| r.get(0),
             )?;
@@ -1095,16 +972,54 @@ impl Database {
         Ok(total)
     }
 
+    pub fn self_avatar(&self, account: &Account) -> Result<Option<String>, DbError> {
+        let inbox = self.inbox(&account.id)?;
+        let conn = inbox.conn.lock();
+        let identity = account.identity.as_deref().unwrap_or("").split('@').next().unwrap_or("");
+        let avatar = conn.query_row(
+            "SELECT json_extract(metadata, '$.avatar_data') FROM conversations WHERE (json_extract(metadata, '$.is_self') = 1 OR (?1 != '' AND remote_id = ?1 || '@s.whatsapp.net')) AND json_extract(metadata, '$.avatar_data') IS NOT NULL LIMIT 1",
+            params![identity], |row| row.get::<_, String>(0),
+        ).optional()?;
+        Ok(avatar)
+    }
+
+    pub fn unread_by_account(&self) -> Result<std::collections::HashMap<String, i64>, DbError> {
+        let mut totals = std::collections::HashMap::new();
+        for account in self.list_accounts()? {
+            let inbox = self.inbox(&account.id)?;
+            let count = inbox.conn.lock().query_row(
+                &format!("SELECT COALESCE(SUM(unread_count), 0) FROM conversations WHERE archived = 0 AND {BADGE_COUNTS}"),
+                [],
+                |r| r.get(0),
+            )?;
+            totals.insert(account.id, count);
+        }
+        Ok(totals)
+    }
+
     pub fn get_account(&self, id: &str) -> Result<Account, DbError> {
-        self.list_accounts()?
-            .into_iter()
-            .find(|a| a.id == id)
-            .ok_or_else(|| DbError::NotFound(id.to_string()))
+        let conn = self.catalog.conn.lock();
+        conn.query_row(
+            &format!("{ACCOUNT_SELECT} WHERE id = ?1"),
+            params![id],
+            map_account_row,
+        )
+        .optional()?
+        .ok_or_else(|| DbError::NotFound(id.to_string()))
     }
 
     pub fn patch_account(&self, id: &str, patch: &AccountPatch) -> Result<Account, DbError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.catalog.conn.lock();
+        if let Some(color) = &patch.accent_color {
+            if color.len() != 7
+                || !color.starts_with('#')
+                || !color[1..].bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(DbError::InvalidInput("Invalid account accent color".into()));
+            }
+            conn.execute("UPDATE accounts SET metadata = json_set(metadata, '$.accent_color', ?1), updated_at = ?2 WHERE id = ?3", params![color, now, id])?;
+        }
         if patch.name.is_some() {
             conn.execute(
                 "UPDATE accounts SET name = COALESCE(?1, name), updated_at = ?2 WHERE id = ?3",
@@ -1184,6 +1099,12 @@ impl Database {
                 params![v as i64, now, id],
             )?;
         }
+        if let Some(prefs) = &patch.auto_download {
+            conn.execute(
+                "UPDATE accounts SET auto_download = ?1, updated_at = ?2 WHERE id = ?3",
+                params![auto_download_column(prefs), now, id],
+            )?;
+        }
         drop(conn);
         self.get_account(id)
     }
@@ -1193,8 +1114,8 @@ impl Database {
         id: &str,
         patch: &ConversationPatch,
     ) -> Result<Conversation, DbError> {
-        let conv = self.get_conversation(id)?;
-        let inbox = self.inbox(&conv.account_id)?;
+        let account_id = self.conversation_account(id)?;
+        let inbox = self.inbox(&account_id)?;
         let conn = inbox.conn.lock();
         if let Some(v) = patch.pinned {
             conn.execute(
@@ -1264,24 +1185,21 @@ impl Database {
                 params![if r { 1 } else { 0 }, id],
             )?;
         }
+        if let Some(prefs) = &patch.auto_download {
+            conn.execute(
+                "UPDATE conversations SET auto_download = ?1 WHERE id = ?2",
+                params![auto_download_column(prefs), id],
+            )?;
+        }
         drop(conn);
         self.get_conversation(id)
     }
 
-    pub fn mark_unread(&self, conversation_id: &str) -> Result<(), DbError> {
-        let conv = self.get_conversation(conversation_id)?;
-        let inbox = self.inbox(&conv.account_id)?;
-        inbox.conn.lock().execute(
-            "UPDATE conversations SET unread_count = CASE WHEN unread_count < 1 THEN 1 ELSE unread_count END WHERE id = ?1",
-            params![conversation_id],
-        )?;
-        Ok(())
-    }
-
     pub fn list_workspaces(&self) -> Result<Vec<Workspace>, DbError> {
         let conn = self.catalog.conn.lock();
-        let mut stmt =
-            conn.prepare("SELECT id, name, builtin, sort_order FROM workspaces ORDER BY sort_order, name")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, builtin, sort_order FROM workspaces ORDER BY sort_order, name",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok(Workspace {
                 id: row.get(0)?,
@@ -1296,8 +1214,11 @@ impl Database {
     pub fn create_workspace(&self, name: &str) -> Result<Workspace, DbError> {
         let id = Uuid::new_v4().to_string();
         let conn = self.catalog.conn.lock();
-        let max: i64 = conn
-            .query_row("SELECT COALESCE(MAX(sort_order), 0) FROM workspaces", [], |r| r.get(0))?;
+        let max: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) FROM workspaces",
+            [],
+            |r| r.get(0),
+        )?;
         conn.execute(
             "INSERT INTO workspaces (id, name, builtin, sort_order) VALUES (?1, ?2, 0, ?3)",
             params![id, name, max + 1],
@@ -1325,7 +1246,11 @@ impl Database {
         {
             let conn = self.catalog.conn.lock();
             let builtin: i64 = conn
-                .query_row("SELECT builtin FROM workspaces WHERE id = ?1", params![id], |r| r.get(0))
+                .query_row(
+                    "SELECT builtin FROM workspaces WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
                 .map_err(|_| DbError::NotFound(id.to_string()))?;
             if builtin != 0 {
                 return Err(DbError::Builtin);
@@ -1363,7 +1288,11 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
     }
 
-    pub fn create_priority_group(&self, name: &str, color: Option<&str>) -> Result<PriorityGroup, DbError> {
+    pub fn create_priority_group(
+        &self,
+        name: &str,
+        color: Option<&str>,
+    ) -> Result<PriorityGroup, DbError> {
         let id = Uuid::new_v4().to_string();
         let conn = self.catalog.conn.lock();
         let max: i64 = conn.query_row(
@@ -1420,133 +1349,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn list_todos(&self, conversation_id: &str) -> Result<Vec<ChatTodo>, DbError> {
-        let conn = self.catalog.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, account_id, body, due_at, done, created_at
-             FROM chat_todos WHERE conversation_id = ?1 ORDER BY done, created_at",
-        )?;
-        let rows = stmt.query_map(params![conversation_id], map_todo_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
-    }
-
-    pub fn add_todo(
-        &self,
-        conversation_id: &str,
-        account_id: &str,
-        body: &str,
-        due_at: Option<&str>,
-    ) -> Result<ChatTodo, DbError> {
-        let id = Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
-        self.catalog.conn.lock().execute(
-            "INSERT INTO chat_todos (id, conversation_id, account_id, body, due_at, done, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
-            params![id, conversation_id, account_id, body, due_at, now],
-        )?;
-        Ok(ChatTodo {
-            id,
-            conversation_id: conversation_id.to_string(),
-            account_id: account_id.to_string(),
-            body: body.to_string(),
-            due_at: due_at.map(str::to_string),
-            done: false,
-            created_at: now,
-        })
-    }
-
-    pub fn set_todo_done(&self, id: &str, done: bool) -> Result<(), DbError> {
-        let n = self.catalog.conn.lock().execute(
-            "UPDATE chat_todos SET done = ?1 WHERE id = ?2",
-            params![if done { 1 } else { 0 }, id],
-        )?;
-        if n == 0 {
-            return Err(DbError::NotFound(id.to_string()));
-        }
-        Ok(())
-    }
-
-    pub fn delete_todo(&self, id: &str) -> Result<(), DbError> {
-        self.catalog
-            .conn
-            .lock()
-            .execute("DELETE FROM chat_todos WHERE id = ?1", params![id])?;
-        Ok(())
-    }
-
-    pub fn list_reminders(&self, conversation_id: Option<&str>) -> Result<Vec<Reminder>, DbError> {
-        let conn = self.catalog.conn.lock();
-        if let Some(cid) = conversation_id {
-            let mut stmt = conn.prepare(
-                "SELECT id, conversation_id, account_id, fire_at, kind, note, fired, created_at
-                 FROM reminders WHERE conversation_id = ?1 ORDER BY fire_at",
-            )?;
-            let rows = stmt.query_map(params![cid], map_reminder_row)?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
-        } else {
-            let mut stmt = conn.prepare(
-                "SELECT id, conversation_id, account_id, fire_at, kind, note, fired, created_at
-                 FROM reminders ORDER BY fire_at",
-            )?;
-            let rows = stmt.query_map([], map_reminder_row)?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
-        }
-    }
-
-    pub fn create_reminder(
-        &self,
-        conversation_id: &str,
-        account_id: &str,
-        fire_at: &str,
-        kind: &str,
-        note: Option<&str>,
-    ) -> Result<Reminder, DbError> {
-        let id = Uuid::new_v4().to_string();
-        let now = Utc::now().to_rfc3339();
-        self.catalog.conn.lock().execute(
-            "INSERT INTO reminders (id, conversation_id, account_id, fire_at, kind, note, fired, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
-            params![id, conversation_id, account_id, fire_at, kind, note, now],
-        )?;
-        Ok(Reminder {
-            id,
-            conversation_id: conversation_id.to_string(),
-            account_id: account_id.to_string(),
-            fire_at: fire_at.to_string(),
-            kind: kind.to_string(),
-            note: note.map(str::to_string),
-            fired: false,
-            created_at: now,
-        })
-    }
-
-    pub fn delete_reminder(&self, id: &str) -> Result<(), DbError> {
-        self.catalog
-            .conn
-            .lock()
-            .execute("DELETE FROM reminders WHERE id = ?1", params![id])?;
-        Ok(())
-    }
-
-    pub fn due_reminders(&self) -> Result<Vec<Reminder>, DbError> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self.catalog.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, account_id, fire_at, kind, note, fired, created_at
-             FROM reminders WHERE fired = 0 AND fire_at <= ?1 ORDER BY fire_at",
-        )?;
-        let rows = stmt.query_map(params![now], map_reminder_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
-    }
-
-    pub fn mark_reminder_fired(&self, id: &str) -> Result<(), DbError> {
-        self.catalog.conn.lock().execute(
-            "UPDATE reminders SET fired = 1 WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(())
-    }
-
     pub fn list_forward_rules(&self) -> Result<Vec<ForwardRule>, DbError> {
         let conn = self.catalog.conn.lock();
         let mut stmt = conn.prepare(
@@ -1575,13 +1377,29 @@ impl Database {
                 draft.source_workspace_id,
                 draft.dest_account_id,
                 draft.dest_conversation_id,
-                if draft.inbound_only.unwrap_or(true) { 1 } else { 0 },
-                if draft.include_self.unwrap_or(false) { 1 } else { 0 },
+                if draft.inbound_only.unwrap_or(true) {
+                    1
+                } else {
+                    0
+                },
+                if draft.include_self.unwrap_or(false) {
+                    1
+                } else {
+                    0
+                },
                 draft.keyword,
                 draft.prefix,
                 draft.suffix,
-                if draft.strip_sender.unwrap_or(false) { 1 } else { 0 },
-                if draft.skip_if_forwarded.unwrap_or(true) { 1 } else { 0 },
+                if draft.strip_sender.unwrap_or(false) {
+                    1
+                } else {
+                    0
+                },
+                if draft.skip_if_forwarded.unwrap_or(true) {
+                    1
+                } else {
+                    0
+                },
                 draft.delay_seconds.unwrap_or(0),
                 now,
             ],
@@ -1602,7 +1420,11 @@ impl Database {
             .ok_or_else(|| DbError::NotFound(id.to_string()))
     }
 
-    pub fn patch_forward_rule(&self, id: &str, patch: &ForwardRulePatch) -> Result<ForwardRule, DbError> {
+    pub fn patch_forward_rule(
+        &self,
+        id: &str,
+        patch: &ForwardRulePatch,
+    ) -> Result<ForwardRule, DbError> {
         let conn = self.catalog.conn.lock();
         if let Some(enabled) = patch.enabled {
             conn.execute(
@@ -1611,7 +1433,10 @@ impl Database {
             )?;
         }
         if patch.clear_source_account.unwrap_or(false) {
-            conn.execute("UPDATE forwarding_rules SET source_account_id = NULL WHERE id = ?1", params![id])?;
+            conn.execute(
+                "UPDATE forwarding_rules SET source_account_id = NULL WHERE id = ?1",
+                params![id],
+            )?;
         } else if patch.source_account_id.is_some() {
             conn.execute(
                 "UPDATE forwarding_rules SET source_account_id = ?1 WHERE id = ?2",
@@ -1665,7 +1490,10 @@ impl Database {
             )?;
         }
         if patch.clear_keyword.unwrap_or(false) {
-            conn.execute("UPDATE forwarding_rules SET keyword = NULL WHERE id = ?1", params![id])?;
+            conn.execute(
+                "UPDATE forwarding_rules SET keyword = NULL WHERE id = ?1",
+                params![id],
+            )?;
         } else if patch.keyword.is_some() {
             conn.execute(
                 "UPDATE forwarding_rules SET keyword = ?1 WHERE id = ?2",
@@ -1673,7 +1501,10 @@ impl Database {
             )?;
         }
         if patch.clear_prefix.unwrap_or(false) {
-            conn.execute("UPDATE forwarding_rules SET prefix = NULL WHERE id = ?1", params![id])?;
+            conn.execute(
+                "UPDATE forwarding_rules SET prefix = NULL WHERE id = ?1",
+                params![id],
+            )?;
         } else if patch.prefix.is_some() {
             conn.execute(
                 "UPDATE forwarding_rules SET prefix = ?1 WHERE id = ?2",
@@ -1681,7 +1512,10 @@ impl Database {
             )?;
         }
         if patch.clear_suffix.unwrap_or(false) {
-            conn.execute("UPDATE forwarding_rules SET suffix = NULL WHERE id = ?1", params![id])?;
+            conn.execute(
+                "UPDATE forwarding_rules SET suffix = NULL WHERE id = ?1",
+                params![id],
+            )?;
         } else if patch.suffix.is_some() {
             conn.execute(
                 "UPDATE forwarding_rules SET suffix = ?1 WHERE id = ?2",
@@ -1718,15 +1552,18 @@ impl Database {
         Ok(())
     }
 
-    pub fn list_scheduled_messages(&self, include_sent: bool) -> Result<Vec<ScheduledMessage>, DbError> {
+    pub fn list_scheduled_messages(
+        &self,
+        include_sent: bool,
+    ) -> Result<Vec<ScheduledMessage>, DbError> {
         let conn = self.catalog.conn.lock();
         let sql = if include_sent {
             "SELECT id, source_account_id, source_conversation_id, source_message_id, dest_account_id,
-                    dest_conversation_id, body, send_at, sent, created_at, attempts, last_error, failed
+                    dest_conversation_id, body, send_at, sent, created_at, attempts, last_error, failed, forward
              FROM scheduled_messages ORDER BY send_at"
         } else {
             "SELECT id, source_account_id, source_conversation_id, source_message_id, dest_account_id,
-                    dest_conversation_id, body, send_at, sent, created_at, attempts, last_error, failed
+                    dest_conversation_id, body, send_at, sent, created_at, attempts, last_error, failed, forward
              FROM scheduled_messages WHERE sent = 0 ORDER BY send_at"
         };
         let mut stmt = conn.prepare(sql)?;
@@ -1734,14 +1571,17 @@ impl Database {
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
     }
 
-    pub fn schedule_message(&self, draft: &ScheduleMessageDraft) -> Result<ScheduledMessage, DbError> {
+    pub fn schedule_message(
+        &self,
+        draft: &ScheduleMessageDraft,
+    ) -> Result<ScheduledMessage, DbError> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         self.catalog.conn.lock().execute(
             "INSERT INTO scheduled_messages (
                 id, source_account_id, source_conversation_id, source_message_id,
-                dest_account_id, dest_conversation_id, body, send_at, sent, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
+                dest_account_id, dest_conversation_id, body, send_at, sent, created_at, forward
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10)",
             params![
                 id,
                 draft.source_account_id,
@@ -1752,6 +1592,7 @@ impl Database {
                 draft.body,
                 draft.send_at,
                 now,
+                draft.forward,
             ],
         )?;
         self.get_scheduled_message(&id)
@@ -1761,7 +1602,7 @@ impl Database {
         let conn = self.catalog.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, source_account_id, source_conversation_id, source_message_id, dest_account_id,
-                    dest_conversation_id, body, send_at, sent, created_at, attempts, last_error, failed
+                    dest_conversation_id, body, send_at, sent, created_at, attempts, last_error, failed, forward
              FROM scheduled_messages WHERE id = ?1",
         )?;
         stmt.query_row(params![id], map_scheduled_message_row)
@@ -1774,18 +1615,18 @@ impl Database {
         let conn = self.catalog.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, source_account_id, source_conversation_id, source_message_id, dest_account_id,
-                    dest_conversation_id, body, send_at, sent, created_at, attempts, last_error, failed
-             FROM scheduled_messages WHERE sent = 0 AND failed = 0 AND send_at <= ?1 ORDER BY send_at",
+                    dest_conversation_id, body, send_at, sent, created_at, attempts, last_error, failed, forward
+             FROM scheduled_messages WHERE sent = 0 AND failed = 0 AND send_at <= ?1 ORDER BY send_at, created_at",
         )?;
         let rows = stmt.query_map(params![now], map_scheduled_message_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
     }
 
     pub fn mark_scheduled_message_sent(&self, id: &str) -> Result<(), DbError> {
-        self.catalog
-            .conn
-            .lock()
-            .execute("UPDATE scheduled_messages SET sent = 1 WHERE id = ?1", params![id])?;
+        self.catalog.conn.lock().execute(
+            "UPDATE scheduled_messages SET sent = 1 WHERE id = ?1",
+            params![id],
+        )?;
         Ok(())
     }
 
@@ -1890,59 +1731,6 @@ impl Database {
     }
 }
 
-fn compare_conversations(a: &Conversation, b: &Conversation) -> std::cmp::Ordering {
-    match (a.pinned, b.pinned) {
-        (true, false) => return std::cmp::Ordering::Less,
-        (false, true) => return std::cmp::Ordering::Greater,
-        _ => {}
-    }
-    let ta = a
-        .last_message_at
-        .map(|t| t.timestamp())
-        .unwrap_or(0);
-    let tb = b
-        .last_message_at
-        .map(|t| t.timestamp())
-        .unwrap_or(0);
-    if ta != tb {
-        return tb.cmp(&ta);
-    }
-    let ra = a
-        .metadata
-        .get("list_rank")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(999_999);
-    let rb = b
-        .metadata
-        .get("list_rank")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(999_999);
-    ra.cmp(&rb)
-}
-
-fn list_conversations_in(
-    conn: &Connection,
-    account_id: Option<&str>,
-    archived_only: bool,
-) -> Result<Vec<Conversation>, DbError> {
-    let archived = if archived_only { 1 } else { 0 };
-    if let Some(aid) = account_id {
-        let sql = format!(
-            "{CONV_SELECT} WHERE c.account_id = ?1 AND c.archived = ?2 ORDER BY c.pinned DESC, datetime(COALESCE(NULLIF(c.last_message_at, ''), c.updated_at, '1970-01-01')) DESC, COALESCE(json_extract(c.metadata, '$.list_rank'), 999999) ASC"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![aid, archived], map_conversation_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
-    } else {
-        let sql = format!(
-            "{CONV_SELECT} WHERE c.archived = ?1 ORDER BY c.pinned DESC, datetime(COALESCE(NULLIF(c.last_message_at, ''), c.updated_at, '1970-01-01')) DESC, COALESCE(json_extract(c.metadata, '$.list_rank'), 999999) ASC"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![archived], map_conversation_row)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
-    }
-}
-
 fn app_db_path(data_dir: &Path) -> PathBuf {
     data_dir.join("app.sqlite")
 }
@@ -1974,7 +1762,16 @@ fn migrate_legacy(data_dir: &Path, catalog: &Conn) -> Result<(), DbError> {
     }
     tracing::info!("splitting legacy database.sqlite into catalog + per-account inboxes");
     let legacy = Connection::open(&old)?;
-    let accounts: Vec<(String, String, String, Option<String>, String, String, String, String)> = {
+    let accounts: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+    )> = {
         let mut stmt = legacy.prepare(
             "SELECT id, connector_id, name, identity, status, metadata, created_at, updated_at FROM accounts",
         )?;
@@ -2006,7 +1803,10 @@ fn migrate_legacy(data_dir: &Path, catalog: &Conn) -> Result<(), DbError> {
 
     let account_ids: Vec<String> = accounts.iter().map(|a| a.0.clone()).collect();
     for account_id in account_ids {
-        let path = data_dir.join("accounts").join(&account_id).join("inbox.sqlite");
+        let path = data_dir
+            .join("accounts")
+            .join(&account_id)
+            .join("inbox.sqlite");
         let inbox = Conn::open(&path, true)?;
         let dest = inbox.conn.lock();
         copy_account_rows(&legacy, &dest, &account_id)?;
@@ -2018,7 +1818,10 @@ fn migrate_legacy(data_dir: &Path, catalog: &Conn) -> Result<(), DbError> {
     for suffix in ["-wal", "-shm"] {
         let src = data_dir.join(format!("database.sqlite{suffix}"));
         if src.exists() {
-            let _ = std::fs::rename(&src, data_dir.join(format!("database.sqlite.legacy{suffix}")));
+            let _ = std::fs::rename(
+                &src,
+                data_dir.join(format!("database.sqlite.legacy{suffix}")),
+            );
         }
     }
     Ok(())
@@ -2110,6 +1913,34 @@ fn get_conversation_by_remote_locked(
         .map_err(DbError::from)
 }
 
+fn map_account_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
+    Ok(Account {
+        id: row.get(0)?,
+        connector_id: row.get(1)?,
+        name: row.get(2)?,
+        identity: row.get(3)?,
+        status: parse_account_status(&row.get::<_, String>(4)?),
+        metadata: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+        created_at: row
+            .get::<_, String>(6)?
+            .parse()
+            .unwrap_or_else(|_| Utc::now()),
+        updated_at: row
+            .get::<_, String>(7)?
+            .parse()
+            .unwrap_or_else(|_| Utc::now()),
+        disabled: row.get::<_, i64>(8)? != 0,
+        muted: row.get::<_, i64>(9)? != 0,
+        workspace_id: row.get(10)?,
+        notify_enabled: opt_bool(row.get(11)?),
+        send_receipts: row.get::<_, i64>(12)? != 0,
+        sleep_enabled: opt_bool(row.get(13)?),
+        sleep_after_minutes: opt_u32(row.get(14)?),
+        sleep_check_minutes: opt_u32(row.get(15)?),
+        auto_download: parse_auto_download(row.get(16)?),
+    })
+}
+
 fn map_conversation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> {
     Ok(Conversation {
         id: row.get(0)?,
@@ -2132,7 +1963,21 @@ fn map_conversation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Conversatio
         notes: row.get::<_, Option<String>>(15)?.unwrap_or_default(),
         notify_enabled: opt_bool(row.get(16)?),
         send_receipts: opt_bool(row.get(17)?),
+        auto_download: parse_auto_download(row.get(18)?),
+        last_message_from_me: opt_bool(row.get(19)?),
+        last_message_sender_id: row.get(20)?,
+        last_message_sender_name: row.get(21)?,
     })
+}
+
+fn parse_auto_download(raw: Option<String>) -> AutoDownloadPrefs {
+    raw.and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Stored form: NULL when nothing is decided, else the JSON object.
+fn auto_download_column(prefs: &AutoDownloadPrefs) -> Option<String> {
+    (!prefs.is_empty()).then(|| serde_json::to_string(prefs).unwrap_or_default())
 }
 
 fn opt_bool(v: Option<i64>) -> Option<bool> {
@@ -2166,51 +2011,14 @@ pub fn parse_stored_datetime(value: &str) -> Option<DateTime<Utc>> {
         return Some(dt.with_timezone(&Utc));
     }
     if let Ok(n) = s.parse::<i64>() {
-        let secs = if n.abs() > 10_000_000_000 { n / 1000 } else { n };
+        let secs = if n.abs() > 10_000_000_000 {
+            n / 1000
+        } else {
+            n
+        };
         return DateTime::from_timestamp(secs, 0);
     }
     None
-}
-
-fn normalize_stored_ts(value: Option<&str>) -> Option<&str> {
-    let s = value?.trim();
-    if s.is_empty() || s.starts_with("0001-") || s.starts_with("0000-") {
-        None
-    } else {
-        Some(s)
-    }
-}
-
-fn effective_workspace<'a>(conv: &'a Conversation, account: Option<&'a Account>) -> &'a str {
-    conv.workspace_id
-        .as_deref()
-        .or_else(|| account.and_then(|a| a.workspace_id.as_deref()))
-        .unwrap_or("default")
-}
-
-fn map_todo_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatTodo> {
-    Ok(ChatTodo {
-        id: row.get(0)?,
-        conversation_id: row.get(1)?,
-        account_id: row.get(2)?,
-        body: row.get(3)?,
-        due_at: row.get(4)?,
-        done: row.get::<_, i64>(5)? != 0,
-        created_at: row.get(6)?,
-    })
-}
-
-fn map_reminder_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reminder> {
-    Ok(Reminder {
-        id: row.get(0)?,
-        conversation_id: row.get(1)?,
-        account_id: row.get(2)?,
-        fire_at: row.get(3)?,
-        kind: row.get(4)?,
-        note: row.get(5)?,
-        fired: row.get::<_, i64>(6)? != 0,
-        created_at: row.get(7)?,
-    })
 }
 
 fn map_forward_rule_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ForwardRule> {
@@ -2249,6 +2057,7 @@ fn map_scheduled_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Schedu
         attempts: row.get(10)?,
         last_error: row.get(11)?,
         failed: row.get::<_, i64>(12)? != 0,
+        forward: row.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -2266,6 +2075,8 @@ fn map_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         metadata: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
         starred: row.get::<_, i64>(10).unwrap_or(0) != 0,
         pinned: row.get::<_, i64>(11).unwrap_or(0) != 0,
+        reactions: Vec::new(),
+        reply: None,
     })
 }
 
@@ -2278,9 +2089,14 @@ fn get_message_locked(
         "SELECT id, conversation_id, remote_id, sender_id, sender_name, direction, body, timestamp, status, metadata, starred, pinned
          FROM messages WHERE id = ?1 AND conversation_id = ?2",
     )?;
-    stmt.query_row(params![message_id, conversation_id], map_message_row)
+    let mut msg = stmt
+        .query_row(params![message_id, conversation_id], map_message_row)
         .optional()?
-        .ok_or_else(|| DbError::NotFound(message_id.to_string()))
+        .ok_or_else(|| DbError::NotFound(message_id.to_string()))?;
+    // Every message the UI receives carries its resolved reply quote, so an update never
+    // makes a quote disappear.
+    replies::resolve_in_conversation(conn, conversation_id, std::slice::from_mut(&mut msg))?;
+    Ok(msg)
 }
 
 fn map_contact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Contact> {
@@ -2295,6 +2111,9 @@ fn map_contact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Contact> {
 }
 
 pub fn message_preview(body: &str, metadata: &serde_json::Value) -> String {
+    if is_revoked(metadata) {
+        return "This message was deleted".into();
+    }
     let media_type = metadata
         .get("media_type")
         .and_then(|v| v.as_str())
@@ -2314,6 +2133,10 @@ pub fn message_preview(body: &str, metadata: &serde_json::Value) -> String {
             other => other,
         };
         let placeholder = format!("[{}]", media);
+        if media == "poll" && !text.is_empty() && text.to_lowercase() != placeholder {
+            // The question, not the answer: a vote never touches this preview.
+            return format!("Poll: {text}");
+        }
         if !text.is_empty() && text.to_lowercase() != placeholder {
             return text.to_string();
         }
@@ -2334,6 +2157,10 @@ fn merge_json_objects(base: serde_json::Value, patch: serde_json::Value) -> serd
         (serde_json::Value::Object(mut a), serde_json::Value::Object(b)) => {
             for (k, v) in b {
                 if v.is_null() {
+                    // A successful download reports `media_error: null` to clear the old failure.
+                    if k == "media_error" {
+                        a.remove(&k);
+                    }
                     continue;
                 }
                 if k == "media_data" {
@@ -2341,6 +2168,22 @@ fn merge_json_objects(base: serde_json::Value, patch: serde_json::Value) -> serd
                         if !existing.is_empty() {
                             continue;
                         }
+                    }
+                }
+                // A later report of the same reply (the echo of a send, a history pass) may
+                // carry fewer facts than the one stored: keep what it does not mention.
+                if k == "reply_to" {
+                    if let (Some(serde_json::Value::Object(old)), serde_json::Value::Object(new)) =
+                        (a.get("reply_to"), &v)
+                    {
+                        let mut merged = old.clone();
+                        for (fk, fv) in new {
+                            if !fv.is_null() {
+                                merged.insert(fk.clone(), fv.clone());
+                            }
+                        }
+                        a.insert(k, serde_json::Value::Object(merged));
+                        continue;
                     }
                 }
                 a.insert(k, v);
@@ -2367,7 +2210,8 @@ fn merge_message_metadata_locked(
     let Some(raw) = existing else {
         return Ok(());
     };
-    let base: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
+    let base: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
     let merged = merge_json_objects(base, patch.clone());
     conn.execute(
         "UPDATE messages SET metadata = ?1 WHERE conversation_id = ?2 AND remote_id = ?3",

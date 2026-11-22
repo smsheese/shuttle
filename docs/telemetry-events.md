@@ -1,12 +1,12 @@
 # Telemetry Event Reference
 
-Shuttle uses a **typed, allowlisted** telemetry registry. Application code should call `$lib/telemetry` (frontend) or the Rust `TelemetryManager` — never Sentry/PostHog SDKs directly.
+Shuttle uses a **typed, allowlisted** telemetry registry. Application code should call `$lib/telemetry` (frontend) or the Rust `TelemetryManager` — never PostHog SDKs directly.
 
 Telemetry is **opt-in** via Settings → Privacy → Anonymous diagnostics:
 
 | Toggle | Backend | When enabled |
 | --- | --- | --- |
-| Crash reports | Sentry | Rust panics/errors + frontend unhandled exceptions (sanitized) |
+| Crash reports | PostHog | Rust panics and frontend unhandled exceptions (safe categories only) |
 | Usage diagnostics | PostHog | Product/performance events (batched ~30s) |
 
 Both default to **off**.
@@ -23,12 +23,12 @@ Never collected:
 
 Allowed global context:
 
-- `app_version`, `build_channel`, `release`, `git_commit`
+- `product`, `app`, `platform`, `app_version`, `build_channel`, `release`, `git_commit`
 - `os`, `architecture`, `cpu_core_count`, `ram_bucket`
 - `environment` (`testing` or `production`) and `build_channel` (same values)
 - Aggregated buckets only (`database_size_bucket`, `message_count_bucket`, `accounts_total`)
 
-Anonymous identity: random `installation_id` (UUIDv4) stored in `app_meta` inside `app.sqlite`.
+Usage diagnostics use a random `installation_id` (UUIDv4) stored in `app_meta`. Error reports are personless and contain a fixed error category, a crate-relative Rust panic location when available, and the global context above. Panic payloads, frontend error messages, and stack traces are discarded before sending. This limits debugging detail. Panic delivery is best-effort. Session replay and automatic interaction capture are not enabled. PostHog receives the network request IP; configure the instance to discard client IP data.
 
 ## App events
 
@@ -49,9 +49,24 @@ Anonymous identity: random `installation_id` (UUIDv4) stored in `app_meta` insid
 | `database_initialized` | `database_size_bucket`, `accounts_total`, `connector_count` |
 | `database_migration_completed` | — |
 | `database_error` | `error_category` |
-| `performance_snapshot` | `foreground`, `sample_count`, `cpu_avg`, `cpu_p95`, `memory_avg_mb`, `memory_p95_mb`, `operation` |
+| `performance_snapshot` | `foreground`, `sample_count`, `cpu_avg`, `cpu_p95`, `memory_avg_mb`, `memory_p95_mb` (Shuttle itself), `sidecar_cpu_avg`, `sidecar_memory_avg_mb`, `sidecar_memory_p95_mb`, `sidecar_count` (its helper programs), plus the load buckets below |
 | `search_used` | — |
 | `command_failed` | `operation`, `error_category`, `connector_type` |
+| `operation_timing` | `operation` (`chat_list`, `chat_open`, `search_chats`, `search_messages`), `count`, `p50_ms`, `p95_ms`, `max_ms`, plus the load buckets below |
+
+## Load buckets
+
+`performance_snapshot`, `operation_timing` and `database_initialized` carry ranges that describe the load, so a slow number can be read against it. They are ranges, never counts.
+
+| Field | Values |
+| --- | --- |
+| `accounts_total` | `0`, `1`, `2_3`, `4_5`, `6_10`, `11_plus` |
+| `conversation_count_bucket`, `message_count_bucket`, `largest_account_message_bucket` | `0`, `1_100`, `101_1k`, `1k_10k`, `10k_100k`, `100k_1m`, `gt_1m` |
+| `database_size_bucket` | `le_1mb`, `le_10mb`, `le_100mb`, `gt_100mb` |
+
+Timings are collected in memory per operation (last 200 calls) and sent as one summary per batch. Only the four listed operation names are recorded.
+
+See [PRIVACY.md](../PRIVACY.md) for the user-facing policy.
 
 ## Connector telemetry protocol
 
@@ -87,9 +102,8 @@ Values resolve in this order: **process env** → **`.env` file** (local) → **
 
 | Variable | Purpose |
 | --- | --- |
-| `SENTRY_DSN` | Sentry project DSN (crash reports) |
-| `POSTHOG_API_KEY` | PostHog project API key |
-| `POSTHOG_HOST` | PostHog ingest host (default `https://us.i.posthog.com`) |
+| `POSTHOG_API_KEY` | PostHog project ingestion token (not a personal API key) |
+| `POSTHOG_HOST` | PostHog ingest host (default `https://eu.i.posthog.com` (EU Cloud)) |
 | `SHUTTLE_BUILD_CHANNEL` | `testing` or `production` |
 | `SHUTTLE_GIT_COMMIT` | Optional release metadata |
 
@@ -97,23 +111,12 @@ Values resolve in this order: **process env** → **`.env` file** (local) → **
 
 ```bash
 cp .env.example .env
-# fill SENTRY_DSN and POSTHOG_API_KEY
+# fill POSTHOG_API_KEY with the testing project ingestion token
 ```
 
 `SHUTTLE_BUILD_CHANNEL=testing` is the default in `.env.example`. The app loads `.env` from the repo root (or `shuttle-app/`) at startup. Do not commit `.env`.
 
-Sentry and PostHog both receive an **environment** of `testing` or `production` (from `SHUTTLE_BUILD_CHANNEL`). Use **separate projects** plus that tag so test noise never sits in production dashboards.
-
-### Sentry: keep testing out of production
-
-1. Create two Sentry projects (or one project with Environments enabled):
-   - **shuttle-testing**
-   - **shuttle-production**
-2. Put the **testing** DSN in local `.env`.
-3. Put the **production** DSN in the GitHub Environment named `production`.
-4. In Sentry, open the **Environment** dropdown (`testing` / `production`). Issues are tagged automatically.
-
-If you only have one Sentry project, the Environment filter still separates events. Separate DSNs/projects are stronger isolation.
+PostHog events receive an **environment** of `testing` or `production` from `SHUTTLE_BUILD_CHANNEL`. Use a separate testing project if available.
 
 ### PostHog: keep testing out of production
 
@@ -128,9 +131,8 @@ Do **not** reuse the production PostHog key in `.env`.
 
 ### GitHub production / testing
 
-Create GitHub Environments named **`production`** and **`testing`**, each with **its own** secrets (different Sentry DSN and PostHog key):
+Create GitHub Environments named **`production`** and **`testing`**, each with its own project ingestion token:
 
-- `SENTRY_DSN`
 - `POSTHOG_API_KEY`
 - `POSTHOG_HOST` (optional)
 

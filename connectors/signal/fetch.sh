@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Download signal-cli (prefers GraalVM native image, falls back to JVM tarball).
-# Bundled in Shuttle release builds under GPL-3.0; see third-party/licenses/signal-cli-GPL-3.0.txt.
+# Published as a downloadable Shuttle component under GPL-3.0; see third-party/licenses/signal-cli-GPL-3.0.txt.
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$DIR/../.." && pwd)"

@@ -1,10 +1,12 @@
 # Attribution
 
-Shuttle’s own source (the Tauri/Svelte app, Rust core, and Python connector wrappers) is licensed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE).
+Shuttle’s own source (the Tauri/Svelte app, Rust core, and Python connector wrappers) is licensed under the [GNU AGPL-3.0-or-later](LICENSE). A [commercial license](COMMERCIAL-LICENSE.md) is available.
 
 This file credits the third-party software Shuttle talks to or optionally downloads. Those components keep their own licenses. Shuttle does **not** relicense them.
 
-Release builds bundle **signal-cli** (GPL-3.0) and an embedded CPython runtime for connector sidecars. Other native helpers (GOWA, TDLib) are fetched at build time when available. If you redistribute a Shuttle build that includes those files, you must satisfy their licenses — license texts ship in the app bundle under `licenses/` and in Settings → Attributions.
+The installer ships only Shuttle itself plus license texts. Connector helpers (**signal-cli** (GPL-3.0), GOWA, TDLib `tdjson` and an embedded CPython runtime) are published as separate components on Shuttle's GitHub release and downloaded on demand when you add an account. Whoever hosts or redistributes those component files must satisfy their licenses; license texts ship in the app bundle under `licenses/` and in Settings → Attributions.
+
+The Shuttle name and logo (`shuttle-logov1.1.*`, `shuttle-app/static/shuttle-logo.*`) are not licensed under the AGPL for use as a brand; see [docs/licensing.md](docs/licensing.md#name-and-logo).
 
 Network names and logos (WhatsApp, Telegram, Signal, Messenger, Instagram, Facebook, Matrix, and others) are trademarks of their respective owners. Shuttle is an independent project and is not affiliated with, endorsed by, or sponsored by those companies.
 
@@ -18,7 +20,7 @@ These are the libraries and binaries the sidecars use. Shuttle’s wrappers live
 | WhatsApp | **whatsmeow** | WhatsApp Web multi-device protocol library used by GOWA | MPL-2.0 | [tulir/whatsmeow](https://github.com/tulir/whatsmeow) |
 | Telegram | **TDLib** (`tdjson`) | Official Telegram client library, loaded locally | Boost Software License 1.0 | [tdlib/td](https://github.com/tdlib/td) |
 | Telegram | **aiotdlib** release assets | Optional source of prebuilt `tdjson` shared libraries (`./connectors/tdlib/fetch.sh`) | MIT | [pylakey/aiotdlib](https://github.com/pylakey/aiotdlib) |
-| Signal | **signal-cli** | Local JSON-RPC client for Signal (bundled sidecar in release builds) | GPL-3.0 | [AsamK/signal-cli](https://github.com/AsamK/signal-cli) |
+| Signal | **signal-cli** | Local JSON-RPC client for Signal (separate sidecar, downloaded on demand) | GPL-3.0 | [AsamK/signal-cli](https://github.com/AsamK/signal-cli) |
 | Messenger | **fbchat** | Unofficial Facebook Messenger client | BSD-3-Clause | [fbchat-dev/fbchat](https://github.com/fbchat-dev/fbchat) |
 | Instagram | **instagrapi** | Unofficial Instagram private API client | MIT | [subzeroid/instagrapi](https://github.com/subzeroid/instagrapi) |
 | Matrix | Matrix Client-Server API | HTTPS messaging to a homeserver | Apache-2.0 (spec) · server-dependent | [spec.matrix.org](https://spec.matrix.org) |
@@ -36,15 +38,15 @@ Downloaded by `./connectors/tdlib/fetch.sh` (prebuilt `tdjson` from aiotdlib rel
 
 ### Signal / signal-cli
 
-Downloaded by `./connectors/signal/fetch.sh` and **bundled in release builds**. **signal-cli is GPL-3.0.** Shuttle’s AGPL wrappers talk to it as a separate process over JSON-RPC.
+Fetched by `./connectors/signal/fetch.sh`, published as a component on Shuttle's GitHub release, and downloaded when you add a Signal account. **signal-cli is GPL-3.0.** Shuttle’s wrappers talk to it as a separate process over JSON-RPC.
 
-When you redistribute Shuttle with bundled signal-cli you must:
+Whoever hosts or redistributes the signal-cli component (including the Shuttle project's own releases) must:
 
-1. Include the GPL-3.0 license text (`licenses/signal-cli-GPL-3.0.txt` in release bundles).
+1. Include the GPL-3.0 license text (`licenses/signal-cli-GPL-3.0.txt` in the app bundle).
 2. Preserve copyright notices and `SOURCE.json` metadata under `connectors/signal/`.
 3. Offer corresponding source for signal-cli (upstream: [AsamK/signal-cli](https://github.com/AsamK/signal-cli)).
 
-Shuttle itself remains under AGPL-3.0; bundling GPL signal-cli as a sidecar is a common combined-distribution pattern. AGPL and GPL-3.0 are compatible for this use.
+Shuttle is AGPL-3.0-or-later; signal-cli runs as a separate GPL-3.0 process that Shuttle talks to over JSON-RPC and is not linked into the app. Each license applies to its own program.
 
 Developers can still point Shuttle at a system-installed binary with `SHUTTLE_SIGNAL_CLI`.
 
@@ -69,6 +71,9 @@ Major libraries used by the desktop app (not an exhaustive dependency list). Rus
 | Tauri 2 | Desktop shell, IPC, bundling | MIT OR Apache-2.0 | [tauri-apps/tauri](https://github.com/tauri-apps/tauri) |
 | Svelte 5 / SvelteKit | UI | MIT | [sveltejs/svelte](https://github.com/sveltejs/svelte) |
 | Vite | Frontend toolchain | MIT | [vitejs/vite](https://github.com/vitejs/vite) |
+| emoji-picker-element | Emoji picker | Apache-2.0 | [nolanlawson/emoji-picker-element](https://github.com/nolanlawson/emoji-picker-element) |
+| Giphy JS SDK (`@giphy/js-fetch-api`) | GIF and sticker search | MIT | [Giphy/giphy-js](https://github.com/Giphy/giphy-js) |
+| SunCalc | Sunrise/sunset times for the automatic theme | BSD-2-Clause | [mourner/suncalc](https://github.com/mourner/suncalc) |
 | python-build-standalone | Embedded CPython for connector sidecars | MPL-2.0 (runtime) · PSF (CPython) | [astral-sh/python-build-standalone](https://github.com/astral-sh/python-build-standalone) |
 | rusqlite (bundled SQLite) | Local message store | MIT (rusqlite); SQLite is public domain | [rusqlite](https://github.com/rusqlite/rusqlite) |
 | tokio | Async runtime, sidecar processes | MIT | [tokio-rs/tokio](https://github.com/tokio-rs/tokio) |
@@ -85,10 +90,10 @@ cd shuttle-app/src-tauri && cargo license
 
 ## Notices that apply when redistributing
 
-1. Include this file and [LICENSE](LICENSE) (AGPL-3.0) with source and binary distributions of Shuttle itself.
+1. Include this file and [LICENSE](LICENSE) with source and binary distributions of Shuttle itself.
 2. If you ship GOWA, tdjson, signal-cli, fbchat, or instagrapi, include their license texts as well.
-3. **Shuttle (AGPL-3.0):** if you run a modified version as a network service, you must offer corresponding source to users interacting with it over the network. See [docs/licensing.md](docs/licensing.md).
-4. **signal-cli (GPL-3.0):** bundled in release builds; include GPL text and source availability as above.
+3. **Shuttle (AGPL-3.0-or-later):** keep the copyright and license notice and offer the corresponding source. See [docs/licensing.md](docs/licensing.md).
+4. **signal-cli (GPL-3.0):** published as a downloadable component; include GPL text and source availability as above.
 5. **whatsmeow (MPL-2.0):** if you modify whatsmeow (including via a patched GOWA), publish those file-level changes under MPL-2.0.
 6. Messenger and Instagram connectors use unofficial APIs; redistribution does not grant any right to those services.
 

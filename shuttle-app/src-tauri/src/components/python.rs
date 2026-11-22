@@ -32,7 +32,12 @@ fn python_meets_minimum(bin: &str, extra_args: &[String]) -> bool {
     for arg in extra_args {
         cmd.arg(arg);
     }
-    let output = match cmd.args(["-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"]).output()
+    let output = match cmd
+        .args([
+            "-c",
+            "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')",
+        ])
+        .output()
     {
         Ok(o) if o.status.success() => o,
         _ => return false,
@@ -50,7 +55,10 @@ fn python_import_probe(bin: &str, extra_args: &[String]) -> bool {
     for arg in extra_args {
         cmd.arg(arg);
     }
-    cmd.args(["-c", "import ssl, sqlite3"]).status().map(|s| s.success()).unwrap_or(false)
+    cmd.args(["-c", "import ssl, sqlite3"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn parse_version(raw: &str) -> Option<(u32, u32)> {
@@ -77,7 +85,9 @@ pub fn managed_python_candidates(root: &PathBuf) -> Vec<PathBuf> {
 }
 
 pub fn find_managed_python(root: &PathBuf) -> Option<PathBuf> {
-    managed_python_candidates(root).into_iter().find(|p| p.exists())
+    managed_python_candidates(root)
+        .into_iter()
+        .find(|p| p.exists())
 }
 
 pub fn python_deps_dir(components_root: &PathBuf, connector_id: &str) -> Option<PathBuf> {
@@ -87,5 +97,9 @@ pub fn python_deps_dir(components_root: &PathBuf, connector_id: &str) -> Option<
         _ => None,
     }?;
     let path = components_root.join("python-deps").join(dep);
-    if path.exists() { Some(path) } else { None }
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
 }

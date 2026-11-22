@@ -18,7 +18,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub channel_styles: HashMap<String, ChannelStyle>,
     #[serde(default)]
-    pub media_retention: MediaRetentionConfig,
+    pub media: MediaConfig,
+    #[serde(default)]
+    pub ai: AiConfig,
+    #[serde(default)]
+    pub integrations: IntegrationsConfig,
 }
 
 impl Default for AppConfig {
@@ -29,53 +33,123 @@ impl Default for AppConfig {
             privacy: PrivacyConfig::default(),
             sleep: SleepConfig::default(),
             channel_styles: default_channel_styles(),
-            media_retention: MediaRetentionConfig::default(),
+            media: MediaConfig::default(),
+            ai: AiConfig::default(),
+            integrations: IntegrationsConfig::default(),
         }
     }
 }
 
-/// How long (in days) to keep downloaded media locally. `None` = keep forever.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MediaRetentionConfig {
+/// The user's own OpenRouter account, used for translation and later AI features.
+/// An empty `api_key` = AI is off and no text leaves the device.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AiConfig {
     #[serde(default)]
-    pub images_days: Option<u32>,
+    pub openrouter_api_key: String,
+    /// OpenRouter model id such as `google/gemini-2.5-flash`.
     #[serde(default)]
-    pub videos_days: Option<u32>,
-    #[serde(default)]
-    pub audio_days: Option<u32>,
-    #[serde(default)]
-    pub documents_days: Option<u32>,
-    #[serde(default)]
-    pub stickers_days: Option<u32>,
-    #[serde(default)]
-    pub gifs_days: Option<u32>,
-    #[serde(default)]
-    pub voice_days: Option<u32>,
+    pub model: String,
 }
 
-impl Default for MediaRetentionConfig {
+/// Keys for optional third-party services the user brings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IntegrationsConfig {
+    /// Enables GIF and sticker search.
+    #[serde(default)]
+    pub giphy_api_key: String,
+}
+
+/// Where saved media goes and how long the app-private download cache is kept.
+///
+/// Downloads (auto or on demand) live in `<data_dir>/media_cache`; only a file the user
+/// explicitly saves ends up in `save_dir`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaConfig {
+    /// Folder for explicit saves. `None` = `<Documents>/shuttle`.
+    #[serde(default)]
+    pub save_dir: Option<String>,
+    /// Show the native save dialog for every save instead of using `save_dir`.
+    #[serde(default)]
+    pub ask_each_time: bool,
+    /// Delete cached downloads unused for this many days. `None` = keep forever.
+    #[serde(default = "default_keep_days")]
+    pub keep_days: Option<u32>,
+}
+
+pub const DEFAULT_MEDIA_KEEP_DAYS: u32 = 60;
+
+fn default_keep_days() -> Option<u32> {
+    Some(DEFAULT_MEDIA_KEEP_DAYS)
+}
+
+impl Default for MediaConfig {
     fn default() -> Self {
         Self {
-            images_days: None,
-            videos_days: None,
-            audio_days: None,
-            documents_days: None,
-            stickers_days: None,
-            gifs_days: None,
-            voice_days: None,
+            save_dir: None,
+            ask_each_time: false,
+            keep_days: default_keep_days(),
         }
     }
 }
 
 fn default_channel_styles() -> HashMap<String, ChannelStyle> {
     let mut m = HashMap::new();
-    m.insert("whatsapp".into(), ChannelStyle { tag: Some("#25D366".into()), background: None, font: None });
-    m.insert("telegram".into(), ChannelStyle { tag: Some("#2AABEE".into()), background: None, font: None });
-    m.insert("signal".into(), ChannelStyle { tag: Some("#3A76F0".into()), background: None, font: None });
-    m.insert("messenger".into(), ChannelStyle { tag: Some("#0084FF".into()), background: None, font: None });
-    m.insert("instagram".into(), ChannelStyle { tag: Some("#E1306C".into()), background: None, font: None });
-    m.insert("email".into(), ChannelStyle { tag: Some("#EA4335".into()), background: None, font: None });
-    m.insert("matrix".into(), ChannelStyle { tag: Some("#0DBD8B".into()), background: None, font: None });
+    m.insert(
+        "whatsapp".into(),
+        ChannelStyle {
+            tag: Some("#25D366".into()),
+            background: None,
+            font: None,
+        },
+    );
+    m.insert(
+        "telegram".into(),
+        ChannelStyle {
+            tag: Some("#2AABEE".into()),
+            background: None,
+            font: None,
+        },
+    );
+    m.insert(
+        "signal".into(),
+        ChannelStyle {
+            tag: Some("#3A76F0".into()),
+            background: None,
+            font: None,
+        },
+    );
+    m.insert(
+        "messenger".into(),
+        ChannelStyle {
+            tag: Some("#0084FF".into()),
+            background: None,
+            font: None,
+        },
+    );
+    m.insert(
+        "instagram".into(),
+        ChannelStyle {
+            tag: Some("#E1306C".into()),
+            background: None,
+            font: None,
+        },
+    );
+    m.insert(
+        "email".into(),
+        ChannelStyle {
+            tag: Some("#EA4335".into()),
+            background: None,
+            font: None,
+        },
+    );
+    m.insert(
+        "matrix".into(),
+        ChannelStyle {
+            tag: Some("#0DBD8B".into()),
+            background: None,
+            font: None,
+        },
+    );
     m
 }
 
@@ -92,6 +166,12 @@ pub struct AppearanceConfig {
     pub font_scale: f64,
     #[serde(default)]
     pub tweakcn_css: Option<String>,
+    #[serde(default)] pub dark_schedule: Option<String>,
+    #[serde(default)] pub dark_from: Option<String>,
+    #[serde(default)] pub dark_to: Option<String>,
+    #[serde(default)] pub dark_location: Option<String>,
+    #[serde(default)] pub dark_latitude: Option<f64>,
+    #[serde(default)] pub dark_longitude: Option<f64>,
 }
 
 fn system_scheme() -> String {
@@ -115,6 +195,8 @@ impl Default for AppearanceConfig {
             datetime_format: default_datetime_format(),
             font_scale: default_font_scale(),
             tweakcn_css: None,
+            dark_schedule: None,
+            dark_from: None, dark_to: None, dark_location: None, dark_latitude: None, dark_longitude: None,
         }
     }
 }
@@ -162,8 +244,9 @@ fn default_sleep_check() -> u32 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct PrivacyConfig {
-    /// Send anonymous crash reports via Sentry when enabled.
+    /// Send anonymous crash reports via PostHog when enabled.
     #[serde(default)]
     pub crash_reports: bool,
     /// Send anonymous usage and performance diagnostics via PostHog when enabled.
@@ -171,14 +254,6 @@ pub struct PrivacyConfig {
     pub usage_diagnostics: bool,
 }
 
-impl Default for PrivacyConfig {
-    fn default() -> Self {
-        Self {
-            crash_reports: false,
-            usage_diagnostics: false,
-        }
-    }
-}
 
 fn default_true() -> bool {
     true
@@ -238,7 +313,10 @@ impl ConfigStore {
             .set_app_setting("config", &json)
             .map_err(|e| e.to_string())?;
         // Keep config.json as a backward-compatible backup copy.
-        let _ = std::fs::write(&self.legacy_path, serde_json::to_string_pretty(&cfg).unwrap_or(json));
+        let _ = std::fs::write(
+            &self.legacy_path,
+            serde_json::to_string_pretty(&cfg).unwrap_or(json),
+        );
         *self.inner.lock() = cfg.clone();
         Ok(cfg)
     }
@@ -261,7 +339,35 @@ fn load_config(db: &Database, legacy_path: &Path) -> AppConfig {
     let cfg = AppConfig::default();
     if let Ok(json) = serde_json::to_string(&cfg) {
         let _ = db.set_app_setting("config", &json);
-        let _ = std::fs::write(legacy_path, serde_json::to_string_pretty(&cfg).unwrap_or(json));
+        let _ = std::fs::write(
+            legacy_path,
+            serde_json::to_string_pretty(&cfg).unwrap_or(json),
+        );
     }
     cfg
+}
+
+#[cfg(test)]
+mod media_config_tests {
+    use super::*;
+
+    #[test]
+    fn media_defaults_keep_sixty_days_and_save_to_documents() {
+        // An old config without a `media` section gets the defaults.
+        let cfg: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.media.keep_days, Some(60));
+        assert!(!cfg.media.ask_each_time);
+        assert!(cfg.media.save_dir.is_none());
+        // A section with only some fields keeps 60 days for the rest.
+        let cfg: AppConfig = serde_json::from_str(r#"{"media":{"ask_each_time":true}}"#).unwrap();
+        assert_eq!(cfg.media.keep_days, Some(60));
+        assert!(cfg.media.ask_each_time);
+        // `null` is "keep forever", not "use the default".
+        let cfg: AppConfig = serde_json::from_str(r#"{"media":{"keep_days":null}}"#).unwrap();
+        assert_eq!(cfg.media.keep_days, None);
+        // The retired per-kind retention block is ignored.
+        let cfg: AppConfig =
+            serde_json::from_str(r#"{"media_retention":{"images_days":3}}"#).unwrap();
+        assert_eq!(cfg.media.keep_days, Some(60));
+    }
 }

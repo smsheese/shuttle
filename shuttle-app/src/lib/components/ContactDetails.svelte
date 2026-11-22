@@ -2,15 +2,28 @@
   import {
     avatarColor,
     conversationAvatar,
+    downloadMessageMediaAndWait,
     fetchContactProfile,
     getInitials,
+    openExternal,
     readMessageMedia,
     updateConversation,
   } from '$lib/api';
+  import { mediaNameOwner, saveMessageMediaFile } from '$lib/mediaSave';
+  import { whatsappCallFallback } from '$lib/whatsappLinks';
+  import { toast as notify } from '$lib/toast.svelte';
   import NetworkIcon from '$lib/components/NetworkIcon.svelte';
   import MediaLightbox, { type LightboxItem } from '$lib/components/MediaLightbox.svelte';
-  import { mediaDataFromMessage, mediaFilename, mediaKindFromMessage, mediaPathFromMessage } from '$lib/messageMedia';
-  import type { Account, ContactProfileBundle, Conversation, MediaRetentionConfig, Message, PriorityGroup, Workspace } from '$lib/types';
+  import {
+    mediaDataFromMessage,
+    mediaFilename,
+    mediaKindFromMessage,
+    mediaPathFromMessage,
+    mediaSizeFromMessage,
+    mediaThumbPathFromMessage,
+    resolveThumbUrl,
+  } from '$lib/messageMedia';
+  import type { Account, ContactProfileBundle, Conversation, Message, PriorityGroup, Workspace } from '$lib/types';
 
   interface Props {
     open: boolean;
@@ -19,16 +32,17 @@
     connectors: { id: string; capabilities: string[] }[];
     workspaces: Workspace[];
     priorityGroups: PriorityGroup[];
-    globalMediaRetention: MediaRetentionConfig;
     onclose: () => void;
     onupdated: () => void;
     onstartcall?: (mode: 'audio' | 'video') => void;
-    onsaveglobalmediaretention?: (cfg: MediaRetentionConfig) => void;
+    /** A group member with no chat on this account: `conversation` is not stored, so nothing
+     * is loaded or saved for it. */
+    transient?: boolean;
   }
 
   let {
     open, conversation, accounts, connectors, workspaces, priorityGroups,
-    globalMediaRetention, onclose, onupdated, onstartcall, onsaveglobalmediaretention,
+    onclose, onupdated, onstartcall, transient = false,
   }: Props = $props();
 
   let tab = $state<'media' | 'docs' | 'links' | 'starred' | 'account'>('media');
@@ -36,30 +50,26 @@
   let loading = $state(false);
   let toast = $state<string | null>(null);
   let thumbUrls = $state<Record<string, string>>({});
-  let retentionDraft = $state<MediaRetentionConfig>({});
   let lightboxOpen = $state(false);
-  let lightboxIndex = $state(0);
-  let lightboxItems = $state<LightboxItem[]>([]);
-
-  const RETENTION_FIELDS: { key: keyof MediaRetentionConfig; label: string }[] = [
-    { key: 'images_days', label: 'Images' },
-    { key: 'videos_days', label: 'Videos' },
-    { key: 'audio_days', label: 'Audio' },
-    { key: 'voice_days', label: 'Voice messages' },
-    { key: 'documents_days', label: 'Documents' },
-    { key: 'stickers_days', label: 'Stickers' },
-    { key: 'gifs_days', label: 'GIFs' },
-  ];
+  let lightboxId = $state<string | null>(null);
+  /** WhatsApp's own tiny previews for media that is not downloaded. */
+  let previewUrls = $state<Record<string, string>>({});
+  let downloading = $state<Set<string>>(new Set());
 
   const account = $derived(conversation ? accounts.find((a) => a.id === conversation.account_id) : null);
   const connector = $derived(account ? connectors.find((c) => c.id === account.connector_id) : null);
   const caps = $derived(connector?.capabilities ?? []);
   const callsAudio = $derived(caps.includes('calls:audio'));
   const callsVideo = $derived(caps.includes('calls:video'));
-  const canCall = $derived(callsAudio || callsVideo);
   const isDirect = $derived(conversation?.conversation_type === 'direct');
+  /** A connector places the call itself; WhatsApp has no call API, so its buttons open the app. */
+  const whatsappCalls = $derived(account?.connector_id === 'whatsapp');
+  const canCall = $derived(callsAudio || callsVideo || whatsappCalls);
+  const canVideoCall = $derived(callsVideo || whatsappCalls);
   const chatType = $derived(
-    conversation?.conversation_type === 'group'
+    transient
+      ? 'Group member'
+      : conversation?.conversation_type === 'group'
       ? 'Group'
       : conversation?.conversation_type === 'channel'
         ? 'Channel'
@@ -79,18 +89,26 @@
   );
   const isGridTab = $derived(tab === 'media' || tab === 'docs');
 
+  // Primitive ids: the parent hands over a fresh `conversation` object on every
+  // live update, and only a change of chat should reload the profile.
+  const accountId = $derived(conversation?.account_id ?? null);
+  const conversationId = $derived(conversation?.id ?? null);
+
   $effect(() => {
-    if (open && conversation) {
-      loading = true;
-      thumbUrls = {};
-      void fetchContactProfile(conversation.account_id, conversation.id)
-        .then((data) => { bundle = data; })
-        .finally(() => { loading = false; });
-    } else if (!open) {
+    if (!open) {
       bundle = null;
       tab = 'media';
       thumbUrls = {};
+      return;
     }
+    if (!accountId || !conversationId || transient) return;
+    let stale = false;
+    loading = true;
+    thumbUrls = {};
+    void fetchContactProfile(accountId, conversationId)
+      .then((data) => { if (!stale) bundle = data; })
+      .finally(() => { if (!stale) loading = false; });
+    return () => { stale = true; };
   });
 
   $effect(() => {
@@ -108,12 +126,12 @@
           .then((url) => { thumbUrls = { ...thumbUrls, [item.id]: url }; })
           .catch(() => {});
       }
-    }
-  });
-
-  $effect(() => {
-    if (tab === 'account') {
-      retentionDraft = { ...globalMediaRetention };
+      const preview = mediaThumbPathFromMessage(item);
+      if (!path && preview && !previewUrls[item.id]) {
+        void resolveThumbUrl(preview).then((url) => {
+          if (url) previewUrls = { ...previewUrls, [item.id]: url };
+        });
+      }
     }
   });
 
@@ -139,25 +157,23 @@
   }
 
   function handleCall(mode: 'audio' | 'video') {
-    onstartcall?.(mode);
+    if (!whatsappCalls) {
+      onstartcall?.(mode);
+      return;
+    }
+    const fallback = whatsappCallFallback(mode, conversation?.remote_id);
+    notify.info(fallback.message);
+    if (fallback.url) void openExternal(fallback.url);
   }
 
-  function retentionValue(key: keyof MediaRetentionConfig): string {
-    const v = retentionDraft[key];
-    return v != null ? String(v) : '';
-  }
-
-  function setRetentionValue(key: keyof MediaRetentionConfig, raw: string) {
-    const n = parseInt(raw, 10);
-    retentionDraft = {
-      ...retentionDraft,
-      [key]: raw.trim() === '' || isNaN(n) || n <= 0 ? null : n,
-    };
-    onsaveglobalmediaretention?.(retentionDraft);
-  }
-
+  /** Downloaded media URL (what the viewer plays), if the file is cached. */
   function thumbSrc(item: Message): string | null {
     return thumbUrls[item.id] ?? mediaDataFromMessage(item);
+  }
+
+  /** What a grid cell shows: the media itself, else WhatsApp's preview. */
+  function cellSrc(item: Message): string | null {
+    return thumbSrc(item) ?? previewUrls[item.id] ?? null;
   }
 
   function docLabel(item: Message): string {
@@ -179,33 +195,59 @@
       const kind = lightboxKindForMessage(msg);
       if (!kind) continue;
       const url = thumbSrc(msg);
-      if (!url) continue;
       const mime = msg.metadata?.mime;
       items.push({
         id: msg.id,
-        url,
+        url: url ?? '',
         kind,
         filename: mediaFilename(msg) ?? (tab === 'docs' ? docLabel(msg) : null),
         mime: typeof mime === 'string' ? mime : null,
+        path: url ? mediaPathFromMessage(msg) : null,
+        thumb: previewUrls[msg.id] ?? null,
+        status: url ? 'ready' : mediaFailedFor(msg) ? 'unavailable' : downloading.has(msg.id) ? 'loading' : 'idle',
+        size: mediaSizeFromMessage(msg),
       });
     }
     return items;
   }
 
+  function mediaFailedFor(msg: Message): boolean {
+    return msg.metadata?.media_error != null;
+  }
+
+  const lightboxItems = $derived<LightboxItem[]>(lightboxOpen ? buildTabLightboxItems() : []);
+  const lightboxIndex = $derived(Math.max(0, lightboxItems.findIndex((i) => i.id === lightboxId)));
+
   function openLightboxForItem(msg: Message) {
-    const items = buildTabLightboxItems();
-    const idx = items.findIndex((i) => i.id === msg.id);
-    if (idx < 0) return;
-    lightboxItems = items;
-    lightboxIndex = idx;
+    lightboxId = msg.id;
     lightboxOpen = true;
   }
 
+  function findMessage(id: string): Message | undefined {
+    return [...(bundle?.media ?? []), ...(bundle?.docs ?? [])].find((m) => m.id === id);
+  }
+
   function saveLightboxItem(item: LightboxItem) {
-    const a = document.createElement('a');
-    a.href = item.url;
-    a.download = item.filename ?? `media-${item.id.slice(0, 8)}`;
-    a.click();
+    const msg = findMessage(item.id);
+    if (msg && conversation)
+      void saveMessageMediaFile(conversation.account_id, conversation.id, msg, mediaNameOwner(conversation, accounts));
+  }
+
+  async function downloadLightboxItem(item: LightboxItem) {
+    const msg = findMessage(item.id);
+    if (!msg || !conversation || downloading.has(msg.id)) return;
+    downloading = new Set([...downloading, msg.id]);
+    try {
+      const done = await downloadMessageMediaAndWait(conversation.account_id, conversation.id, msg.id);
+      if (bundle) {
+        const swap = (list: Message[]) => list.map((m) => (m.id === done.id ? done : m));
+        bundle = { ...bundle, media: swap(bundle.media ?? []), docs: swap(bundle.docs ?? []) };
+      }
+    } catch (e) {
+      notify.error(e instanceof Error ? e.message : 'Download failed');
+    } finally {
+      downloading = new Set([...downloading].filter((id) => id !== msg.id));
+    }
   }
 </script>
 
@@ -251,21 +293,28 @@
       </div>
     {/if}
 
-    {#if isDirect && account && canCall}
+    {#if isDirect && account && canCall && onstartcall}
       <div class="call-row">
-        {#if callsAudio}
-          <button type="button" class="call-btn" title="Audio call" onclick={() => handleCall('audio')}>
-            🎧 Audio
-          </button>
-        {/if}
-        {#if callsVideo}
+        <button type="button" class="call-btn" title="Audio call" onclick={() => handleCall('audio')}>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.79 19.79 0 0 1 2.12 4.18 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.9.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/>
+          </svg>
+          Audio
+        </button>
+        {#if canVideoCall}
           <button type="button" class="call-btn" title="Video call" onclick={() => handleCall('video')}>
-            📹 Video
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="2" y="6" width="13" height="12" rx="2"/><path d="m15 12 6-3.5v11L15 16z"/>
+            </svg>
+            Video
           </button>
         {/if}
       </div>
     {/if}
 
+    {#if transient}
+      <p class="muted">You have no chat with this person on this account.</p>
+    {:else}
     <div class="tabs">
       {#each (['media', 'docs', 'links', 'starred', 'account'] as const) as t (t)}
         <button type="button" class:active={tab === t} onclick={() => (tab = t)}>{t}</button>
@@ -281,24 +330,11 @@
           </div>
         {/if}
 
-        <div class="section-head">Global media retention</div>
-        <p class="retention-hint">Days to keep downloaded media locally. Leave blank to keep forever.</p>
-        <div class="retention-grid">
-          {#each RETENTION_FIELDS as field (field.key)}
-            <label class="retention-row">
-              <span class="retention-label">{field.label}</span>
-              <input
-                type="number"
-                min="1"
-                placeholder="∞"
-                value={retentionValue(field.key)}
-                oninput={(e) => setRetentionValue(field.key, e.currentTarget.value)}
-                class="retention-input"
-              />
-              <span class="retention-unit">days</span>
-            </label>
-          {/each}
-        </div>
+        <div class="section-head">Media</div>
+        <p class="retention-hint">
+          Downloads, saving and how long downloaded media is kept are in Settings → Media &amp; storage.
+          Right-click this chat in the list to change what downloads automatically here.
+        </p>
       </div>
     {:else if isGridTab}
       <div class="grid-scroll">
@@ -310,7 +346,7 @@
           <div class="item-grid">
             {#each tabItems as item (item.id)}
               {#if tab === 'media'}
-                {@const src = thumbSrc(item)}
+                {@const src = cellSrc(item)}
                 {@const kind = mediaKindFromMessage(item)}
                 <button type="button" class="grid-cell" title={kind ?? 'media'} onclick={() => openLightboxForItem(item)}>
                   {#if src}
@@ -369,6 +405,7 @@
         </select>
       </label>
     </div>
+    {/if}
 
     {#if tab !== 'account' && account}
       <div class="account-row bottom">
@@ -386,8 +423,9 @@
     items={lightboxItems}
     index={lightboxIndex}
     onclose={() => (lightboxOpen = false)}
-    onindex={(i) => (lightboxIndex = i)}
+    onindex={(i) => (lightboxId = lightboxItems[i]?.id ?? lightboxId)}
     onsave={saveLightboxItem}
+    ondownload={downloadLightboxItem}
   />
 {/if}
 
@@ -476,7 +514,9 @@
     flex: 1; padding: 8px; border-radius: 8px;
     border: 1px solid var(--border-subtle); background: var(--bg-hover);
     cursor: pointer; font-size: 13px;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
   }
+  .call-btn svg { flex: none; opacity: 0.85; }
   .call-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
   .tabs {
@@ -605,37 +645,6 @@
 
   .retention-hint {
     font-size: 11px; color: var(--text-muted); margin: 0;
-  }
-
-  .retention-grid {
-    display: flex; flex-direction: column; gap: 6px;
-  }
-
-  .retention-row {
-    display: grid;
-    grid-template-columns: 1fr 72px auto;
-    align-items: center;
-    gap: 8px;
-    font-size: 12px;
-  }
-
-  .retention-label { color: var(--text-secondary); }
-
-  .retention-input {
-    width: 100%;
-    padding: 4px 6px;
-    font-size: 12px;
-    border: 1px solid var(--border-subtle);
-    border-radius: 4px;
-    background: var(--bg-input);
-    color: var(--text);
-    text-align: right;
-  }
-
-  .retention-unit {
-    font-size: 11px;
-    color: var(--text-muted);
-    white-space: nowrap;
   }
 
   .toast {

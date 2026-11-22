@@ -384,10 +384,10 @@ Not legal advice.
 
 | Component | License | Implication |
 | --- | --- | --- |
-| Shuttle | AGPL-3.0 | Current project license |
-| mautrix bridges | AGPL-3.0 | Compatible with Shuttle; still extra compliance if bundled |
+| Shuttle | AGPL-3.0-or-later | Current project license |
+| mautrix bridges | AGPL-3.0 | Compatible with Shuttle's AGPL, but third-party AGPL code cannot be covered by Shuttle's commercial license |
 | mautrix-go | MPL-2.0 | File-level copyleft |
-| GOWA / whatsmeow | MIT / MPL-2.0 | Permissive |
+| GOWA / whatsmeow | MIT / MPL-2.0 | MIT is permissive; MPL-2.0 is file-level copyleft |
 | TDLib | BSL-1.0 | Official Telegram library |
 | signal-cli | GPL-3.0 | Already handled as a sidecar |
 | tuwunel | Confirm `LICENSE` before any bundle | Conduit-lineage FOSS; not a reason to adopt |

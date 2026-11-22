@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2000" height="2000" viewBox="0 0 2000 2000" role="img" aria-labelledby="title desc">
+<title id="title">Shuttle logo v1.1</title>
+<desc id="desc">White SHUTTLE lettering on a diagonal blue banner, with a separate blue paper airplane below. Transparent background. Lettering and artwork are editable vector paths.</desc>
+<path id="banner" fill="#0047C9" d="M1999,0 1987,0 0,1147 0,1999 16,1997 474,1732 475,1924 900,1486 1999,852Z"/>
+<path id="letter-1" fill="#FFFFFF" d="M226,1034 48,1137 48,1255 13,1275 13,1512 48,1494 48,1610 191,1529 191,1763 85,1825 84,1708 13,1748 13,1867 48,1849 48,1965 226,1862 226,1744 262,1723 262,1486 236,1502 226,1505 226,1388 84,1469 84,1236 190,1174 191,1291 262,1250 262,1131 236,1147 226,1150Z"/>
+<path id="letter-2" fill="#FFFFFF" d="M549,847 477,888 477,1242 372,1304 370,950 298,992 298,1821 370,1779 370,1424 476,1362 477,1717 549,1676Z"/>
+<path id="letter-3" fill="#FFFFFF" d="M836,680 763,722 763,1433 658,1494 656,784 584,826 584,1537 619,1518 619,1636 799,1531 799,1413 836,1391Z"/>
+<path id="letter-4" fill="#FFFFFF" d="M1122,514 906,639 906,758 975,718 978,719 978,1428 1051,1385 1051,675 1122,633Z"/>
+<path id="letter-5" fill="#FFFFFF" d="M1411,347 1193,473 1193,591 1265,552 1265,1262 1339,1219 1338,508 1411,465Z"/>
+<path id="letter-6" fill="#FFFFFF" d="M1554,263 1481,306 1482,1137 1699,1011 1699,893 1554,975Z"/>
+<path id="letter-7" fill="#FFFFFF" d="M1988,12 1734,158 1734,991 1988,845 1988,725 1820,823 1807,828 1807,593 1951,509 1951,389 1807,471 1807,237 1988,130Z"/>
+<path id="plane-wings" fill="#3879FF" d="M2000 951 1005 1524 1400 1674 1400 1925 1622 1756 2000 1898Z"/>
+<path id="plane-tail" fill="#1C5CE7" d="M1400 1925 1622 1756 1528 1719Z"/>
+<path id="plane-fold" fill="#003FD0" d="M1907 1102 1400 1674 1400 1925Z"/>
+</svg>

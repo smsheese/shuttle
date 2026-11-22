@@ -26,10 +26,6 @@ if [[ ! -f "$ROOT/connectors/signal/signal-cli.exe" && ! -f "$ROOT/connectors/si
   exit 1
 fi
 
-if [[ ! -f "$ROOT/third-party/licenses/AGPL-3.0.txt" ]]; then
-  cp -f "$ROOT/LICENSE" "$ROOT/third-party/licenses/AGPL-3.0.txt"
-fi
-
 if [[ ! -d "$ROOT/connectors/signal/runtime" ]]; then
   mkdir -p "$ROOT/connectors/signal/runtime"
   echo "Native signal-cli build; no JVM runtime bundled." > "$ROOT/connectors/signal/runtime/README"

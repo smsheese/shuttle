@@ -207,6 +207,15 @@
     cropRect = null;
   }
 
+  let backdropDown = false;
+
+  function onWindowKey(e: KeyboardEvent) {
+    if (!open || e.key !== 'Escape' || busy) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    oncancel();
+  }
+
   async function exportAndSend() {
     if (!canvasEl || busy) return;
     busy = true;
@@ -233,8 +242,19 @@
   }
 </script>
 
+<svelte:window onkeydown={onWindowKey} />
+
 {#if open}
-  <div class="backdrop" role="presentation" onclick={oncancel}></div>
+  <div
+    class="backdrop"
+    role="presentation"
+    onpointerdown={(e) => (backdropDown = e.target === e.currentTarget)}
+    onpointerup={(e) => {
+      const close = backdropDown && e.target === e.currentTarget;
+      backdropDown = false;
+      if (close && !busy) oncancel();
+    }}
+  ></div>
   <div class="editor" role="dialog" aria-modal="true" aria-label="Edit image">
     <header class="head">
       <h2>Edit image</h2>

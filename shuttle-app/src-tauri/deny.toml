@@ -1,0 +1,25 @@
+# Shuttle ships under AGPL-3.0-or-later plus a commercial license (docs/licensing.md), so every
+# linked crate must be permissive or dual-licensed with a permissive option. Run: cargo deny check
+
+[graph]
+all-features = false
+
+[advisories]
+ignore = [
+    # crypto-bigint timing variability, reached only through `age` (p256 via hpke). Backups are a
+    # local file the user encrypts and decrypts; there is no remote timing oracle. Revisit on the next `age` release.
+    { id = "RUSTSEC-2026-0387", reason = "age -> p256 -> crypto-bigint 0.5; no remote oracle, no patched path yet" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono is flagged unmaintained, not vulnerable; used across the codebase and Tauri, no drop-in replacement planned for 0.6.0" },
+]
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "MIT", "MIT-0", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-1-Clause", "BSD-2-Clause", "BSD-3-Clause",
+    "ISC", "0BSD", "Zlib", "Unlicense", "CC0-1.0", "BSL-1.0", "Unicode-3.0", "CDLA-Permissive-2.0",
+    "bzip2-1.0.6", "MPL-2.0", "AGPL-3.0-or-later",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"

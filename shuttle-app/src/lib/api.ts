@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { isTauri, mockApi } from './mock';
 import type {
@@ -11,6 +11,7 @@ import type {
   ComponentInstallProgress,
   ConnectorRequirements,
   InstalledComponent,
+  MediaCacheInfo,
   Conversation,
   Contact,
   ContactProfileBundle,
@@ -19,15 +20,22 @@ import type {
   ForwardRule,
   ForwardRuleDraft,
   ForwardRulePatch,
+  ForwardResult,
+  ForwardTarget,
   Message,
+  MessageOp,
+  MessageOpResult,
   PriorityGroup,
   BackupManifest,
-  Reminder,
+  ChatNote,
+  NoteSchedule,
   ScheduledMessage,
   ScheduleMessageDraft,
   SearchResults,
   SearchScope,
+  SenderContact,
   ShuttleEvent,
+  Translation,
   Workspace,
 } from './types';
 import type { TelemetryErrorContext, TelemetryProps } from './telemetry/types';
@@ -183,6 +191,34 @@ export async function startConversation(
     : mockApi.startConversation(accountId, remoteId, title);
 }
 
+/**
+ * Ask the connector whether a number is on WhatsApp. Resolves true/false, or null when the
+ * check could not be made (offline, sleeping account, timeout): the caller carries on then.
+ */
+export async function checkWhatsappNumber(accountId: string, phone: string): Promise<boolean | null> {
+  if (!isTauri()) return mockApi.checkWhatsappNumber(phone);
+  const requestId = crypto.randomUUID();
+  let finish!: (value: boolean | null) => void;
+  const answered = new Promise<boolean | null>((resolve) => { finish = resolve; });
+  const unlisten = await onShuttleEvent((event) => {
+    if (event.kind !== 'number.checked' || event.payload.account_id !== accountId) return;
+    const data = event.payload.data as { request_id?: string; on_whatsapp?: boolean | null } | undefined;
+    if (data?.request_id !== requestId) return;
+    finish(typeof data.on_whatsapp === 'boolean' ? data.on_whatsapp : null);
+  });
+  const timeout = setTimeout(() => finish(null), 6000);
+  try {
+    // Subscribed first, so a fast reply cannot be missed.
+    await invoke('check_whatsapp_number', { accountId, phone, requestId });
+    return await answered;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+    unlisten();
+  }
+}
+
 export async function createGroup(
   accountId: string,
   title: string,
@@ -195,14 +231,19 @@ export async function createGroup(
   }
 }
 
+/**
+ * Download a message's media into the app cache. `auto` marks a download nobody asked for (a
+ * thread rendering): the core only goes ahead when the chat/account auto-download setting
+ * allows that kind. Returns whether a download was requested.
+ */
 export async function downloadMessageMedia(
   accountId: string,
   conversationId: string,
-  messageId: string
-): Promise<void> {
-  if (isTauri()) {
-    await invoke('download_message_media', { accountId, conversationId, messageId });
-  }
+  messageId: string,
+  auto = false
+): Promise<boolean> {
+  if (!isTauri()) return false;
+  return invoke<boolean>('download_message_media', { accountId, conversationId, messageId, auto });
 }
 
 export async function downloadStatusMedia(accountId: string, messageId: string): Promise<void> {
@@ -211,12 +252,110 @@ export async function downloadStatusMedia(accountId: string, messageId: string):
   }
 }
 
-export async function readMessageMedia(path: string): Promise<string> {
-  return invoke('read_message_media', { path });
+/** Subscribe before requesting: the command acknowledges queuing, not completion. */
+export async function downloadMessageMediaAndWait(
+  accountId: string, conversationId: string, messageId: string
+): Promise<Message> {
+  let finish!: (message: Message) => void;
+  let fail!: (error: Error) => void;
+  const completed = new Promise<Message>((resolve, reject) => { finish = resolve; fail = reject; });
+  const unlisten = await onShuttleEvent((event) => {
+    if (event.kind !== 'media.downloaded' || event.payload.account_id !== accountId) return;
+    const message = event.payload.message as Message | undefined;
+    if (message?.id !== messageId || message.conversation_id !== conversationId) return;
+    if (message.metadata?.media_error) fail(new Error(String(message.metadata.media_error)));
+    else finish(message);
+  });
+  const timeout = setTimeout(() => fail(new Error('Media download timed out')), 120000);
+  try {
+    // Observe completion while the invoke is in flight so failures never become
+    // unhandled rejections and fast connector replies cannot be missed.
+    const [message] = await Promise.all([completed, downloadMessageMedia(accountId, conversationId, messageId)]);
+    return message;
+  } finally {
+    clearTimeout(timeout);
+    unlisten();
+  }
 }
 
-export async function shuttleFilesRoot(accountId: string): Promise<string> {
-  return invoke('shuttle_files_root', { accountId });
+export async function readMessageMedia(path: string): Promise<string> {
+  const localPath = await invoke<string>('read_message_media', { path });
+  return convertFileSrc(localPath);
+}
+
+/** The two names that head a generated file name. */
+export interface MediaNameOwner {
+  accountName?: string | null;
+  chatName?: string | null;
+}
+
+/** What the UI knows about a media message; the core builds a readable file name from it. */
+export interface MediaNameInfo {
+  /** `image`, `video`, `audio`, `sticker`, `document`, ... */
+  kind?: string | null;
+  /** The file name WhatsApp reported (kept for documents). */
+  filename?: string | null;
+  /** Message time (RFC 3339). */
+  timestamp?: string | null;
+  /** The account's name, the first half of a generated name. */
+  accountName?: string | null;
+  /** The chat's title, the second half of a generated name. */
+  chatName?: string | null;
+}
+
+/**
+ * Copy a downloaded file to the user's save folder (native dialog when "ask each time" is on).
+ * Resolves the path written, or null when the user cancelled. Never overwrites. The file is
+ * named from `name` (documents keep their name) or "Work-Mum-261112-1325.jpg" style, built
+ * from the account, the chat and the message time.
+ */
+export async function saveMediaFile(sourcePath: string, name: MediaNameInfo = {}): Promise<string | null> {
+  return invoke<string | null>('save_media_file', {
+    sourcePath,
+    suggestedName: name.filename ?? null,
+    kind: name.kind ?? null,
+    timestamp: name.timestamp ?? null,
+    accountName: name.accountName ?? null,
+    chatName: name.chatName ?? null,
+  });
+}
+
+/** What `copyMediaToClipboard` put on the clipboard (see src-tauri/src/clipboard.rs). */
+export type ClipboardCopyKind = 'image' | 'file' | 'path_text';
+
+/**
+ * Copy a downloaded media file to the system clipboard so it pastes into other apps: image
+ * data plus a file reference for images, a file reference otherwise. The pasted file has a
+ * readable name built from `name`. `path_text` means the OS could not take a file and only
+ * the path was copied.
+ */
+export async function copyMediaToClipboard(
+  path: string,
+  name: MediaNameInfo = {}
+): Promise<ClipboardCopyKind> {
+  return invoke<ClipboardCopyKind>('copy_media_to_clipboard', {
+    path,
+    kind: name.kind ?? null,
+    filename: name.filename ?? null,
+    timestamp: name.timestamp ?? null,
+    accountName: name.accountName ?? null,
+    chatName: name.chatName ?? null,
+  });
+}
+
+/** Show a saved file selected in the OS file manager. */
+export async function revealInFileManager(path: string): Promise<void> {
+  await invoke('reveal_in_file_manager', { path });
+}
+
+export async function mediaCacheInfo(): Promise<MediaCacheInfo> {
+  return isTauri()
+    ? invoke('media_cache_info')
+    : { bytes: 0, files: 0, save_dir: '~/Documents/shuttle' };
+}
+
+export async function clearMediaCache(): Promise<{ files: number; bytes: number }> {
+  return isTauri() ? invoke('clear_media_cache') : { files: 0, bytes: 0 };
 }
 
 export async function fetchConversationAvatar(
@@ -252,11 +391,17 @@ export async function getMessages(conversationId: string, limit?: number): Promi
 export async function sendMessage(
   accountId: string,
   conversationId: string,
-  text: string
+  text: string,
+  replyToMessageId?: string | null
 ): Promise<Message> {
   return isTauri()
-    ? invoke('send_message', { accountId, conversationId, text })
-    : mockApi.sendMessage(accountId, conversationId, text);
+    ? invoke('send_message', {
+        accountId,
+        conversationId,
+        text,
+        replyToMessageId: replyToMessageId ?? null,
+      })
+    : mockApi.sendMessage(accountId, conversationId, text, replyToMessageId ?? null);
 }
 
 export async function sendAttachment(
@@ -278,18 +423,25 @@ export async function sendAttachment(
         question: attachment.question ?? null,
         options: attachment.options ?? null,
         maxAnswer: attachment.max_answer ?? null,
+        replyToMessageId: attachment.reply_to_message_id ?? null,
       })
     : mockApi.sendAttachment(accountId, conversationId, attachment);
 }
 
-export async function forwardMessage(
-  destAccountId: string,
-  destConversationId: string,
-  text: string
-): Promise<Message> {
+/**
+ * Forward messages of one chat to chats on any account. Each message is sent again as itself
+ * (text, or media with its caption); with `sendAt` (ISO) the forward is scheduled instead.
+ * One result per (target, message).
+ */
+export async function forwardMessages(
+  sourceConversationId: string,
+  messageIds: string[],
+  targets: ForwardTarget[],
+  sendAt?: string | null
+): Promise<ForwardResult[]> {
   return isTauri()
-    ? invoke('forward_message', { destAccountId, destConversationId, text })
-    : mockApi.sendMessage(destAccountId, destConversationId, text);
+    ? invoke('forward_messages', { sourceConversationId, messageIds, targets, sendAt: sendAt ?? null })
+    : mockApi.forwardMessages(sourceConversationId, messageIds, targets, sendAt ?? null);
 }
 
 export async function markRead(conversationId: string, sendRemote?: boolean): Promise<void> {
@@ -324,8 +476,33 @@ export async function searchMessages(
     : { conversations: await mockApi.searchConversations(query), messages: [] };
 }
 
+/** React to, edit or delete messages of one chat. The stored result arrives as events. */
+export async function applyMessageOp(
+  conversationId: string,
+  messageIds: string[],
+  op: MessageOp
+): Promise<MessageOpResult[]> {
+  return isTauri()
+    ? invoke('apply_message_op', { conversationId, messageIds, op })
+    : mockApi.applyMessageOp(conversationId, messageIds, op);
+}
+
+/**
+ * Translate messages of one chat into `target` with the user's OpenRouter model. Rejects with a
+ * `TranslateError` (`not_configured` when Settings has no OpenRouter key).
+ */
+export async function translateText(
+  conversationId: string,
+  messageIds: string[],
+  target: string
+): Promise<Translation[]> {
+  return isTauri()
+    ? invoke('translate_text', { conversationId, messageIds, target })
+    : mockApi.translateText(conversationId, messageIds, target);
+}
+
 export async function starMessage(messageId: string, starred: boolean): Promise<Message> {
-  return isTauri() ? invoke('star_message', { messageId, starred }) : ({} as Message);
+  return isTauri() ? invoke('star_message', { messageId, starred }) : mockApi.starMessage(messageId, starred);
 }
 
 export async function pinMessage(messageId: string, pinned: boolean): Promise<Message> {
@@ -345,6 +522,13 @@ export async function fetchContactProfile(
         links: [],
         starred: [],
       };
+}
+
+/** A group member's direct chat on the same account, or their contact entry. Creates nothing. */
+export async function senderContact(accountId: string, senderId: string): Promise<SenderContact> {
+  return isTauri()
+    ? invoke('sender_contact', { accountId, senderId })
+    : mockApi.senderContact(accountId, senderId);
 }
 
 export async function startCall(
@@ -375,6 +559,12 @@ export async function rejectCall(accountId: string, callId: string): Promise<voi
 
 export async function hangupCall(accountId: string, callId: string): Promise<void> {
   if (isTauri()) await invoke('hangup_call', { accountId, callId });
+}
+
+export async function unreadByAccount(): Promise<Record<string, number>> {
+  if (isTauri()) return invoke('unread_by_account');
+  const conversations = await mockApi.listConversations(undefined, undefined, undefined, false, 0, 10000);
+  return conversations.reduce((out: Record<string, number>, c: Conversation) => { out[c.account_id] = (out[c.account_id] ?? 0) + c.unread_count; return out; }, {});
 }
 
 export async function totalUnread(): Promise<number> {
@@ -448,11 +638,19 @@ export async function addTodo(
   conversationId: string,
   accountId: string,
   body: string,
-  dueAt?: string
+  dueAt?: string,
+  messageRef?: MessageRef
 ): Promise<ChatTodo> {
   return isTauri()
-    ? invoke('add_todo', { conversationId, accountId, body, dueAt: dueAt ?? null })
-    : mockApi.addTodo(conversationId, accountId, body, dueAt);
+    ? invoke('add_todo', {
+        conversationId,
+        accountId,
+        body,
+        dueAt: dueAt ?? null,
+        messageId: messageRef?.id ?? null,
+        messageSnippet: messageRef?.snippet ?? null,
+      })
+    : mockApi.addTodo(conversationId, accountId, body, dueAt, messageRef);
 }
 
 export async function setTodoDone(id: string, done: boolean): Promise<void> {
@@ -463,32 +661,51 @@ export async function deleteTodo(id: string): Promise<void> {
   return isTauri() ? invoke('delete_todo', { id }) : mockApi.deleteTodo(id);
 }
 
-export async function listReminders(conversationId?: string): Promise<Reminder[]> {
-  return isTauri()
-    ? invoke('list_reminders', { conversationId: conversationId ?? null })
-    : mockApi.listReminders(conversationId);
+/** A message a todo or note was created from. */
+export interface MessageRef {
+  id: string;
+  snippet: string;
 }
 
-export async function createReminder(
+export async function listNotes(conversationId: string): Promise<ChatNote[]> {
+  return isTauri() ? invoke('list_notes', { conversationId }) : mockApi.listNotes(conversationId);
+}
+
+export async function addNote(
   conversationId: string,
   accountId: string,
-  fireAt: string,
-  kind?: string,
-  note?: string
-): Promise<Reminder> {
+  body: string,
+  opts: { messageRef?: MessageRef; schedule?: NoteSchedule } = {}
+): Promise<ChatNote> {
   return isTauri()
-    ? invoke('create_reminder', {
+    ? invoke('add_note', {
         conversationId,
         accountId,
-        fireAt,
-        kind: kind ?? null,
-        note: note ?? null,
+        body,
+        messageId: opts.messageRef?.id ?? null,
+        messageSnippet: opts.messageRef?.snippet ?? null,
+        schedule: opts.schedule ?? null,
       })
-    : mockApi.createReminder(conversationId, accountId, fireAt, kind, note);
+    : mockApi.addNote(conversationId, accountId, body, opts);
 }
 
-export async function deleteReminder(id: string): Promise<void> {
-  return isTauri() ? invoke('delete_reminder', { id }) : mockApi.deleteReminder(id);
+/** Change a note's text and/or schedule; `clearSchedule` cancels its timer or alarm. */
+export async function updateNote(
+  id: string,
+  patch: { body?: string; schedule?: NoteSchedule; clearSchedule?: boolean }
+): Promise<ChatNote> {
+  return isTauri()
+    ? invoke('update_note', {
+        id,
+        body: patch.body ?? null,
+        schedule: patch.schedule ?? null,
+        clearSchedule: patch.clearSchedule ?? false,
+      })
+    : mockApi.updateNote(id, patch);
+}
+
+export async function deleteNote(id: string): Promise<void> {
+  return isTauri() ? invoke('delete_note', { id }) : mockApi.deleteNote(id);
 }
 
 export async function listForwardRules(): Promise<ForwardRule[]> {
@@ -563,7 +780,7 @@ export async function openDevtools(): Promise<void> {
 }
 
 export function onShuttleEvent(handler: (event: ShuttleEvent) => void): Promise<UnlistenFn> {
-  if (!isTauri()) return mockApi.onShuttleEvent();
+  if (!isTauri()) return mockApi.onShuttleEvent(handler);
   return listen<ShuttleEvent>('shuttle-event', (e) => handler(e.payload));
 }
 
@@ -594,6 +811,11 @@ export async function telemetryPerformance(
 export async function telemetrySetForeground(foreground: boolean): Promise<void> {
   if (!isTauri()) return;
   await invoke('telemetry_set_foreground', { foreground });
+}
+
+export async function telemetryInstallationId(): Promise<string> {
+  if (!isTauri()) return '';
+  return invoke<string>('telemetry_installation_id');
 }
 
 export const DATETIME_FORMATS: { id: string; label: string; example: string }[] = [

@@ -1,0 +1,39 @@
+name: Bug report
+description: Something in Shuttle does not work
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Shuttle version
+      description: Settings → About, or the installer file name
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [Linux, Windows, macOS (Apple Silicon), macOS (Intel)]
+    validations:
+      required: true
+  - type: input
+    id: network
+    attributes:
+      label: Network
+      description: WhatsApp, Telegram, Signal, ...
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected and what happened
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        Do not attach GOWA, TDLib or signal-cli session files, backups, or config files with keys. Remove phone numbers and tokens from logs.

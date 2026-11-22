@@ -39,7 +39,7 @@ Architecture: [overview.md](overview.md). History: [CHANGELOG.md](../CHANGELOG.m
 | 9. More networks | X, iMessage, SMS, Google Chat, LinkedIn, then others | partial (Matrix added; rest planned) |
 | 10. Calls | Audio first, then video — network-dependent | partial (protocol kept; UI is honest — no fake WebRTC) |
 | 11. Platforms | amd64 + arm64 desktop on Windows, Linux, macOS; Android later | partial (desktop CI + docs; Android future) |
-| 12. Telemetry | Opt-in Sentry / PostHog, `.env` vs GitHub Environments | done (0.0.9–0.1.0) |
+| 12. Telemetry | Opt-in PostHog, `.env` vs GitHub Environments | done (0.0.9–0.1.0) |
 | 13. Resource budget | Beat Ferdium by 50–70% RSS on a comparable multi-account idle load | partial (sleep + shared sidecars + `scripts/rss-sample.sh`; Shuttle numbers not yet measured) |
 | 14. Daily-driver chrome | Tray, quick switch, shortcuts, account sleep, search polish | partial (must-haves landed; FTS polish and later QoL remain) |
 

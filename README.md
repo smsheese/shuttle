@@ -10,15 +10,15 @@ Shuttle aims to be the **no-thought answer** for low resource use: fast and resp
 - **Sign-in that matches the network** — QR, phone + code, password, or IMAP/SMTP
 - **Data stays local** — per-account SQLite inboxes, appearance in `config.json`, credentials in the OS keyring
 - **Native notifications** with quiet hours and per-account / per-chat mute; read receipts off until you opt in
-- **Organization** — workspaces, priority groups, chat notes, todos, and one-shot reminders
+- **Organization** — workspaces, priority groups, per-chat notes (optionally with a timer or alarm), and todos that can quote a message
 - **Routing** — forward between chats or accounts, delayed send, scheduled messages
 - **Themes** — system light/dark, bundled presets, or pasted CSS
 - **Daily-driver chrome** — system tray (close-to-tray), Ctrl/Cmd+K quick switch, keyboard shortcuts
 - **Account sleep** — idle connectors hibernate after a few minutes; wake when you open that account (distinct from disable)
 - **Shared sidecars** — one Python process per network, not per account
-- **Media** — in-thread players, lightbox, canvas image editor on attach
+- **Media** — in-thread players, lightbox, canvas image editor on attach; downloads go to a private cache with per-account/per-chat auto-download rules and timed cleanup, and only files you save land in your save folder (never overwritten)
 - **Backup / restore** — password-protected export/import with optional media; restart after restore
-- **Optional telemetry** (Sentry / PostHog) — off by default, with Settings → Privacy toggles
+- **Optional telemetry** (PostHog) — off by default, with Settings → Privacy toggles
 
 Product north star (lightweight · responsive · cross-platform · QoL · contributor-friendly) and remaining work: [docs/roadmap.md](docs/roadmap.md). Architecture: [docs/](docs/README.md).
 
@@ -42,9 +42,7 @@ Full credits and redistribution notes: [ATTRIBUTION.md](ATTRIBUTION.md). Protoco
 
 ## License
 
-Shuttle (the desktop app, Rust core, and connector wrappers) is **[AGPL-3.0](LICENSE)**.
-
-AGPL is a copyleft license with a **network clause**: if you modify Shuttle and run it as a service that users interact with over a network, you must offer them the corresponding source. That is intentional — Shuttle is meant to stay open, not disappear behind a proprietary SaaS wrapper.
+Shuttle (the desktop app, Rust core, and connector wrappers) is free and open source under the **[GNU AGPL-3.0-or-later](LICENSE)**. Anyone may use, modify and build on it; if you distribute it or run a modified version as a service, you must share your source under the same license. Products that cannot do that can buy a [commercial license](COMMERCIAL-LICENSE.md). Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Third-party integrators keep **their own licenses**. Shuttle does not relicense them. In particular:
 
@@ -73,6 +71,21 @@ Messages and sessions live under the OS application data directory (on Linux, `~
 | Windows | yes | yes | `.msi`, NSIS `.exe` |
 
 Android is a possible future target and is not in the current build. See [docs/platforms.md](docs/platforms.md).
+
+## Install
+
+Download the installer for your system from the [latest release](https://github.com/smsheese/shuttle/releases/latest): `.dmg` (macOS), `.msi` or `-setup.exe` (Windows), `.deb`, `.rpm` or `.AppImage` (Linux). Verify with `SHA256SUMS`; Linux packages carry detached `.asc` GPG signatures when the release was signed. Shuttle has no auto-updater yet, so install new releases by hand. Network components (WhatsApp, Telegram, Signal, ...) download from the same release when you add the first account of that network.
+
+**Unsigned test builds.** The 0.6.0 builds are not code-signed yet, so each OS warns on first launch.
+- **Windows.** SmartScreen shows "Windows protected your PC". Choose *More info*, then *Run anyway*.
+- **macOS.** Gatekeeper says the app is damaged or from an unidentified developer. Drag Shuttle to Applications, then run `xattr -dr com.apple.quarantine /Applications/Shuttle.app` once, or right-click the app and choose *Open*.
+- **Linux.** No warning. Check `SHA256SUMS` against the download.
+
+**Before you add WhatsApp.** Shuttle talks to WhatsApp through GOWA, an unofficial client. WhatsApp may restrict numbers that use unofficial clients, so use a spare number if the account matters to you. Calls cannot be placed from Shuttle; the call buttons hand off to WhatsApp.
+
+**Bring your own keys.** GIF and sticker search needs your own free Giphy key, and Translate needs your OpenRouter key and model id. Both go in Settings. Shuttle ships with none.
+
+**Telemetry.** Privacy policy: [PRIVACY.md](PRIVACY.md). Anonymous usage and crash diagnostics go to Shuttle's own PostHog project only if you turn them on in Settings → Privacy. Both are off by default. What is sent: [docs/telemetry-events.md](docs/telemetry-events.md). Security reports: [SECURITY.md](SECURITY.md).
 
 ## Quick start
 
@@ -103,7 +116,7 @@ SHUTTLE_COMPONENTS_BASE_URL=https://your-cdn.example/shuttle/components ./script
 
 Set `SHUTTLE_COMPONENTS_BASE_URL` when building release installers so the app knows where to fetch `v{version}/manifest.json`.
 
-Optional overrides: `SHUTTLE_DATA_DIR`, `SHUTTLE_PYTHON`, `SHUTTLE_GOWA_BIN`, `SHUTTLE_TDLIB`, `SHUTTLE_SIGNAL_CLI`.
+Optional overrides: `SHUTTLE_DATA_DIR`, `SHUTTLE_PYTHON`, `SHUTTLE_GOWA_BIN`, `SHUTTLE_GOWA_VERSION`, `SHUTTLE_TDLIB`, `SHUTTLE_SIGNAL_CLI`. The GOWA release is pinned and checked against SHA-256; see [connectors/gowa/README.md](connectors/gowa/README.md).
 
 For local telemetry testing, copy [`.env.example`](.env.example) to `.env`. Production CI builds bake GitHub Environment secrets into the binary. See [docs/telemetry-events.md](docs/telemetry-events.md).
 
@@ -143,7 +156,7 @@ Desktop notifications use D-Bus (`notify-rust`). Cinnamon / GNOME / KDE already 
 | [docs/core.md](docs/core.md) | Protocol, data model, Tauri commands |
 | [docs/storage.md](docs/storage.md) | Where files live and how they are protected |
 | [docs/platforms.md](docs/platforms.md) | OS / CPU matrix and packaging |
-| [docs/licensing.md](docs/licensing.md) | AGPL-3.0 and third-party licenses |
+| [docs/licensing.md](docs/licensing.md) | AGPL-3.0, commercial licensing and third-party licenses |
 | [docs/roadmap.md](docs/roadmap.md) | Remaining work |
 | [docs/telemetry-events.md](docs/telemetry-events.md) | Opt-in telemetry |
 

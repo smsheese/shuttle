@@ -41,7 +41,9 @@ mod windows_job {
         SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
 
     static JOB: OnceLock<HANDLE> = OnceLock::new();
 
@@ -49,7 +51,9 @@ mod windows_job {
         JOB.get_or_init(|| unsafe {
             let job = CreateJobObjectW(null_mut(), null_mut());
             if job.is_null() {
-                tracing::warn!("CreateJobObjectW failed; connector orphans may survive Shuttle exit");
+                tracing::warn!(
+                    "CreateJobObjectW failed; connector orphans may survive Shuttle exit"
+                );
                 return job;
             }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
@@ -61,7 +65,9 @@ mod windows_job {
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             );
             if ok == 0 {
-                tracing::warn!("SetInformationJobObject failed; connector orphans may survive Shuttle exit");
+                tracing::warn!(
+                    "SetInformationJobObject failed; connector orphans may survive Shuttle exit"
+                );
             }
             job
         });

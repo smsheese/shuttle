@@ -23,10 +23,6 @@ if [[ ! -f "$ROOT/third-party/licenses/signal-cli-GPL-3.0.txt" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$ROOT/third-party/licenses/AGPL-3.0.txt" ]]; then
-  cp -f "$ROOT/LICENSE" "$ROOT/third-party/licenses/AGPL-3.0.txt"
-fi
-
 # Tauri resource map includes runtime/; native builds do not ship a JVM tree.
 if [[ ! -d "$ROOT/connectors/signal/runtime" ]]; then
   mkdir -p "$ROOT/connectors/signal/runtime"

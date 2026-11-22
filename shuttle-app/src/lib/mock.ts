@@ -11,14 +11,38 @@ import type {
   ForwardRule,
   ForwardRuleDraft,
   ForwardRulePatch,
+  ForwardResult,
+  ForwardTarget,
   Message,
+  MessageActions,
+  MessageOp,
+  MessageOpResult,
   PriorityGroup,
   BackupManifest,
-  Reminder,
+  ChatNote,
+  NoteSchedule,
   ScheduledMessage,
   ScheduleMessageDraft,
+  SenderContact,
+  ShuttleEvent,
+  StatusItem,
+  Translation,
   Workspace,
 } from './types';
+import { offeredActions, withMyReaction } from './messageActions';
+import { captionText } from './messageMedia';
+
+const DEMO_PHOTO =
+  'data:image/svg+xml;utf8,' +
+  encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f6a35b"/><stop offset="1" stop-color="#6b4fa3"/></linearGradient></defs><rect width="320" height="200" fill="url(#g)"/><circle cx="160" cy="130" r="34" fill="#ffd27a"/><rect y="150" width="320" height="50" fill="#2d3c66"/></svg>'
+  );
+
+const DEMO_STICKER =
+  'data:image/svg+xml;utf8,' +
+  encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><g fill="none" stroke="#e11d48" stroke-width="9" stroke-linecap="round"><path d="M46 118c22-4 40-22 44-44"/><path d="M56 58l-6 14M88 46l-2 16M108 62l-12 10"/></g><circle cx="44" cy="120" r="19" fill="#f59e0b"/><circle cx="116" cy="118" r="9" fill="#22d3ee"/><circle cx="98" cy="96" r="6" fill="#a855f7"/></svg>'
+  );
 
 const DEMO_ACCOUNTS: Account[] = [
   {
@@ -54,6 +78,7 @@ const DEMO_CONVERSATIONS: Conversation[] = [
     unread_count: 2,
     last_message_at: new Date(Date.now() - 600000).toISOString(),
     last_message_preview: 'See you tomorrow! 🎉',
+    last_message_from_me: true,
     pinned: true,
     archived: false,
     muted: false,
@@ -68,7 +93,10 @@ const DEMO_CONVERSATIONS: Conversation[] = [
     conversation_type: 'group',
     unread_count: 5,
     last_message_at: new Date(Date.now() - 7200000).toISOString(),
-    last_message_preview: 'Alex: Updated the mockups in Figma',
+    last_message_preview: 'Updated the mockups in Figma',
+    last_message_from_me: false,
+    last_message_sender_id: 'alex@s.whatsapp.net',
+    last_message_sender_name: 'Alex Rivera',
     pinned: false,
     archived: false,
     muted: false,
@@ -84,6 +112,7 @@ const DEMO_CONVERSATIONS: Conversation[] = [
     unread_count: 1,
     last_message_at: new Date(Date.now() - 18000000).toISOString(),
     last_message_preview: "Don't forget to call grandma this weekend ❤️",
+    last_message_from_me: false,
     pinned: false,
     archived: false,
     muted: false,
@@ -99,6 +128,9 @@ const DEMO_CONVERSATIONS: Conversation[] = [
     unread_count: 12,
     last_message_at: new Date(Date.now() - 86400000).toISOString(),
     last_message_preview: 'New async patterns discussion thread',
+    last_message_from_me: false,
+    last_message_sender_id: '+14155550123',
+    last_message_sender_name: null,
     pinned: false,
     archived: false,
     muted: false,
@@ -114,10 +146,245 @@ const DEMO_CONVERSATIONS: Conversation[] = [
     unread_count: 0,
     last_message_at: new Date(Date.now() - 172800000).toISOString(),
     last_message_preview: 'Thanks for the intro!',
+    last_message_from_me: true,
     pinned: false,
     archived: false,
     muted: false,
     metadata: {},
+  },
+  {
+    id: 'c6',
+    account_id: 'wa-1',
+    remote_id: 'r6@g.us',
+    contact_id: null,
+    title: 'Rent Appartment Riyadh',
+    conversation_type: 'group',
+    unread_count: 3,
+    last_message_at: new Date(Date.now() - 3600000).toISOString(),
+    last_message_preview: 'Maintenance visit on Thursday at 10:00',
+    last_message_from_me: false,
+    last_message_sender_id: '15550123456@s.whatsapp.net',
+    last_message_sender_name: 'Building Manager',
+    pinned: false,
+    archived: false,
+    muted: false,
+    // Only admins may post here and this account is not one: the composer is locked.
+    metadata: { announce_only: true, self_is_admin: false },
+  },
+  // Places where WhatsApp only gave a label, to check the UI never prints one when a real
+  // name is known, and prints a neutral label when it is not.
+  {
+    id: 'g1',
+    account_id: 'wa-1',
+    remote_id: '120363040000000001@g.us',
+    contact_id: null,
+    title: 'Group',
+    conversation_type: 'group',
+    unread_count: 0,
+    last_message_at: new Date(Date.now() - 9000000).toISOString(),
+    last_message_preview: 'Handover notes are in the shared folder',
+    last_message_from_me: false,
+    pinned: false,
+    archived: false,
+    muted: false,
+    metadata: { names: { subject: 'Villa Owners' } },
+  },
+  {
+    id: 'g2',
+    account_id: 'wa-1',
+    remote_id: '120363040000000002@g.us',
+    contact_id: null,
+    title: 'Group',
+    conversation_type: 'group',
+    unread_count: 0,
+    last_message_at: new Date(Date.now() - 30000000).toISOString(),
+    last_message_preview: 'Anyone still in the building?',
+    last_message_from_me: false,
+    pinned: false,
+    archived: false,
+    muted: false,
+    metadata: {},
+  },
+  {
+    id: 'ch1',
+    account_id: 'wa-1',
+    remote_id: '120363040000000003@newsletter',
+    contact_id: null,
+    title: 'Channel',
+    conversation_type: 'channel',
+    unread_count: 3,
+    last_message_at: new Date(Date.now() - 1800000).toISOString(),
+    last_message_preview: 'Shuttle 0.5 is out with a faster inbox',
+    last_message_from_me: false,
+    pinned: false,
+    archived: false,
+    muted: false,
+    metadata: { names: { subject: 'Shuttle News' } },
+  },
+  {
+    id: 'ch2',
+    account_id: 'wa-1',
+    remote_id: '120363040000000004@newsletter',
+    contact_id: null,
+    title: 'Newsletter 120363040000000004',
+    conversation_type: 'channel',
+    unread_count: 0,
+    last_message_at: new Date(Date.now() - 7200000).toISOString(),
+    last_message_preview: 'This week: type scales that hold up',
+    last_message_from_me: false,
+    pinned: false,
+    archived: false,
+    muted: false,
+    metadata: { names: { subject: 'Design Digest' } },
+  },
+  {
+    id: 'ch3',
+    account_id: 'wa-1',
+    remote_id: '120363040000000005@newsletter',
+    contact_id: null,
+    title: 'Newsletter 120363040000000005',
+    conversation_type: 'channel',
+    unread_count: 0,
+    last_message_at: new Date(Date.now() - 90000000).toISOString(),
+    last_message_preview: 'Restock day is Friday',
+    last_message_from_me: false,
+    pinned: false,
+    archived: false,
+    muted: false,
+    metadata: {},
+  },
+];
+
+/** Inline pictures for the mock statuses, so a preview shows without a real media file. */
+function demoShot(from: string, to: string, label: string): string {
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="240" height="360">` +
+    `<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">` +
+    `<stop offset="0" stop-color="${from}"/><stop offset="1" stop-color="${to}"/>` +
+    `</linearGradient></defs>` +
+    `<rect width="240" height="360" fill="url(#g)"/>` +
+    `<circle cx="186" cy="74" r="48" fill="rgba(255,255,255,0.26)"/>` +
+    `<rect x="26" y="256" width="132" height="14" rx="7" fill="rgba(255,255,255,0.8)"/>` +
+    `<rect x="26" y="284" width="82" height="10" rx="5" fill="rgba(255,255,255,0.5)"/>` +
+    `<text x="26" y="58" font-family="sans-serif" font-size="19" fill="rgba(255,255,255,0.92)">${label}</text>` +
+    `</svg>`;
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+const DEMO_STATUSES: StatusItem[] = [
+  {
+    account_id: 'wa-1',
+    sender_id: 'r1',
+    sender_name: 'Sarah Chen',
+    timestamp: new Date(Date.now() - 10800000).toISOString(),
+    media_type: 'image',
+    count: 2,
+    posts: [
+      {
+        id: 'sp-sarah-1',
+        media_type: 'image',
+        text: 'Sunrise over the bay',
+        timestamp: new Date(Date.now() - 10800000).toISOString(),
+        thumbnail_path: demoShot('#f59e0b', '#be123c', 'Sunrise'),
+      },
+      {
+        id: 'sp-sarah-2',
+        media_type: 'text',
+        text: 'Same place, ten minutes later',
+        timestamp: new Date(Date.now() - 10400000).toISOString(),
+      },
+    ],
+  },
+  {
+    account_id: 'wa-1',
+    sender_id: 'r9',
+    sender_name: 'Alex Rivera',
+    timestamp: new Date(Date.now() - 7200000).toISOString(),
+    media_type: 'image',
+    count: 1,
+    posts: [
+      {
+        id: 'sp-alex-1',
+        media_type: 'image',
+        text: 'Studio wall',
+        timestamp: new Date(Date.now() - 7200000).toISOString(),
+        thumbnail_path: demoShot('#0ea5e9', '#1e3a8a', 'Studio'),
+      },
+    ],
+  },
+  {
+    account_id: 'wa-1',
+    sender_id: 'r10',
+    sender_name: 'Priya Shah',
+    timestamp: new Date(Date.now() - 5400000).toISOString(),
+    media_type: 'text',
+    count: 1,
+    posts: [
+      {
+        id: 'sp-priya-1',
+        media_type: 'text',
+        text: 'Shipping the new build tonight',
+        timestamp: new Date(Date.now() - 5400000).toISOString(),
+      },
+    ],
+  },
+  {
+    account_id: 'wa-1',
+    sender_id: 'r11',
+    sender_name: 'Maya Okafor',
+    timestamp: new Date(Date.now() - 3600000).toISOString(),
+    media_type: 'text',
+    count: 1,
+    posts: [
+      {
+        id: 'sp-maya-1',
+        media_type: 'text',
+        text: 'https://www.instagram.com/reel/CxYzAbCdEf/',
+        timestamp: new Date(Date.now() - 3600000).toISOString(),
+        link_preview: {
+          url: 'https://www.instagram.com/reel/CxYzAbCdEf/',
+          title: 'Behind the scenes at the studio',
+          thumbnail_path: demoShot('#7c3aed', '#db2777', 'Reel'),
+        },
+      },
+    ],
+  },
+  {
+    account_id: 'wa-1',
+    sender_id: 'r12',
+    sender_name: 'Omar Haddad',
+    timestamp: new Date(Date.now() - 2400000).toISOString(),
+    media_type: 'text',
+    count: 1,
+    posts: [
+      {
+        id: 'sp-omar-1',
+        media_type: 'text',
+        text: 'https://www.facebook.com/watch?v=1098765432',
+        timestamp: new Date(Date.now() - 2400000).toISOString(),
+        link_preview: {
+          url: 'https://www.facebook.com/watch?v=1098765432',
+          title: null,
+          thumbnail_path: null,
+        },
+      },
+    ],
+  },
+  {
+    account_id: 'tg-1',
+    sender_id: 'r3',
+    sender_name: 'Mom',
+    timestamp: new Date(Date.now() - 1800000).toISOString(),
+    media_type: 'text',
+    count: 1,
+    posts: [
+      {
+        id: 'sp-mom-1',
+        media_type: 'text',
+        text: '❤️',
+        timestamp: new Date(Date.now() - 1800000).toISOString(),
+      },
+    ],
   },
 ];
 
@@ -157,7 +424,15 @@ const DEMO_MESSAGES: Record<string, Message[]> = {
       body: 'Yes! How about 12:30?',
       timestamp: new Date(Date.now() - 10800000).toISOString(),
       status: 'read',
-      metadata: {},
+      metadata: { reply_to: { remote_id: 'rm1b' } },
+      reply: {
+        remote_id: 'rm1b',
+        message_id: 'm1b',
+        sender_name: 'Sarah Chen',
+        from_me: false,
+        snippet: 'I was thinking that new Thai place on 5th — heard great things',
+        available: true,
+      },
     },
     {
       id: 'm2b',
@@ -232,6 +507,54 @@ const DEMO_MESSAGES: Record<string, Message[]> = {
       metadata: {},
     },
     {
+      id: 'm6p',
+      conversation_id: 'c1',
+      remote_id: 'rm6p',
+      sender_id: null,
+      sender_name: 'Sarah Chen',
+      direction: 'inbound',
+      body: 'Sunset from the pier last night',
+      timestamp: new Date(Date.now() - 1500000).toISOString(),
+      status: 'delivered',
+      metadata: { media_type: 'image', media_data: DEMO_PHOTO, mime: 'image/svg+xml', filename: 'pier.svg' },
+    },
+    {
+      id: 'm6q',
+      conversation_id: 'c1',
+      remote_id: 'rm6q',
+      sender_id: null,
+      sender_name: 'Sarah Chen',
+      direction: 'inbound',
+      body: '[Image]',
+      timestamp: new Date(Date.now() - 1400000).toISOString(),
+      status: 'delivered',
+      metadata: { media_type: 'image', media_data: DEMO_PHOTO, mime: 'image/svg+xml' },
+    },
+    {
+      id: 'm6r',
+      conversation_id: 'c1',
+      remote_id: 'rm6r',
+      sender_id: null,
+      sender_name: 'Sarah Chen',
+      direction: 'inbound',
+      body: '[Location]',
+      timestamp: new Date(Date.now() - 1300000).toISOString(),
+      status: 'delivered',
+      metadata: { media_type: 'location', latitude: 40.74, longitude: -73.99 },
+    },
+    {
+      id: 'm6s',
+      conversation_id: 'c1',
+      remote_id: 'rm6s',
+      sender_id: null,
+      sender_name: 'Sarah Chen',
+      direction: 'inbound',
+      body: '[Video]',
+      timestamp: new Date(Date.now() - 1200000).toISOString(),
+      status: 'delivered',
+      metadata: { media_type: 'video', media_error: 'The file is no longer on WhatsApp' },
+    },
+    {
       id: 'm7',
       conversation_id: 'c1',
       remote_id: 'rm7',
@@ -242,6 +565,161 @@ const DEMO_MESSAGES: Record<string, Message[]> = {
       timestamp: new Date(Date.now() - 600000).toISOString(),
       status: 'delivered',
       metadata: {},
+    },
+    {
+      id: 'm7a',
+      conversation_id: 'c1',
+      remote_id: 'rm7a',
+      sender_id: null,
+      sender_name: 'Sarah Chen',
+      direction: 'inbound',
+      body: [
+        'The plan:',
+        '*Book the table* for _eight_ people',
+        '~Six~ _ten_ of us now',
+        'Bring `cash` just in case',
+        '> They close at 11',
+        '1. Table at 12:30',
+        '2. Cake at 13:00',
+        '- candles',
+        '- a lighter',
+        '```',
+        'cash total = 8 * 46.50',
+        '```',
+      ].join(String.fromCharCode(10)),
+      timestamp: new Date(Date.now() - 540000).toISOString(),
+      status: 'delivered',
+      metadata: {},
+    },
+    {
+      id: 'm7b',
+      conversation_id: 'c1',
+      remote_id: 'rm7b',
+      sender_id: null,
+      sender_name: 'You',
+      direction: 'outbound',
+      body: 'Forwarded from the group chat',
+      timestamp: new Date(Date.now() - 480000).toISOString(),
+      status: 'read',
+      metadata: { forwarded: true },
+    },
+    {
+      id: 'm7c',
+      conversation_id: 'c1',
+      remote_id: 'rm7c',
+      sender_id: null,
+      sender_name: 'Sarah Chen',
+      direction: 'inbound',
+      body: '[Sticker]',
+      timestamp: new Date(Date.now() - 420000).toISOString(),
+      status: 'delivered',
+      metadata: { media_type: 'sticker', media_data: DEMO_STICKER, mime: 'image/svg+xml', filename: 'party.svg' },
+    },
+    {
+      id: 'm7p1',
+      conversation_id: 'c1',
+      remote_id: 'rm7p1',
+      sender_id: null,
+      sender_name: 'Sarah Chen',
+      direction: 'inbound',
+      body: 'Where shall we eat on Friday?',
+      timestamp: new Date(Date.now() - 360000).toISOString(),
+      status: 'delivered',
+      metadata: {
+        media_type: 'poll',
+        poll: {
+          question: 'Where shall we eat on Friday?',
+          multiple: false,
+          options: [
+            { id: 'p1a', text: 'The ramen place', votes: 3, voters: [
+              { id: '15550001111@s.whatsapp.net', name: 'Sarah Chen' },
+              { id: '15550002222@s.whatsapp.net', name: 'Alex Rivera' },
+              { id: '15550003333@s.whatsapp.net', name: 'Mina Patel' },
+            ], mine: false },
+            { id: 'p1b', text: 'Pizza by the pier', votes: 1, voters: [
+              { id: '15550004444@s.whatsapp.net', name: 'Tom Okafor' },
+            ], mine: false },
+            { id: 'p1c', text: 'Somewhere with a table for eight', votes: 0, voters: [], mine: false },
+          ],
+        },
+      },
+    },
+    {
+      id: 'm7p2',
+      conversation_id: 'c1',
+      remote_id: 'rm7p2',
+      sender_id: null,
+      sender_name: 'You',
+      direction: 'outbound',
+      body: 'Which night works for the party?',
+      timestamp: new Date(Date.now() - 300000).toISOString(),
+      status: 'read',
+      metadata: {
+        media_type: 'poll',
+        poll: {
+          question: 'Which night works for the party?',
+          multiple: false,
+          options: [
+            { id: 'p2a', text: 'Friday', votes: 2, voters: [
+              { id: '15550001111@s.whatsapp.net', name: 'Sarah Chen' },
+              { id: 'self@s.whatsapp.net', name: 'You' },
+            ], mine: true },
+            { id: 'p2b', text: 'Saturday', votes: 0, voters: [], mine: false },
+          ],
+        },
+      },
+    },
+    {
+      id: 'm7p3',
+      conversation_id: 'c1',
+      remote_id: 'rm7p3',
+      sender_id: null,
+      sender_name: 'Sarah Chen',
+      direction: 'inbound',
+      body: 'Pick the cakes you want',
+      timestamp: new Date(Date.now() - 240000).toISOString(),
+      status: 'delivered',
+      metadata: {
+        media_type: 'poll',
+        poll: {
+          question: 'Pick the cakes you want',
+          multiple: true,
+          options: [
+            { id: 'p3a', text: 'Chocolate', votes: 2, voters: [
+              { id: '15550001111@s.whatsapp.net', name: 'Sarah Chen' },
+              { id: 'self@s.whatsapp.net', name: 'You' },
+            ], mine: true },
+            { id: 'p3b', text: 'Lemon drizzle', votes: 1, voters: [
+              { id: 'self@s.whatsapp.net', name: 'You' },
+            ], mine: true },
+            { id: 'p3c', text: 'Cheesecake', votes: 1, voters: [
+              { id: '15550002222@s.whatsapp.net', name: 'Alex Rivera' },
+            ], mine: false },
+          ],
+        },
+      },
+    },
+    {
+      id: 'm7p4',
+      conversation_id: 'c1',
+      remote_id: 'rm7p4',
+      sender_id: null,
+      sender_name: 'You',
+      direction: 'outbound',
+      body: 'Shall we split the bill?',
+      timestamp: new Date(Date.now() - 180000).toISOString(),
+      status: 'sent',
+      metadata: {
+        media_type: 'poll',
+        poll: {
+          question: 'Shall we split the bill?',
+          multiple: false,
+          options: [
+            { id: 'p4a', text: 'Split it evenly', votes: 0, voters: [], mine: false },
+            { id: 'p4b', text: 'Everyone pays for their own', votes: 0, voters: [], mine: false },
+          ],
+        },
+      },
     },
   ],
   c2: [
@@ -257,7 +735,112 @@ const DEMO_MESSAGES: Record<string, Message[]> = {
       status: 'delivered',
       metadata: {},
     },
+    {
+      id: 'g1',
+      conversation_id: 'c2',
+      remote_id: 'rg1',
+      sender_id: 'r1',
+      sender_name: 'Sarah Chen',
+      direction: 'inbound',
+      body: 'Love the new header. Can we try it in dark mode too?',
+      timestamp: new Date(Date.now() - 7100000).toISOString(),
+      status: 'delivered',
+      metadata: {},
+    },
+    {
+      id: 'g2',
+      conversation_id: 'c2',
+      remote_id: 'rg2',
+      sender_id: '15550123456@s.whatsapp.net',
+      sender_name: 'Priya Shah',
+      direction: 'inbound',
+      body: 'I can pair on that this afternoon',
+      timestamp: new Date(Date.now() - 7000000).toISOString(),
+      status: 'delivered',
+      metadata: {},
+    },
+    {
+      id: 'g3',
+      conversation_id: 'c2',
+      remote_id: 'rg3',
+      sender_id: null,
+      sender_name: 'You',
+      direction: 'outbound',
+      body: 'Great, thanks both',
+      timestamp: new Date(Date.now() - 6900000).toISOString(),
+      status: 'read',
+      metadata: {},
+    },
   ],
+  c6: [
+    {
+      id: 'h1',
+      conversation_id: 'c6',
+      remote_id: 'rh1',
+      sender_id: '15550123456@s.whatsapp.net',
+      sender_name: 'Building Manager',
+      direction: 'inbound',
+      body: 'Maintenance visit on Thursday at 10:00',
+      timestamp: new Date(Date.now() - 3600000).toISOString(),
+      status: 'delivered',
+      metadata: {},
+    },
+  ],
+  c3: [
+    {
+      id: 'tg1',
+      conversation_id: 'c3',
+      remote_id: 'rt1',
+      sender_id: null,
+      sender_name: 'Mom',
+      direction: 'inbound',
+      body: 'Markdown here is *stars* and _underscores_, not WhatsApp markup',
+      timestamp: new Date(Date.now() - 2600000).toISOString(),
+      status: 'delivered',
+      metadata: {},
+    },
+  ],
+};
+
+/** The mock's forward: the same rules the core applies, delivered at once. */
+async function mockForwardOne(target: ForwardTarget, msg: Message, sendAt: string | null): Promise<ForwardResult> {
+  const base = { ...target, message_id: msg.id };
+  const kind = typeof msg.metadata?.media_type === 'string' ? msg.metadata.media_type : null;
+  if (msg.metadata?.revoked_at) return { ...base, status: 'not_forwardable', reason: 'The message was deleted' };
+  if (kind === 'location') return { ...base, status: 'not_forwardable', reason: 'Locations cannot be forwarded' };
+  if (kind === 'poll') return { ...base, status: 'not_forwardable', reason: 'Polls cannot be forwarded' };
+  if (kind && msg.metadata?.media_error) {
+    return { ...base, status: 'failed', error: `The media could not be downloaded: ${msg.metadata.media_error}` };
+  }
+  if (sendAt) {
+    await mockApi.scheduleMessage({
+      dest_account_id: target.account_id,
+      dest_conversation_id: target.conversation_id,
+      source_conversation_id: msg.conversation_id,
+      source_message_id: msg.id,
+      body: kind ? captionText(msg) || `[${kind}]` : msg.body,
+      send_at: sendAt,
+    });
+    scheduledMessages = scheduledMessages.map((s, i) => (i === scheduledMessages.length - 1 ? { ...s, forward: true } : s));
+    return { ...base, status: 'scheduled' };
+  }
+  const sent = await mockApi.sendMessage(target.account_id, target.conversation_id, kind ? captionText(msg) || `[${kind}]` : msg.body);
+  const media = kind
+    ? { media_type: kind, media_data: msg.metadata.media_data, mime: msg.metadata.mime, filename: msg.metadata.filename }
+    : {};
+  messages[target.conversation_id] = (messages[target.conversation_id] ?? []).map((m) =>
+    m.id === sent.id ? { ...m, metadata: { ...media, forwarded: true } } : m
+  );
+  return { ...base, status: 'sent' };
+}
+
+const NO_ACTIONS: MessageActions = {
+  react: false,
+  edit: false,
+  delete: false,
+  delete_everyone: false,
+  edit_window_secs: null,
+  delete_everyone_window_secs: null,
 };
 
 const CONNECTORS: ConnectorInfo[] = [
@@ -267,6 +850,14 @@ const CONNECTORS: ConnectorInfo[] = [
     description: 'Scan QR code with WhatsApp on your phone',
     auth_type: 'qr',
     capabilities: ['text', 'media', 'read_receipts', 'groups'],
+    actions: {
+      react: true,
+      edit: true,
+      delete: true,
+      delete_everyone: true,
+      edit_window_secs: 15 * 60,
+      delete_everyone_window_secs: 2 * 24 * 60 * 60,
+    },
   },
   {
     id: 'telegram',
@@ -274,6 +865,7 @@ const CONNECTORS: ConnectorInfo[] = [
     description: 'Log in with your phone number',
     auth_type: 'phone',
     capabilities: ['text', 'media', 'read_receipts', 'groups', 'channels'],
+    actions: NO_ACTIONS,
   },
   {
     id: 'signal',
@@ -281,6 +873,7 @@ const CONNECTORS: ConnectorInfo[] = [
     description: 'Register with your phone number',
     auth_type: 'phone',
     capabilities: ['text', 'media', 'read_receipts', 'groups'],
+    actions: NO_ACTIONS,
   },
   {
     id: 'messenger',
@@ -288,6 +881,7 @@ const CONNECTORS: ConnectorInfo[] = [
     description: 'Log in with Facebook email and password',
     auth_type: 'password',
     capabilities: ['text', 'media', 'groups'],
+    actions: NO_ACTIONS,
   },
   {
     id: 'instagram',
@@ -295,6 +889,7 @@ const CONNECTORS: ConnectorInfo[] = [
     description: 'Log in to Instagram DMs',
     auth_type: 'password',
     capabilities: ['text', 'media'],
+    actions: NO_ACTIONS,
   },
   {
     id: 'email',
@@ -302,6 +897,7 @@ const CONNECTORS: ConnectorInfo[] = [
     description: 'Connect IMAP and SMTP',
     auth_type: 'email',
     capabilities: ['text'],
+    actions: NO_ACTIONS,
   },
   {
     id: 'matrix',
@@ -309,6 +905,7 @@ const CONNECTORS: ConnectorInfo[] = [
     description: 'Log in to a Matrix homeserver',
     auth_type: 'password',
     capabilities: ['text', 'groups', 'channels'],
+    actions: NO_ACTIONS,
   },
 ];
 
@@ -317,8 +914,16 @@ let conversations = [...DEMO_CONVERSATIONS];
 const messages = { ...DEMO_MESSAGES };
 let workspaces: Workspace[] = [{ id: 'default', name: 'Default', builtin: true, sort_order: 0 }];
 let priorityGroups: PriorityGroup[] = [];
+function mockSchedule(schedule?: NoteSchedule): Pick<ChatNote, 'fire_at' | 'kind'> {
+  if (schedule?.timer_secs) {
+    return { fire_at: new Date(Date.now() + schedule.timer_secs * 1000).toISOString(), kind: 'timer' };
+  }
+  if (schedule?.alarm_at) return { fire_at: new Date(schedule.alarm_at).toISOString(), kind: 'alarm' };
+  return { fire_at: null, kind: null };
+}
+
 let todos: ChatTodo[] = [];
-let reminders: Reminder[] = [];
+let notes: ChatNote[] = [];
 let forwardRules: ForwardRule[] = [];
 let scheduledMessages: ScheduledMessage[] = [];
 let appConfig: AppConfig = {
@@ -347,8 +952,49 @@ let appConfig: AppConfig = {
     email: { tag: '#EA4335' },
     matrix: { tag: '#0DBD8B' },
   },
-  media_retention: {},
+  media: { save_dir: null, ask_each_time: false, keep_days: 60 },
+  ai: { openrouter_api_key: '', model: '' },
+  integrations: { giphy_api_key: '' },
 };
+
+const listeners = new Set<(event: ShuttleEvent) => void>();
+
+/** Deliver an event the way the core would, a moment after the action that caused it. */
+function emitLater(event: ShuttleEvent) {
+  setTimeout(() => listeners.forEach((fn) => fn(event)), 120);
+}
+
+function applyMockOp(conversationId: string, msg: Message, op: MessageOp): string | undefined {
+  const conv = conversations.find((c) => c.id === conversationId);
+  const account = accounts.find((a) => a.id === conv?.account_id);
+  const actions = CONNECTORS.find((c) => c.id === account?.connector_id)?.actions;
+  const offered = offeredActions(actions, msg);
+  const allowed =
+    op.kind === 'react' ? offered.react
+    : op.kind === 'edit' ? offered.edit && op.text.trim() !== ''
+    : op.kind === 'delete_for_everyone' ? offered.deleteForEveryone
+    : offered.deleteForMe;
+  if (!allowed) return 'Not allowed for this message';
+  const list = messages[conversationId] ?? [];
+  const base = { account_id: conv?.account_id, conversation_id: conversationId };
+  if (op.kind === 'react') {
+    const reactions = withMyReaction(msg.reactions, op.emoji);
+    messages[conversationId] = list.map((m) => (m.id === msg.id ? { ...m, reactions } : m));
+    emitLater({ kind: 'message.reactions', payload: { ...base, updates: [{ remote_id: msg.remote_id, reactions }] } });
+  } else if (op.kind === 'delete_for_me') {
+    messages[conversationId] = list.filter((m) => m.id !== msg.id);
+    emitLater({ kind: 'message.removed', payload: { ...base, message_id: msg.id } });
+  } else {
+    const now = new Date().toISOString();
+    const next: Message =
+      op.kind === 'edit'
+        ? { ...msg, body: op.text, metadata: { ...msg.metadata, edited_at: now } }
+        : { ...msg, body: '', metadata: { revoked_at: now }, reactions: [] };
+    messages[conversationId] = list.map((m) => (m.id === msg.id ? next : m));
+    emitLater({ kind: 'message.updated', payload: { ...base, message: next } });
+  }
+  return undefined;
+}
 
 export const mockApi = {
   listAccounts: async () => accounts,
@@ -375,7 +1021,7 @@ export const mockApi = {
     conversations = conversations.filter((c) => c.account_id !== id);
   },
   updateAccount: async (id: string, patch: AccountPatch) => {
-    accounts = accounts.map((a) => (a.id === id ? { ...a, ...patch } : a));
+    accounts = accounts.map((a) => (a.id === id ? { ...a, ...patch, metadata: { ...a.metadata, ...(patch.accent_color ? { accent_color: patch.accent_color } : {}) } } : a));
     return accounts.find((a) => a.id === id)!;
   },
   wakeAccount: async (_accountId: string) => 'already running',
@@ -416,7 +1062,7 @@ export const mockApi = {
         remote_id: c.remote_id,
         display_name: c.title,
         avatar_url: null,
-        metadata: {},
+        metadata: { saved: true, has_chat: true },
       })),
   startConversation: async (accountId: string, remoteId: string, title: string) => {
     const existing = conversations.find((c) => c.account_id === accountId && c.remote_id === remoteId);
@@ -439,6 +1085,7 @@ export const mockApi = {
     conversations = [conv, ...conversations];
     return conv;
   },
+  checkWhatsappNumber: async (_phone: string): Promise<boolean | null> => true,
   createGroup: async (accountId: string, title: string, _participants: string[]) => {
     const conv: Conversation = {
       id: crypto.randomUUID(),
@@ -462,23 +1109,50 @@ export const mockApi = {
     return conversations.find((c) => c.id === id)!;
   },
   getMessages: async (conversationId: string) => messages[conversationId] ?? [],
-  sendMessage: async (accountId: string, conversationId: string, text: string) => {
+  sendMessage: async (
+    _accountId: string,
+    conversationId: string,
+    text: string,
+    replyToMessageId: string | null = null
+  ) => {
+    const original = replyToMessageId
+      ? (messages[conversationId] ?? []).find((m) => m.id === replyToMessageId)
+      : undefined;
+    const id = crypto.randomUUID();
     const msg: Message = {
-      id: crypto.randomUUID(),
+      id,
       conversation_id: conversationId,
-      remote_id: null,
+      // The mock "sends" at once, so the message has a network id like an echoed send.
+      remote_id: `mock-${id}`,
       sender_id: null,
       sender_name: 'You',
       direction: 'outbound',
       body: text,
       timestamp: new Date().toISOString(),
       status: 'sent',
-      metadata: {},
+      metadata: original?.remote_id ? { reply_to: { remote_id: original.remote_id } } : {},
+      reply: original?.remote_id
+        ? {
+            remote_id: original.remote_id,
+            message_id: original.id,
+            sender_name: original.direction === 'outbound' ? 'You' : (original.sender_name ?? undefined),
+            from_me: original.direction === 'outbound',
+            snippet: original.body.slice(0, 160),
+            available: true,
+          }
+        : undefined,
     };
     messages[conversationId] = [...(messages[conversationId] ?? []), msg];
     conversations = conversations.map((c) =>
       c.id === conversationId
-        ? { ...c, last_message_preview: text, last_message_at: msg.timestamp }
+        ? {
+            ...c,
+            last_message_preview: text,
+            last_message_at: msg.timestamp,
+            last_message_from_me: true,
+            last_message_sender_id: null,
+            last_message_sender_name: null,
+          }
         : c
     );
     return msg;
@@ -489,7 +1163,7 @@ export const mockApi = {
       attachment.question ||
       attachment.filename ||
       `[${attachment.kind}]`;
-    return mockApi.sendMessage(accountId, conversationId, body);
+    return mockApi.sendMessage(accountId, conversationId, body, attachment.reply_to_message_id ?? null);
   },
   markRead: async (conversationId: string) => {
     conversations = conversations.map((c) =>
@@ -546,7 +1220,13 @@ export const mockApi = {
     return g;
   },
   listTodos: async (conversationId: string) => todos.filter((t) => t.conversation_id === conversationId),
-  addTodo: async (conversationId: string, accountId: string, body: string, dueAt?: string) => {
+  addTodo: async (
+    conversationId: string,
+    accountId: string,
+    body: string,
+    dueAt?: string,
+    messageRef?: { id: string; snippet: string }
+  ) => {
     const t: ChatTodo = {
       id: crypto.randomUUID(),
       conversation_id: conversationId,
@@ -555,6 +1235,8 @@ export const mockApi = {
       due_at: dueAt ?? null,
       done: false,
       created_at: new Date().toISOString(),
+      message_id: messageRef?.id ?? null,
+      message_snippet: messageRef?.snippet ?? null,
     };
     todos = [...todos, t];
     return t;
@@ -565,30 +1247,50 @@ export const mockApi = {
   deleteTodo: async (id: string) => {
     todos = todos.filter((t) => t.id !== id);
   },
-  listReminders: async (conversationId?: string) =>
-    conversationId ? reminders.filter((r) => r.conversation_id === conversationId) : reminders,
-  createReminder: async (
+  listNotes: async (conversationId: string) => notes.filter((n) => n.conversation_id === conversationId),
+  addNote: async (
     conversationId: string,
     accountId: string,
-    fireAt: string,
-    kind?: string,
-    note?: string
+    body: string,
+    opts: { messageRef?: { id: string; snippet: string }; schedule?: NoteSchedule } = {}
   ) => {
-    const r: Reminder = {
+    const n: ChatNote = {
       id: crypto.randomUUID(),
       conversation_id: conversationId,
       account_id: accountId,
-      fire_at: fireAt,
-      kind: kind ?? 'nudge',
-      note: note ?? null,
+      body,
+      message_id: opts.messageRef?.id ?? null,
+      message_snippet: opts.messageRef?.snippet ?? null,
+      ...mockSchedule(opts.schedule),
       fired: false,
       created_at: new Date().toISOString(),
     };
-    reminders = [...reminders, r];
-    return r;
+    notes = [...notes, n];
+    return n;
   },
-  deleteReminder: async (id: string) => {
-    reminders = reminders.filter((r) => r.id !== id);
+  updateNote: async (
+    id: string,
+    patch: { body?: string; schedule?: NoteSchedule; clearSchedule?: boolean }
+  ) => {
+    let updated: ChatNote | undefined;
+    notes = notes.map((n) => {
+      if (n.id !== id) return n;
+      updated = {
+        ...n,
+        body: patch.body ?? n.body,
+        ...(patch.schedule
+          ? { ...mockSchedule(patch.schedule), fired: false }
+          : patch.clearSchedule
+            ? { fire_at: null, kind: null, fired: false }
+            : {}),
+      };
+      return updated;
+    });
+    if (!updated) throw new Error('note not found');
+    return updated;
+  },
+  deleteNote: async (id: string) => {
+    notes = notes.filter((n) => n.id !== id);
   },
   listForwardRules: async () => forwardRules,
   createForwardRule: async (draft: ForwardRuleDraft) => {
@@ -676,7 +1378,69 @@ export const mockApi = {
       includes_media: includeMedia,
     }) satisfies BackupManifest,
   restoreBackup: async (_path?: string, _password?: string) => {},
-  onShuttleEvent: async () => () => {},
+  applyMessageOp: async (conversationId: string, messageIds: string[], op: MessageOp): Promise<MessageOpResult[]> =>
+    messageIds.map((id) => {
+      const msg = (messages[conversationId] ?? []).find((m) => m.id === id);
+      const error = msg ? applyMockOp(conversationId, msg, op) : 'Message not found';
+      return error ? { message_id: id, error } : { message_id: id };
+    }),
+  forwardMessages: async (
+    sourceConversationId: string,
+    messageIds: string[],
+    targets: ForwardTarget[],
+    sendAt: string | null
+  ): Promise<ForwardResult[]> => {
+    await new Promise((r) => setTimeout(r, 400));
+    const stored = messages[sourceConversationId] ?? [];
+    const sources = messageIds
+      .map((id) => stored.find((m) => m.id === id))
+      .filter((m): m is Message => !!m)
+      .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    const results: ForwardResult[] = [];
+    for (const target of targets) {
+      for (const msg of sources) results.push(await mockForwardOne(target, msg, sendAt));
+    }
+    return results;
+  },
+  starMessage: async (messageId: string, starred: boolean): Promise<Message> => {
+    for (const [conversationId, list] of Object.entries(messages)) {
+      const found = list.find((m) => m.id === messageId);
+      if (!found) continue;
+      const next = { ...found, starred };
+      messages[conversationId] = list.map((m) => (m === found ? next : m));
+      return next;
+    }
+    throw new Error('Message not found');
+  },
+  senderContact: async (accountId: string, senderId: string): Promise<SenderContact> => ({
+    conversation:
+      conversations.find((c) => c.account_id === accountId && c.conversation_type === 'direct' && c.remote_id === senderId) ?? null,
+    contact: null,
+  }),
+  translateText: async (conversationId: string, messageIds: string[], target: string): Promise<Translation[]> => {
+    if (!appConfig.ai?.openrouter_api_key.trim()) throw { kind: 'not_configured' };
+    await new Promise((r) => setTimeout(r, 300));
+    return messageIds.map((id) => {
+      const body = (messages[conversationId] ?? []).find((m) => m.id === id)?.body ?? '';
+      return body.trim()
+        ? { message_id: id, text: `(${target}) ${body}` }
+        : { message_id: id, error: 'Nothing to translate' };
+    });
+  },
+  onShuttleEvent: async (handler: (event: ShuttleEvent) => void) => {
+    listeners.add(handler);
+    emitLater({
+      kind: 'status.feed',
+      payload: { account_id: 'wa-1', items: DEMO_STATUSES.filter((item) => item.account_id === 'wa-1') },
+    });
+    emitLater({
+      kind: 'status.feed',
+      payload: { account_id: 'tg-1', items: DEMO_STATUSES.filter((item) => item.account_id === 'tg-1') },
+    });
+    return () => {
+      listeners.delete(handler);
+    };
+  },
 };
 
 export function isTauri(): boolean {

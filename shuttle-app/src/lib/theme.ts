@@ -1,3 +1,6 @@
+import { setDatetimeFormat } from '$lib/dateFormatPref.svelte';
+import { setGiphyKey } from '$lib/giphy';
+import * as SunCalc from 'suncalc';
 import type { AppConfig } from './types';
 import {
   bundledThemeForId,
@@ -16,6 +19,38 @@ export function resolvedScheme(scheme: string): 'light' | 'dark' {
   }
   return 'dark';
 }
+
+export function scheduledScheme(appearance: AppConfig['appearance'], now = new Date()): 'light' | 'dark' {
+  const mode = appearance.dark_schedule;
+  if (!mode) return resolvedScheme(appearance.color_scheme);
+  if (mode === 'always') return 'dark';
+  if (mode === 'off') return 'light';
+  if (mode === 'system') return resolvedScheme('system');
+  if (mode === 'time') {
+    const current = now.getHours() * 60 + now.getMinutes();
+    const parse = (value: string) => { const [h, m] = value.split(':').map(Number); return h * 60 + m; };
+    const from = parse(appearance.dark_from || '18:00');
+    const to = parse(appearance.dark_to || '06:00');
+    return (from === to ? false : from < to ? current >= from && current < to : current >= from || current < to) ? 'dark' : 'light';
+  }
+  const lat = appearance.dark_latitude, lon = appearance.dark_longitude;
+  if (mode === 'sun' && lat != null && lon != null) {
+    const events: { time: number; dark: boolean }[] = [];
+    for (let offset = -2; offset <= 2; offset++) {
+      const day = new Date(now.getTime() + offset * 86400000);
+      const times = SunCalc.getTimes(day, lat, lon);
+      if (times.sunrise) events.push({ time: times.sunrise.getTime(), dark: false });
+      if (times.sunset) events.push({ time: times.sunset.getTime(), dark: true });
+    }
+    const latest = events.filter((e) => Number.isFinite(e.time) && e.time <= now.getTime()).sort((a, b) => b.time - a.time)[0];
+    return latest ? (latest.dark ? 'dark' : 'light') : (SunCalc.getPosition(now, lat, lon).altitude < 0 ? 'dark' : 'light');
+  }
+  return 'light';
+}
+
+let currentConfig: AppConfig | undefined;
+let scheduleTimer: ReturnType<typeof setInterval> | undefined;
+let appliedMode: string | undefined;
 
 function clearTweakcnStyle(): void {
   document.getElementById('shuttle-tweakcn')?.remove();
@@ -42,9 +77,14 @@ function themeFromConfig(cfg: AppConfig): TweakcnTheme | null {
 
 /** Apply appearance config to the document (sync; expects tweakcn CSS to already be cached). */
 export function applyAppConfig(cfg: AppConfig): void {
+  setDatetimeFormat(cfg.appearance.datetime_format);
+  setGiphyKey(cfg.integrations?.giphy_api_key);
   if (typeof document === 'undefined') return;
   const root = document.documentElement;
-  const themeMode = resolvedScheme(cfg.appearance.color_scheme);
+  currentConfig = cfg;
+  if (!scheduleTimer && typeof window !== 'undefined') scheduleTimer = setInterval(() => { if (currentConfig && scheduledScheme(currentConfig.appearance) !== appliedMode) applyAppConfig(currentConfig); }, 60000);
+  const themeMode = scheduledScheme(cfg.appearance);
+  appliedMode = themeMode;
   root.dataset.theme = themeMode;
   root.style.colorScheme = themeMode;
   document.body.style.colorScheme = themeMode;

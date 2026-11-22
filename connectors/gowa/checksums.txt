@@ -1,0 +1,7 @@
+# GOWA pinned tag: v9.9.0 (aldinokemal/go-whatsapp-web-multidevice). sha256sum format; checked by fetch.sh.
+ead32e63f9338019f315d6e70159b44154bc6fc75637faa2c4deae2b90e38398  whatsapp_9.9.0_darwin_amd64.zip
+ac1d77adb15a31de558b8dca7871d0fbc7d05fdaab82ed49d9de357cdfe0e1b6  whatsapp_9.9.0_darwin_arm64.zip
+b3a0afc3cd2721198de60032a21f7f0aa78e58d0a478a7b00566d1604b7aa574  whatsapp_9.9.0_linux_amd64.zip
+f9c2f376fc0c82ae1c2148615cf8f92505eeb8959786d7d61f9919d513646880  whatsapp_9.9.0_linux_arm64.zip
+2ed41030286eac0da7e4745208bafe7675bdbb29e816e3807f0d3ddbac6fe2b6  whatsapp_9.9.0_linux_armv7.zip
+51fa01ee9379cb8201c4ae07d54fca1b05aee0770a20de91773255dbd3913b69  whatsapp_9.9.0_windows_amd64.zip

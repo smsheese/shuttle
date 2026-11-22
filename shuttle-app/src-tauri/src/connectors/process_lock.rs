@@ -93,7 +93,10 @@ fn cmdline_looks_like_connector(pid: i32, connector_id: &str) -> bool {
     let Ok(bytes) = fs::read(&path) else {
         return false;
     };
-    cmdline_matches(&String::from_utf8_lossy(&bytes).replace('\0', " "), connector_id)
+    cmdline_matches(
+        &String::from_utf8_lossy(&bytes).replace('\0', " "),
+        connector_id,
+    )
 }
 
 #[cfg(target_os = "macos")]

@@ -1,6 +1,6 @@
 <script lang="ts">
   import NetworkIcon from '$lib/components/NetworkIcon.svelte';
-  import { accountAvatar } from '$lib/api';
+  import { accountAvatar, openDevtools } from '$lib/api';
   import { CONNECTOR_COLORS, type Account } from '$lib/types';
 
   interface Props {
@@ -9,6 +9,7 @@
     onselect: (id: string | null) => void;
     onadd: () => void;
     unreadTotal: number;
+    unreadCounts?: Record<string, number>;
     mobileTab?: 'inbox' | 'settings';
     settingsActive?: boolean;
     ontabchange?: (tab: 'inbox' | 'settings') => void;
@@ -22,6 +23,7 @@
     onselect,
     onadd,
     unreadTotal,
+    unreadCounts = {},
     mobileTab = 'inbox',
     settingsActive = false,
     ontabchange,
@@ -38,7 +40,6 @@
     brandTimer = setTimeout(() => (brandClicks = 0), 2500);
     if (brandClicks >= 8) {
       brandClicks = 0;
-      const { openDevtools } = await import('$lib/api');
       openDevtools();
     }
   }
@@ -63,7 +64,7 @@
       aria-label="Shuttle"
       onclick={onBrandClick}
     >
-      <img class="brand-logo" src="/shuttle-logo.svg" width="22" height="22" alt="" />
+      <img class="brand-logo" src="/shuttle-logo.svg" width="56" height="56" alt="" />
     </button>
 
     <button
@@ -92,7 +93,7 @@
           class:active={selected === account.id}
           class:disabled={account.disabled}
           class:sleeping={account.status === 'sleeping'}
-          style="--network-color: {CONNECTOR_COLORS[account.connector_id] ?? '#888'}"
+          style="--network-color: {typeof account.metadata?.accent_color === 'string' ? account.metadata.accent_color : CONNECTOR_COLORS[account.connector_id] ?? '#888888'}; --brand-color: {CONNECTOR_COLORS[account.connector_id] ?? '#888888'}"
           onclick={() => onselect(account.id)}
           oncontextmenu={(e) => {
             e.preventDefault();
@@ -105,7 +106,7 @@
           <span
             class="network-avatar"
             class:photo={!!photo}
-            style={photo ? undefined : `background: color-mix(in srgb, var(--network-color) 18%, transparent); color: var(--network-color)`}
+            style={photo ? undefined : `background: color-mix(in srgb, var(--brand-color) 18%, transparent); color: var(--brand-color)`}
           >
             {#if photo}
               <img class="network-photo" src={photo} alt="" />
@@ -118,6 +119,9 @@
               </span>
             {/if}
           </span>
+          {#if (unreadCounts[account.id] ?? 0) > 0}
+            <span class="badge" aria-label="{unreadCounts[account.id]} unread messages">{unreadCounts[account.id] > 99 ? '99+' : unreadCounts[account.id]}</span>
+          {/if}
           {#if account.status !== 'connected'}
             <span
               class="status-dot"
@@ -173,8 +177,7 @@
       aria-current={mobileTab === 'settings' ? 'page' : undefined}
     >
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true">
-        <circle cx="12" cy="12" r="3"/>
-        <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+        <path d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06-1.73 3-.08-.02a1.7 1.7 0 0 0-1.79.65l-.05.07h-3.46l-.03-.08A1.7 1.7 0 0 0 11 19.4a1.7 1.7 0 0 0-1.65 1.15l-.03.08H5.86l-.05-.07a1.7 1.7 0 0 0-1.79-.65l-.08.02-1.73-3 .06-.06A1.7 1.7 0 0 0 2.6 15l-.03-.08v-3.46l.03-.08a1.7 1.7 0 0 0-.34-1.87L2.2 9.45l1.73-3 .08.02a1.7 1.7 0 0 0 1.79-.65l.05-.07h3.46l.03.08A1.7 1.7 0 0 0 11 6.98a1.7 1.7 0 0 0 1.65-1.15l.03-.08h3.46l.05.07a1.7 1.7 0 0 0 1.79.65l.08-.02 1.73 3-.06.06a1.7 1.7 0 0 0-.34 1.87l.03.08v3.46Z" transform="translate(1 -1.2) scale(.92)"/>
       </svg>
       <span class="tab-label">Settings</span>
     </button>
@@ -213,24 +216,23 @@
   }
 
   .brand {
-    width: 36px;
-    height: 36px;
+    width: 100%;
+    height: 56px;
     display: flex;
     align-items: center;
     justify-content: center;
     margin-bottom: 8px;
     border: none;
     padding: 0;
-    border-radius: var(--radius-md);
-    background: var(--accent-muted);
+    background: transparent;
     cursor: pointer;
     color: inherit;
   }
 
   .brand-logo {
     display: block;
-    width: 22px;
-    height: 22px;
+    width: 100%;
+    height: 100%;
     object-fit: contain;
   }
 
@@ -287,9 +289,9 @@
     background: var(--accent);
   }
 
-  .network.active::before {
-    background: var(--network-color);
-  }
+  .network::before { content: ""; position: absolute; left: -8px; top: 6px; bottom: 6px; width: 3px; border-radius: 2px; background: var(--network-color); }
+  .network.active::before { top: 6px; height: auto; transform: none; background: var(--network-color); }
+  .network.active { background: color-mix(in srgb, var(--network-color) 20%, var(--bg-sidebar)); }
 
   .network-avatar {
     position: relative;
@@ -323,20 +325,58 @@
     width: 16px;
     height: 16px;
     border-radius: 50%;
-    background: color-mix(in srgb, var(--network-color) 22%, var(--bg-sidebar));
-    color: var(--network-color);
+    background: color-mix(in srgb, var(--brand-color) 22%, var(--bg-sidebar));
+    color: var(--brand-color);
     display: grid;
     place-items: center;
     box-shadow: 0 0 0 1.5px var(--bg-sidebar);
     z-index: 1;
   }
 
-  .network.active .network-avatar.photo {
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--network-color) 55%, transparent);
+  .network:not(.active) .network-avatar {
+    transform: scale(0.9);
+  }
+
+  .network.active .network-avatar::after,
+  .all-chats.active::after {
+    content: '';
+    position: absolute;
+    pointer-events: none;
+    padding: 2px;
+    background: conic-gradient(from var(--ring-angle), var(--ring-a), var(--ring-b), var(--ring-a));
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    mask-composite: exclude;
+    animation: ring-spin 2.4s linear infinite;
+  }
+
+  .network.active .network-avatar::after {
+    --ring-a: var(--network-color);
+    --ring-b: color-mix(in srgb, var(--network-color) 20%, white);
+    inset: -4px;
+    border-radius: 50%;
+  }
+
+  .all-chats.active::after {
+    --ring-a: var(--accent);
+    --ring-b: color-mix(in srgb, var(--accent) 20%, white);
+    inset: -2px;
+    border-radius: calc(var(--radius-md) + 2px);
+  }
+
+  @property --ring-angle {
+    syntax: '<angle>';
+    initial-value: 0deg;
+    inherits: false;
+  }
+
+  @keyframes ring-spin {
+    to { --ring-angle: 360deg; }
   }
 
   .network.active .network-avatar:not(.photo) {
-    background: color-mix(in srgb, var(--network-color) 28%, transparent);
+    background: color-mix(in srgb, var(--brand-color) 28%, transparent);
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--network-color) 40%, transparent);
   }
 
@@ -345,7 +385,7 @@
   }
 
   .network:hover .network-avatar:not(.photo) {
-    background: color-mix(in srgb, var(--network-color) 24%, transparent);
+    background: color-mix(in srgb, var(--brand-color) 24%, transparent);
   }
 
   .divider {
@@ -418,6 +458,10 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
+    .network.active .network-avatar::after,
+    .all-chats.active::after {
+      animation: none;
+    }
     .badge-pulse {
       animation: none;
     }

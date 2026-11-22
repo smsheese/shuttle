@@ -1,6 +1,9 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import NetworkIcon from '$lib/components/NetworkIcon.svelte';
-  import { DATETIME_FORMATS, fetchTweakcnTheme, formatTime, openExternal, restartApp, saveAppConfig } from '$lib/api';
+  import { clearMediaCache, DATETIME_FORMATS, fetchTweakcnTheme, formatTime, mediaCacheInfo, openExternal, restartApp, saveAppConfig, telemetryInstallationId } from '$lib/api';
+  import { AUTO_DOWNLOAD_DEFAULTS } from '$lib/mediaSave';
+  import { formatFileSize } from '$lib/messageMedia';
   import { isTauri } from '$lib/mock';
   import { save, open } from '@tauri-apps/plugin-dialog';
   import { shortcutModKey } from '$lib/shortcuts';
@@ -21,6 +24,9 @@
     type Account,
     type AccountPatch,
     type AppConfig,
+    type AutoDownloadGroup,
+    type MediaCacheInfo,
+    type MediaConfig,
     type Conversation,
     type ConnectorInfo,
     type ForwardRule,
@@ -36,9 +42,11 @@
     | 'channels'
     | 'workspaces'
     | 'accounts'
+    | 'media'
     | 'routing'
     | 'backup'
     | 'keyboard'
+    | 'feedback'
     | 'about';
 
   interface Props {
@@ -79,6 +87,8 @@
     ) => Promise<void>;
     onrestorebackup: (path: string, password: string) => Promise<void>;
     onaccountmenu?: (account: Account, x: number, y: number) => void;
+    /** Open the tab that holds `field` and focus it (a new `at` asks again). */
+    focus?: { field: 'openrouter-key'; at: number } | null;
   }
 
   let {
@@ -105,12 +115,32 @@
     onexportbackup,
     onrestorebackup,
     onaccountmenu,
+    focus = null,
   }: Props = $props();
 
   let activeTab = $state<SettingsTab>('appearance');
   let newWs = $state('');
   let newPriority = $state('');
   let tweakcnInput = $state('');
+  let locationQuery = $state('');
+  let locationLoading = $state(false);
+  let locationStatus = $state('');
+  let locations = $state<{name: string; country?: string; admin1?: string; latitude: number; longitude: number}[]>([]);
+
+  async function searchLocation() {
+    if (locationQuery.trim().length < 2) { locationStatus = 'Enter at least two characters.'; return; }
+    locationLoading = true; locationStatus = ''; locations = [];
+    try {
+      const response = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(locationQuery.trim())}&count=8&language=en&format=json`);
+      if (!response.ok) throw new Error('Location search failed.');
+      const result = await response.json();
+      locations = result.results ?? [];
+      if (!locations.length) locationStatus = 'No locations found.';
+    } catch { locationStatus = 'Could not search locations. Check your connection.'; }
+    finally { locationLoading = false; }
+  }
+
+
   let themeStatus = $state<string | null>(null);
   let themeLoading = $state(false);
   let ruleSourceConversationId = $state('');
@@ -153,11 +183,20 @@
     { id: 'channels', label: 'Channels' },
     { id: 'workspaces', label: 'Workspaces & priorities' },
     { id: 'accounts', label: 'Accounts' },
+    { id: 'media', label: 'Media & storage' },
     { id: 'routing', label: 'Routing' },
     { id: 'backup', label: 'Backup' },
     { id: 'keyboard', label: 'Keyboard' },
+    { id: 'feedback', label: 'Feedback' },
     { id: 'about', label: 'About' },
   ];
+
+  const FEEDBACK_FORM_URL = 'https://forms.tfs.qa/forms/contact-form-xj6nhk';
+  let feedbackOpen = $state(false);
+  let installationId = $state('');
+  $effect(() => {
+    if (activeTab === 'about' && !installationId) void telemetryInstallationId().then((id) => (installationId = id));
+  });
 
   const modKey = shortcutModKey();
 
@@ -169,6 +208,7 @@
   }
 
   async function applyTweakcnTheme() {
+    if (themeLoading) return;
     const id = parseTweakcnId(tweakcnInput || config.appearance.theme_id);
     if (!id) {
       themeStatus = 'Enter a tweakcn share URL or theme id.';
@@ -227,6 +267,28 @@
     });
   }
 
+  let openrouterKeyEl = $state<HTMLInputElement | null>(null);
+
+  $effect(() => {
+    if (focus?.field !== 'openrouter-key') return;
+    activeTab = 'privacy';
+    void tick().then(() => openrouterKeyEl?.focus());
+  });
+
+  function patchAi(partial: Partial<NonNullable<AppConfig['ai']>>) {
+    onconfig({
+      ...config,
+      ai: { openrouter_api_key: '', model: '', ...config.ai, ...partial },
+    });
+  }
+
+  function patchIntegrations(partial: Partial<NonNullable<AppConfig['integrations']>>) {
+    onconfig({
+      ...config,
+      integrations: { giphy_api_key: '', ...config.integrations, ...partial },
+    });
+  }
+
   function patchPrivacy(partial: Partial<AppConfig['privacy']>) {
     onconfig({
       ...config,
@@ -254,6 +316,82 @@
       });
     }
   }
+
+
+  // ---- Media & storage -------------------------------------------------------------------
+  const mediaDefaults: MediaConfig = { save_dir: null, ask_each_time: false, keep_days: 60 };
+  const mediaCfg = $derived(config.media ?? mediaDefaults);
+  let cacheInfo = $state<MediaCacheInfo | null>(null);
+  let cacheStatus = $state('');
+  let clearingCache = $state(false);
+  const AUTO_DOWNLOAD_GROUPS: { group: AutoDownloadGroup; label: string }[] = [
+    { group: 'images', label: 'Images' },
+    { group: 'videos', label: 'Videos' },
+    { group: 'files', label: 'Files' },
+  ];
+
+  function patchMedia(partial: Partial<MediaConfig>) {
+    onconfig({ ...config, media: { ...mediaCfg, ...partial } });
+  }
+
+  async function refreshCacheInfo() {
+    try {
+      cacheInfo = await mediaCacheInfo();
+    } catch {
+      cacheInfo = null;
+    }
+  }
+
+  async function chooseSaveFolder() {
+    if (!isTauri()) return;
+    const picked = await open({
+      directory: true,
+      multiple: false,
+      defaultPath: mediaCfg.save_dir || cacheInfo?.save_dir || undefined,
+      title: 'Choose where saved media goes',
+    });
+    if (typeof picked === 'string' && picked) {
+      patchMedia({ save_dir: picked });
+      setTimeout(() => void refreshCacheInfo(), 300);
+    }
+  }
+
+  function resetSaveFolder() {
+    patchMedia({ save_dir: null });
+    setTimeout(() => void refreshCacheInfo(), 300);
+  }
+
+  function setKeepDays(raw: string) {
+    const n = Math.floor(Number(raw));
+    if (Number.isFinite(n) && n >= 1) patchMedia({ keep_days: n });
+  }
+
+  async function clearCacheNow() {
+    if (!confirm('Delete all downloaded media from Shuttle’s cache? Saved files are not touched, and anything still on WhatsApp can be downloaded again.')) return;
+    clearingCache = true;
+    cacheStatus = '';
+    try {
+      const done = await clearMediaCache();
+      cacheStatus = done.files > 0 ? `Removed ${done.files} file${done.files === 1 ? '' : 's'} (${formatFileSize(done.bytes)}).` : 'Nothing to clear.';
+    } catch (e) {
+      cacheStatus = e instanceof Error ? e.message : String(e);
+    } finally {
+      clearingCache = false;
+      void refreshCacheInfo();
+    }
+  }
+
+  function accountAutoDownload(account: Account, group: AutoDownloadGroup): boolean {
+    return account.auto_download?.[group] ?? AUTO_DOWNLOAD_DEFAULTS[group];
+  }
+
+  function setAccountAutoDownload(account: Account, group: AutoDownloadGroup, on: boolean) {
+    onaccountpatch?.(account.id, { auto_download: { ...(account.auto_download ?? {}), [group]: on } });
+  }
+
+  $effect(() => {
+    if (activeTab === 'media') void refreshCacheInfo();
+  });
 
   function setChannelTag(id: string, tag: string) {
     onconfig({
@@ -301,21 +439,6 @@
       {#if activeTab === 'appearance'}
         <section>
           <h2>Appearance</h2>
-          <fieldset class="field-group">
-            <legend>Color scheme</legend>
-            <div class="scheme-row">
-              {#each ['system', 'light', 'dark'] as scheme (scheme)}
-                <button
-                  type="button"
-                  class="scheme-btn"
-                  class:active={config.appearance.color_scheme === scheme}
-                  onclick={() => patchAppearance({ color_scheme: scheme })}
-                >
-                  {scheme === 'system' ? 'System' : scheme === 'light' ? 'Light' : 'Dark'}
-                </button>
-              {/each}
-            </div>
-          </fieldset>
           <label>
             Chat list date and time
             <select
@@ -359,7 +482,8 @@
             tweakcn theme URL or id
             <input
               bind:value={tweakcnInput}
-              placeholder="https://tweakcn.com/r/themes/… or theme id"
+              placeholder="https://tweakcn.com/themes/… or theme id"
+              disabled={themeLoading}
               onkeydown={(e) => {
                 if (e.key === 'Enter') void applyTweakcnTheme();
               }}
@@ -367,17 +491,36 @@
           </label>
           <div class="theme-actions">
             <button type="button" class="apply-theme-btn" disabled={themeLoading} onclick={() => void applyTweakcnTheme()}>
-              {themeLoading ? 'Fetching theme…' : 'Apply theme'}
+              {themeLoading ? 'Applying theme…' : 'Apply theme'}
             </button>
           </div>
-          {#if themeStatus}
-            <p class="hint theme-status">{themeStatus}</p>
-          {/if}
+          <p class:theme-status={!!themeStatus} class="hint" role="status" aria-live="polite">
+            {themeLoading ? 'Fetching and applying theme…' : themeStatus ?? ''}
+          </p>
           <p class="hint">
             Paste a
             <button type="button" class="linkish" onclick={() => openLink('https://github.com/jnsahaj/tweakcn')}>tweakcn</button>
             share link or id. Shuttle fetches colours and fonts, then reloads the app.
           </p>
+          <label>
+            Dark mode schedule
+            <select value={config.appearance.dark_schedule ?? (config.appearance.color_scheme === 'dark' ? 'always' : config.appearance.color_scheme === 'light' ? 'off' : 'system')} onchange={(e) => patchAppearance({ dark_schedule: e.currentTarget.value as NonNullable<AppConfig['appearance']['dark_schedule']> })}>
+              <option value="off">Off</option><option value="always">Always dark</option><option value="system">Follow system</option><option value="time">Custom times</option><option value="sun">Sunset to sunrise</option>
+            </select>
+          </label>
+          {#if config.appearance.dark_schedule === 'time'}
+            <label>Dark from <input type="time" value={config.appearance.dark_from ?? '18:00'} onchange={(e) => patchAppearance({ dark_from: e.currentTarget.value })} /></label>
+            <label>Until <input type="time" value={config.appearance.dark_to ?? '06:00'} onchange={(e) => patchAppearance({ dark_to: e.currentTarget.value })} /></label>
+            <p class="hint">Times use this device’s local time.</p>
+          {:else if config.appearance.dark_schedule === 'sun'}
+            <label>Search for a location <input bind:value={locationQuery} placeholder="City or town" onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void searchLocation(); } }} /></label>
+            <button type="button" class="apply-theme-btn" disabled={locationLoading} onclick={() => void searchLocation()}>{locationLoading ? 'Searching…' : 'Find location'}</button>
+            <p class="hint" role="status">{locationStatus || (config.appearance.dark_location ? `Selected: ${config.appearance.dark_location}` : 'Choose a location for sunset and sunrise.')}</p>
+            {#each locations as location}
+              <button type="button" class="apply-theme-btn" onclick={() => { patchAppearance({ dark_location: [location.name, location.admin1, location.country].filter(Boolean).join(', '), dark_latitude: location.latitude, dark_longitude: location.longitude }); locations = []; }}>{[location.name, location.admin1, location.country].filter(Boolean).join(', ')}</button>
+            {/each}
+            <p class="hint">Location search uses Open-Meteo. Sunrise and sunset are calculated on this device.</p>
+          {/if}
           <label>
             Built-in preset (legacy)
             <select
@@ -493,6 +636,47 @@
               onchange={(e) => patchPrivacy({ usage_diagnostics: e.currentTarget.checked })}
             />
             Send anonymous usage and performance diagnostics
+          </label>
+          <h3 class="privacy-subhead">AI and translation (OpenRouter)</h3>
+          <p class="hint">
+            Off until you add your own OpenRouter key. Translate sends only the message you pick to
+            OpenRouter and the model you choose. Translations are not saved. The same key will power
+            other AI features later. Get a key at openrouter.ai/keys.
+          </p>
+          <label>
+            OpenRouter API key
+            <input
+              bind:this={openrouterKeyEl}
+              type="password"
+              autocomplete="off"
+              placeholder="sk-or-..."
+              value={config.ai?.openrouter_api_key ?? ''}
+              onchange={(e) => patchAi({ openrouter_api_key: e.currentTarget.value.trim() })}
+            />
+          </label>
+          <label>
+            Model id
+            <input
+              type="text"
+              autocomplete="off"
+              placeholder="google/gemini-2.5-flash"
+              value={config.ai?.model ?? ''}
+              onchange={(e) => patchAi({ model: e.currentTarget.value.trim() })}
+            />
+          </label>
+          <h3 class="privacy-subhead">GIFs and stickers (Giphy)</h3>
+          <p class="hint">
+            Search needs your own free Giphy key from developers.giphy.com. Typed searches go to
+            Giphy.
+          </p>
+          <label>
+            Giphy API key
+            <input
+              type="password"
+              autocomplete="off"
+              value={config.integrations?.giphy_api_key ?? ''}
+              onchange={(e) => patchIntegrations({ giphy_api_key: e.currentTarget.value.trim() })}
+            />
           </label>
         </section>
       {:else if activeTab === 'channels'}
@@ -651,6 +835,103 @@
             {/each}
           </ul>
           <button class="add-account-btn" onclick={onadd} type="button">Add account</button>
+        </section>
+      {:else if activeTab === 'media'}
+        <section>
+          <h2>Media &amp; storage</h2>
+          <p class="hint">
+            Downloaded media lives in a private cache inside Shuttle's data folder. A file only reaches
+            your save folder when you save it.
+          </p>
+
+          <h3 class="privacy-subhead">Saving</h3>
+          <label>
+            Save folder
+            <div class="path-row">
+              <input readonly value={mediaCfg.save_dir || cacheInfo?.save_dir || 'Documents/shuttle'} />
+              {#if isTauri()}
+                <button type="button" class="tiny" onclick={() => void chooseSaveFolder()}>Choose…</button>
+              {/if}
+              {#if mediaCfg.save_dir}
+                <button type="button" class="tiny" onclick={resetSaveFolder}>Default</button>
+              {/if}
+            </div>
+          </label>
+          <label class="check">
+            <input
+              type="checkbox"
+              checked={mediaCfg.ask_each_time}
+              onchange={(e) => patchMedia({ ask_each_time: e.currentTarget.checked })}
+            />
+            Ask where to save each time
+          </label>
+          <p class="hint">Saving never overwrites: a name that already exists becomes “name (1)”.</p>
+
+          <h3 class="privacy-subhead">Downloaded media</h3>
+          <label class="check">
+            <input
+              type="checkbox"
+              checked={mediaCfg.keep_days === null}
+              onchange={(e) => patchMedia({ keep_days: e.currentTarget.checked ? null : 60 })}
+            />
+            Keep downloaded media forever
+          </label>
+          {#if mediaCfg.keep_days !== null}
+            <label>
+              Keep downloaded media for (days)
+              <input
+                type="number"
+                min="1"
+                step="1"
+                value={mediaCfg.keep_days}
+                onchange={(e) => setKeepDays(e.currentTarget.value)}
+              />
+            </label>
+          {/if}
+          <p class="hint">
+            Media you have not opened for this long is removed from the cache; the chat keeps its preview and a
+            Download button. Anything you saved is never deleted.
+          </p>
+          <div class="path-row">
+            <span>
+              Cache size:
+              {#if cacheInfo}
+                {formatFileSize(cacheInfo.bytes) || '0 B'} · {cacheInfo.files} file{cacheInfo.files === 1 ? '' : 's'}
+              {:else}
+                …
+              {/if}
+            </span>
+            <button type="button" class="tiny" onclick={() => void refreshCacheInfo()}>Refresh</button>
+            <button type="button" class="tiny danger" disabled={clearingCache || !cacheInfo?.files} onclick={() => void clearCacheNow()}>
+              Clear downloaded media now
+            </button>
+          </div>
+          {#if cacheStatus}
+            <p class="hint">{cacheStatus}</p>
+          {/if}
+
+          <h3 class="privacy-subhead">Auto-download</h3>
+          <p class="hint">
+            What each account downloads by itself. Stickers follow Images; voice notes and audio follow Files
+            but always download when you press play. Right-click a chat in the list to override this per chat.
+          </p>
+          {#each accounts as account (account.id)}
+            <div class="auto-dl-row">
+              <span class="auto-dl-name">{account.name}</span>
+              {#each AUTO_DOWNLOAD_GROUPS as g (g.group)}
+                <label class="check">
+                  <input
+                    type="checkbox"
+                    checked={accountAutoDownload(account, g.group)}
+                    onchange={(e) => setAccountAutoDownload(account, g.group, e.currentTarget.checked)}
+                  />
+                  {g.label}
+                </label>
+              {/each}
+            </div>
+          {:else}
+            <p class="hint">No accounts yet.</p>
+          {/each}
         </section>
       {:else if activeTab === 'routing'}
         <section>
@@ -852,6 +1133,27 @@
             </tbody>
           </table>
         </section>
+      {:else if activeTab === 'feedback'}
+        <section>
+          <h2>Feedback</h2>
+          <p class="hint">
+            Found a bug or have an idea? Tell us here. The form is hosted on forms.tfs.qa, so nothing is loaded until you
+            open it, and Shuttle sends no chat data with it. Say what happened and which OS you use.
+          </p>
+          {#if feedbackOpen}
+            <iframe
+              class="feedback-frame"
+              title="Send feedback"
+              src={FEEDBACK_FORM_URL}
+              referrerpolicy="no-referrer"
+            ></iframe>
+          {:else}
+            <div class="feedback-actions">
+              <button type="button" class="apply-theme-btn" onclick={() => (feedbackOpen = true)}>Open feedback form</button>
+              <button type="button" class="linkish" onclick={() => openLink(FEEDBACK_FORM_URL)}>Open in browser instead</button>
+            </div>
+          {/if}
+        </section>
       {:else if activeTab === 'about'}
         <section>
           <h2>About Shuttle</h2>
@@ -866,6 +1168,12 @@
             <button type="button" class="linkish" onclick={() => openLink('https://github.com/smsheese')}>GitHub</button>
             · built with Cursor Agent
           </p>
+          {#if installationId}
+            <p class="hint">
+              Installation ID: <code>{installationId}</code>. Quote it if you ask us to delete diagnostics sent from this
+              computer. Policy: <button type="button" class="linkish" onclick={() => openLink('https://github.com/smsheese/shuttle/blob/main/PRIVACY.md')}>PRIVACY.md</button>.
+            </p>
+          {/if}
         </section>
 
         <section>
@@ -1009,34 +1317,6 @@
     gap: 10px;
     cursor: pointer;
   }
-  .field-group {
-    border: none;
-    padding: 0;
-    margin: 0 0 14px;
-  }
-  .field-group legend {
-    font-size: 13px;
-    margin-bottom: 8px;
-    padding: 0;
-  }
-  .scheme-row {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .scheme-btn {
-    border: 1px solid var(--border);
-    background: var(--bg-input);
-    border-radius: var(--radius-sm);
-    padding: 8px 14px;
-    cursor: pointer;
-    font-size: 13px;
-  }
-  .scheme-btn.active {
-    border-color: var(--accent);
-    background: var(--accent-muted);
-    color: var(--text);
-  }
   .theme-actions {
     margin: 4px 0 8px;
   }
@@ -1167,9 +1447,6 @@
   .sleep-mode select {
     flex: 1;
   }
-  .network.sleeping {
-    opacity: 0.7;
-  }
   .acct-actions {
     display: flex;
     flex-wrap: wrap;
@@ -1214,6 +1491,20 @@
     letter-spacing: normal;
     margin: 0;
   }
+  .feedback-frame {
+    border: none;
+    width: 100%;
+    height: 640px;
+    border-radius: 8px;
+    background: var(--bg-elevated, transparent);
+  }
+  .feedback-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 12px;
+  }
+
   .privacy-subhead {
     font-size: 13px;
     font-weight: 600;
@@ -1269,6 +1560,16 @@
   }
   .linkish:hover {
     text-decoration: underline;
+  }
+  .auto-dl-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 16px;
+  }
+  .auto-dl-name {
+    min-width: 140px;
+    font-weight: 600;
   }
   .path-row {
     display: flex;

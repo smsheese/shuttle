@@ -29,17 +29,13 @@ fn candidate_env_files() -> Vec<std::path::PathBuf> {
     paths
 }
 
-pub fn sentry_dsn() -> Option<String> {
-    runtime_or_embedded("SENTRY_DSN", option_env!("SHUTTLE_SENTRY_DSN"))
-}
-
 pub fn posthog_api_key() -> Option<String> {
     runtime_or_embedded("POSTHOG_API_KEY", option_env!("SHUTTLE_POSTHOG_API_KEY"))
 }
 
 pub fn posthog_host() -> String {
     runtime_or_embedded("POSTHOG_HOST", option_env!("SHUTTLE_POSTHOG_HOST"))
-        .unwrap_or_else(|| "https://us.i.posthog.com".into())
+        .unwrap_or_else(|| "https://eu.i.posthog.com".into())
 }
 
 pub fn build_channel() -> String {
@@ -51,7 +47,7 @@ pub fn build_channel() -> String {
     normalize_environment(&raw)
 }
 
-/// Sentry `environment` and PostHog `$environment`: `testing` or `production`.
+/// PostHog environment: `testing` or `production`.
 pub fn telemetry_environment() -> String {
     build_channel()
 }
@@ -64,7 +60,10 @@ fn normalize_environment(value: &str) -> String {
 }
 
 pub fn git_commit() -> Option<String> {
-    runtime_or_embedded("SHUTTLE_GIT_COMMIT", option_env!("SHUTTLE_EMBEDDED_GIT_COMMIT"))
+    runtime_or_embedded(
+        "SHUTTLE_GIT_COMMIT",
+        option_env!("SHUTTLE_EMBEDDED_GIT_COMMIT"),
+    )
 }
 
 fn runtime_or_embedded(key: &str, embedded: Option<&str>) -> Option<String> {
@@ -87,11 +86,11 @@ mod tests {
     #[test]
     fn empty_runtime_falls_through() {
         // Safety: tests run serially enough for this crate's env helper.
-        std::env::remove_var("SENTRY_DSN");
-        assert!(runtime_or_embedded("SENTRY_DSN", None).is_none());
+        std::env::remove_var("SHUTTLE_TEST_ENV_KEY");
+        assert!(runtime_or_embedded("SHUTTLE_TEST_ENV_KEY", None).is_none());
         assert_eq!(
-            runtime_or_embedded("SENTRY_DSN", Some("https://example.ingest.sentry.io/1")).unwrap(),
-            "https://example.ingest.sentry.io/1"
+            runtime_or_embedded("SHUTTLE_TEST_ENV_KEY", Some("example")).unwrap(),
+            "example"
         );
         assert_eq!(normalize_environment("prod"), "production");
         assert_eq!(normalize_environment("dev"), "testing");

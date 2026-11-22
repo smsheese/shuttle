@@ -1,3 +1,11 @@
+let unreadCount = 0;
+let refreshTitle: (() => void) | undefined;
+
+export function setWindowTitleUnread(count: number): void {
+  unreadCount = count;
+  refreshTitle?.();
+}
+
 /** Keep the native window title as `Shuttle <version> — <locale date/time>`. */
 export async function startWindowTitleClock(): Promise<() => void> {
   try {
@@ -16,14 +24,15 @@ export async function startWindowTitleClock(): Promise<() => void> {
         dateStyle: 'medium',
         timeStyle: 'medium',
       });
-      await win.setTitle(`Shuttle ${version} — ${when}`);
+      await win.setTitle(`${unreadCount > 0 ? `(${unreadCount}) ` : ''}Shuttle ${version} — ${when}`);
     };
 
+    refreshTitle = () => { void tick(); };
     await tick();
     const id = window.setInterval(() => {
       void tick();
     }, 1000);
-    return () => window.clearInterval(id);
+    return () => { window.clearInterval(id); refreshTitle = undefined; };
   } catch {
     return () => {};
   }

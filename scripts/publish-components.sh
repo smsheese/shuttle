@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${SHUTTLE_COMPONENTS_OUT:-$ROOT/dist/components}"
 VERSION="${SHUTTLE_COMPONENTS_VERSION:-$(node -p "require('$ROOT/shuttle-app/package.json').version")}"
-BASE_URL="${SHUTTLE_COMPONENTS_BASE_URL:-https://components.example.com/shuttle/components}"
+BASE_URL="${SHUTTLE_COMPONENTS_BASE_URL:-https://github.com/smsheese/shuttle/releases/download}"
 PLATFORM="${SHUTTLE_COMPONENTS_PLATFORM:-}"
 
 platform_key() {
@@ -52,21 +52,37 @@ add_entry() {
   local key="$1"
   local file="$2"
   local url_path="$3"
-  node - "$MANIFEST_ENTRIES" "$key" "$file" "$BASE_URL" "$VERSION" "$url_path" <<'NODE'
+  local component_version="${4:-}"
+  node - "$MANIFEST_ENTRIES" "$key" "$file" "$BASE_URL" "$VERSION" "$url_path" "$component_version" <<'NODE'
 const fs = require('fs');
 const crypto = require('crypto');
-const [,, out, key, file, baseUrl, version, urlPath] = process.argv;
+const [,, out, key, file, baseUrl, version, urlPath, componentVersion] = process.argv;
 const buf = fs.readFileSync(file);
 const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
 const url = `${baseUrl.replace(/\/$/, '')}/v${version}/${urlPath}`;
-fs.appendFileSync(out, JSON.stringify({ key, url, sha256, size: buf.length }) + '\n');
+const entry = { key, url, sha256, size: buf.length };
+if (componentVersion) entry.version = componentVersion;
+fs.appendFileSync(out, JSON.stringify(entry) + '\n');
 NODE
 }
 
 echo "==> Staging connector components for $PLATFORM_KEY (v$VERSION)"
 
 echo "==> Native helpers"
-"$ROOT/connectors/gowa/fetch.sh" || echo "warn: GOWA fetch skipped"
+# GOWA release is pinned in connectors/gowa/fetch.sh (override: SHUTTLE_GOWA_VERSION).
+# A checksum mismatch (exit 3) aborts the build; other failures are skipped with a warning.
+GOWA_RELEASE="$("$ROOT/connectors/gowa/fetch.sh" --print-version)"
+GOWA_FETCHED=0
+gowa_rc=0
+"$ROOT/connectors/gowa/fetch.sh" || gowa_rc=$?
+case "$gowa_rc" in
+  0) GOWA_FETCHED=1 ;;
+  3)
+    echo "error: GOWA $GOWA_RELEASE failed its SHA-256 check; refusing to publish an unverified binary" >&2
+    exit 1
+    ;;
+  *) echo "warn: GOWA fetch skipped (exit $gowa_rc)" ;;
+esac
 "$ROOT/connectors/tdlib/fetch.sh" || echo "warn: TDLib fetch skipped"
 "$ROOT/connectors/signal/fetch.sh"
 
@@ -79,7 +95,7 @@ if [[ -d "$ROOT/connectors/python-runtime/current/python" ]]; then
   cp -a "$ROOT/connectors/python-runtime/current/python" "$TMP/python"
   OUT_FILE="$PLATFORM_DIR/python-runtime.tar.gz"
   pack_dir "$TMP/python" "$OUT_FILE"
-  add_entry "python-runtime" "$OUT_FILE" "$PLATFORM_KEY/python-runtime.tar.gz"
+  add_entry "python-runtime" "$OUT_FILE" "$PLATFORM_KEY-python-runtime.tar.gz"
 fi
 
 if [[ -f "$ROOT/connectors/gowa/whatsapp" || -f "$ROOT/connectors/gowa/whatsapp.exe" ]]; then
@@ -88,16 +104,22 @@ if [[ -f "$ROOT/connectors/gowa/whatsapp" || -f "$ROOT/connectors/gowa/whatsapp.
   cp -a "$ROOT/connectors/gowa/whatsapp"* "$TMP/gowa/" 2>/dev/null || true
   OUT_FILE="$PLATFORM_DIR/native-gowa.tar.gz"
   pack_dir "$TMP/gowa" "$OUT_FILE"
-  add_entry "native:gowa" "$OUT_FILE" "$PLATFORM_KEY/native-gowa.tar.gz"
+  # Record the release only when this run fetched it; a binary left over from an
+  # earlier run is packaged without a version rather than mislabelled.
+  gowa_version=""
+  if [[ "$GOWA_FETCHED" == 1 ]]; then
+    gowa_version="$GOWA_RELEASE"
+  fi
+  add_entry "native:gowa" "$OUT_FILE" "$PLATFORM_KEY-native-gowa.tar.gz" "$gowa_version"
 fi
 
-if compgen -G "$ROOT/connectors/tdlib/"'tdjson*' >/dev/null || compgen -G "$ROOT/connectors/tdlib/libtdjson*' >/dev/null; then
+if compgen -G "$ROOT/connectors/tdlib/"'tdjson*' >/dev/null || compgen -G "$ROOT/connectors/tdlib/libtdjson*" >/dev/null; then
   rm -rf "$TMP/tdlib"
   mkdir -p "$TMP/tdlib"
   cp -a "$ROOT/connectors/tdlib/"* "$TMP/tdlib/" 2>/dev/null || true
   OUT_FILE="$PLATFORM_DIR/native-tdlib.tar.gz"
   pack_dir "$TMP/tdlib" "$OUT_FILE"
-  add_entry "native:tdlib" "$OUT_FILE" "$PLATFORM_KEY/native-tdlib.tar.gz"
+  add_entry "native:tdlib" "$OUT_FILE" "$PLATFORM_KEY-native-tdlib.tar.gz"
 fi
 
 if [[ -d "$ROOT/connectors/signal" ]]; then
@@ -107,7 +129,7 @@ if [[ -d "$ROOT/connectors/signal" ]]; then
   [[ -d "$ROOT/connectors/signal/runtime" ]] && cp -a "$ROOT/connectors/signal/runtime" "$TMP/signal/"
   OUT_FILE="$PLATFORM_DIR/native-signal-cli.tar.gz"
   pack_dir "$TMP/signal" "$OUT_FILE"
-  add_entry "native:signal-cli" "$OUT_FILE" "$PLATFORM_KEY/native-signal-cli.tar.gz"
+  add_entry "native:signal-cli" "$OUT_FILE" "$PLATFORM_KEY-native-signal-cli.tar.gz"
 fi
 
 pack_python_deps() {
@@ -120,7 +142,7 @@ pack_python_deps() {
   python3 -m pip install --disable-pip-version-check "$requirement" -t "$dest" >/dev/null
   local out="$PLATFORM_DIR/python-deps-$name.tar.gz"
   pack_dir "$dest" "$out"
-  add_entry "python:deps:$name" "$out" "$PLATFORM_KEY/python-deps-$name.tar.gz"
+  add_entry "python:deps:$name" "$out" "$PLATFORM_KEY-python-deps-$name.tar.gz"
 }
 
 if command -v python3 >/dev/null 2>&1; then
@@ -141,7 +163,7 @@ for script in shuttle_ipc.py whatsapp-connector.py telegram-connector.py signal-
   fi
   OUT_FILE="$PLATFORM_DIR/${key//:/-}.tar.gz"
   pack_file "$src" "$OUT_FILE"
-  add_entry "$key" "$OUT_FILE" "$PLATFORM_KEY/${key//:/-}.tar.gz"
+  add_entry "$key" "$OUT_FILE" "$PLATFORM_KEY-${key//:/-}.tar.gz"
 done
 
 node - "$MANIFEST" "$MANIFEST_ENTRIES" "$VERSION" "$PLATFORM_KEY" <<'NODE'
@@ -157,11 +179,9 @@ manifest.platforms[platform] = manifest.platforms[platform] || {};
 const lines = fs.readFileSync(entriesPath, 'utf8').trim().split('\n').filter(Boolean);
 for (const line of lines) {
   const entry = JSON.parse(line);
-  manifest.platforms[platform][entry.key] = {
-    url: entry.url,
-    sha256: entry.sha256,
-    size: entry.size,
-  };
+  const artifact = { url: entry.url, sha256: entry.sha256, size: entry.size };
+  if (entry.version) artifact.version = entry.version;
+  manifest.platforms[platform][entry.key] = artifact;
 }
 fs.mkdirSync(require('path').dirname(manifestPath), { recursive: true });
 fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));

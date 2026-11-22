@@ -14,24 +14,12 @@ export async function initTelemetry(): Promise<void> {
   if (handlersInstalled || typeof window === 'undefined') return;
   handlersInstalled = true;
 
-  window.addEventListener('error', (event) => {
-    void reportError('frontend_exception', {
-      operation: 'window.error',
-      error_category: event.message.slice(0, 120),
-    });
+  window.addEventListener('error', () => {
+    void reportError('frontend_exception');
   });
 
-  window.addEventListener('unhandledrejection', (event) => {
-    const reason =
-      event.reason instanceof Error
-        ? event.reason.message
-        : typeof event.reason === 'string'
-          ? event.reason
-          : 'unhandled_rejection';
-    void reportError('frontend_unhandled_rejection', {
-      operation: 'window.unhandledrejection',
-      error_category: reason.slice(0, 120),
-    });
+  window.addEventListener('unhandledrejection', () => {
+    void reportError('frontend_unhandled_rejection');
   });
 
   document.addEventListener('visibilitychange', () => {

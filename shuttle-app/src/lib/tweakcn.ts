@@ -31,10 +31,14 @@ const SYSTEM_FONTS = new Set([
 export function parseTweakcnId(input: string): string | null {
   const trimmed = input.trim();
   if (!trimmed) return null;
-  const urlMatch = trimmed.match(/tweakcn\.com\/r\/themes\/([a-z0-9]+)/i);
-  if (urlMatch) return urlMatch[1];
   if (/^[a-z0-9]{16,}$/i.test(trimmed)) return trimmed;
-  return null;
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol !== 'https:' || url.hostname.toLowerCase() !== 'tweakcn.com') return null;
+    return url.pathname.match(/^\/(?:r\/)?themes\/([a-z0-9]{16,})\/?$/i)?.[1] ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export function isLegacyPreset(themeId: string): themeId is LegacyThemePreset {

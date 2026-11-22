@@ -104,7 +104,10 @@ pub fn extract_archive(archive_path: &Path, dest: &Path) -> Result<(), String> {
         fs::copy(archive_path, dest).map_err(|e| e.to_string())?;
         Ok(())
     } else {
-        Err(format!("Unsupported archive format: {}", archive_path.display()))
+        Err(format!(
+            "Unsupported archive format: {}",
+            archive_path.display()
+        ))
     }
 }
 
@@ -126,7 +129,7 @@ fn extract_zip(archive_path: &Path, dest: &Path) -> Result<(), String> {
             Some(path) => dest.join(path),
             None => continue,
         };
-        if file.name().ends_with('/') {
+        if file.is_dir() {
             fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
         } else {
             if let Some(parent) = outpath.parent() {

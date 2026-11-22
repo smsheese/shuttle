@@ -11,11 +11,21 @@ export interface GiphyItem {
 }
 
 let _gf: GiphyFetch | null = null;
+let _gfKey = '';
+let userKey = '';
+
+/** The key from Settings wins; the build-time key is only a fallback for local development. */
+export function setGiphyKey(key: string | null | undefined) {
+  userKey = (key ?? '').trim();
+}
 
 function gf(): GiphyFetch | null {
-  const key = import.meta.env.VITE_GIPHY_API_KEY as string | undefined;
-  if (!key?.trim()) return null;
-  if (!_gf) _gf = new GiphyFetch(key.trim());
+  const key = userKey || ((import.meta.env.VITE_GIPHY_API_KEY as string | undefined) ?? '').trim();
+  if (!key) return null;
+  if (!_gf || _gfKey !== key) {
+    _gf = new GiphyFetch(key);
+    _gfKey = key;
+  }
   return _gf;
 }
 

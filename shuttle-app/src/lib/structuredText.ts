@@ -1,3 +1,11 @@
+import { mentionSegments, type MentionResolver, type TextSegment } from './mentions';
+import type { Message } from './types';
+
+/** A link in a body, on top of the plain text and @mention segments. */
+export type BodySegment = TextSegment | { url: string };
+
+const URL_RE = /https?:\/\/[^\s<>)"']+/g;
+
 export function innerSpan(text: string, offset: number): { inner: string; wrapper: string } | null {
   const pairs: [string, string][] = [
     ['```', '```'],
@@ -35,5 +43,33 @@ export function selectionContext(): { selected: string; inner: string | null } {
 }
 
 export function urlsIn(text: string): string[] {
-  return text.match(/https?:\/\/[^\s<>)"']+/g) ?? [];
+  return urlSpans(text).map((span) => span.url);
+}
+
+/** Every link in `text`, with where it starts. Trailing sentence punctuation is not the link. */
+export function urlSpans(text: string): { url: string; start: number }[] {
+  const out: { url: string; start: number }[] = [];
+  for (const m of text.matchAll(URL_RE)) {
+    const url = m[0].replace(/[.,;:!?]+$/, '');
+    if (url.length > 'https://'.length) out.push({ url, start: m.index ?? 0 });
+  }
+  return out;
+}
+
+/**
+ * A message body as segments: plain text, resolved @mentions and links, so the view renders
+ * text nodes and anchors (nothing is HTML).
+ */
+export function bodySegments(msg: Message, text: string, resolver: MentionResolver): BodySegment[] {
+  const spans = urlSpans(text);
+  if (!spans.length) return mentionSegments(msg, text, resolver);
+  const out: BodySegment[] = [];
+  let last = 0;
+  for (const span of spans) {
+    if (span.start > last) out.push(...mentionSegments(msg, text.slice(last, span.start), resolver));
+    out.push({ url: span.url });
+    last = span.start + span.url.length;
+  }
+  if (last < text.length) out.push(...mentionSegments(msg, text.slice(last), resolver));
+  return out;
 }

@@ -45,11 +45,7 @@ pub fn in_quiet_hours(cfg: &NotificationConfig) -> bool {
 }
 
 /// Most specific wins: muted always blocks. Then chat → account → app-wide + quiet hours.
-pub fn should_notify(
-    cfg: &AppConfig,
-    account: &Account,
-    conv: &Conversation,
-) -> bool {
+pub fn should_notify(cfg: &AppConfig, account: &Account, conv: &Conversation) -> bool {
     if conv.muted || account.muted {
         return false;
     }
@@ -78,10 +74,7 @@ pub fn should_notify_ids(
     account_id: &str,
     conversation_id: &str,
 ) -> bool {
-    let Ok(accounts) = db.list_accounts() else {
-        return false;
-    };
-    let Some(account) = accounts.into_iter().find(|a| a.id == account_id) else {
+    let Ok(account) = db.get_account(account_id) else {
         return false;
     };
     let Ok(conv) = db.get_conversation(conversation_id) else {

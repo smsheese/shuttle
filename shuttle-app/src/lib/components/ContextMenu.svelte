@@ -32,7 +32,7 @@
   const style = $derived.by(() => {
     const pad = 8;
     const w = 240;
-    const h = items.length * 32 + 12;
+    const h = items.reduce((sum, it) => sum + (it.row ? 44 : 32), 12);
     const left = Math.min(x, window.innerWidth - w - pad);
     const top = Math.min(y, window.innerHeight - h - pad);
     return `left:${Math.max(pad, left)}px;top:${Math.max(pad, top)}px`;
@@ -44,6 +44,25 @@
     {#each items as item (item.id)}
       {#if item.separator}
         <div class="sep" role="separator"></div>
+      {:else if item.row}
+        <div class="row" role="group" aria-label={item.label}>
+          {#each item.row as cell (cell.id)}
+            <button
+              class="cell"
+              class:active={cell.active}
+              role="menuitem"
+              type="button"
+              title={cell.title ?? cell.label}
+              aria-label={cell.title ?? cell.label}
+              onclick={() => {
+                onselect(cell.id);
+                onclose();
+              }}
+            >
+              {cell.label}
+            </button>
+          {/each}
+        </div>
       {:else}
         <button
           class="item"
@@ -98,6 +117,33 @@
   }
   .item.danger {
     color: #ef4444;
+  }
+  .row {
+    display: flex;
+    justify-content: space-between;
+    gap: 2px;
+    padding: 2px 2px 6px;
+    margin-bottom: 4px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .cell {
+    flex: 1 1 0;
+    min-width: 0;
+    height: 34px;
+    border: none;
+    background: transparent;
+    color: var(--text);
+    font-size: 19px;
+    line-height: 1;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+  }
+  .cell:hover {
+    background: var(--bg-hover);
+  }
+  .cell.active {
+    background: var(--accent-muted);
+    box-shadow: inset 0 0 0 1px var(--accent);
   }
   .sep {
     height: 1px;

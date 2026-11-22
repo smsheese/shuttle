@@ -6,6 +6,7 @@
   import { applyAppConfig } from '$lib/theme';
   import { ensureThemeConfig } from '$lib/tweakcn';
   import { startWindowTitleClock } from '$lib/windowTitle';
+  import Toasts from '$lib/components/Toasts.svelte';
 
   onMount(() => {
     const block = (e: Event) => e.preventDefault();
@@ -48,3 +49,4 @@
 </script>
 
 <slot />
+<Toasts />

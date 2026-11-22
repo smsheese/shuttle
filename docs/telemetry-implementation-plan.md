@@ -1,6 +1,6 @@
 # Shuttle Telemetry Implementation Plan (Privacy-First)
 
-> **Status (0.0.9–0.1.0):** implemented. Day-to-day contract, event names, cadence, and env vars are in [telemetry-events.md](telemetry-events.md). This file is the original design (sanitizer rules, module layout, phased work). Prefer the events doc unless you are changing telemetry architecture.
+> **Historical design:** Sentry references below describe the original design; PostHog now handles errors. **Status (0.0.9–0.1.0):** implemented. Day-to-day contract, event names, cadence, and env vars are in [telemetry-events.md](telemetry-events.md). This file is the original design (sanitizer rules, module layout, phased work). Prefer the events doc unless you are changing telemetry architecture.
 
 ## Purpose
 

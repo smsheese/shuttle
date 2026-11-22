@@ -15,7 +15,7 @@
     open: boolean;
     connectors: ConnectorInfo[];
     onclose: () => void;
-    oncreate: (connectorId: string, name: string, credentials: Record<string, string>) => void;
+    oncreate: (connectorId: string, name: string, credentials: Record<string, string>, accentColor: string) => void;
     onsubmit?: (credentials: Record<string, string>) => void;
     qrData?: string | null;
     connecting?: boolean;
@@ -42,6 +42,7 @@
   let view: 'list' | 'setup' = $state('list');
   let selectedConnector: ConnectorInfo | null = $state(null);
   let accountName = $state('');
+  let accentColor = $state('#25d366');
   let phoneNumber = $state('');
   let verificationCode = $state('');
   let username = $state('');
@@ -163,6 +164,7 @@
   async function startSetup(c: ConnectorInfo) {
     selectedConnector = c;
     accountName = c.name;
+    accentColor = CONNECTOR_COLORS[c.id] ?? '#888888';
     authStarted = false;
     qrReady = false;
     signalAcknowledged = false;
@@ -226,7 +228,7 @@
     } finally {
       downloading = false;
     }
-    oncreate(selectedConnector.id, accountName.trim(), collectCredentials());
+    oncreate(selectedConnector.id, accountName.trim(), collectCredentials(), accentColor);
     authStarted = true;
     qrReady = false;
   }
@@ -455,6 +457,8 @@
             placeholder="e.g. Work WhatsApp"
             disabled={authStarted}
           />
+          <label for="account-accent">Account accent colour</label>
+          <input id="account-accent" class="account-accent" type="color" bind:value={accentColor} disabled={authStarted || downloading} />
           <p class="hint">{meta.tagline}</p>
           {#if requirements && requirements.total_download_bytes > 0}
             <p class="download-estimate">
@@ -816,6 +820,8 @@
   input:disabled {
     opacity: 0.6;
   }
+
+  .account-accent { width: 54px; height: 36px; padding: 3px; margin-bottom: 8px; cursor: pointer; }
 
   .hint {
     font-size: 12px;

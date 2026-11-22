@@ -1,4 +1,6 @@
 <script lang="ts">
+  import DateTimeField from '$lib/components/DateTimeField.svelte';
+  import { defaultLocalDateTime, isFutureLocalDateTime, nextMinute, toLocalDateTime } from '$lib/localDateTime';
   interface Props {
     open: boolean;
     initialNote?: string;
@@ -11,20 +13,15 @@
   let note = $state('');
   let busy = $state(false);
 
-  function toLocalDatetimeInput(d: Date): string {
-    const pad = (n: number) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  }
-
   $effect(() => {
     if (open) {
-      fireAt = toLocalDatetimeInput(new Date(Date.now() + 3600_000));
+      fireAt = defaultLocalDateTime();
       note = initialNote;
     }
   });
 
   async function submit() {
-    if (!fireAt || busy) return;
+    if (!isFutureLocalDateTime(fireAt) || busy) return;
     busy = true;
     try {
       await onsubmit(new Date(fireAt).toISOString(), note.trim());
@@ -39,17 +36,14 @@
   <div class="backdrop" role="presentation" onclick={onclose}></div>
   <div class="modal" role="dialog" aria-modal="true" aria-label="Remind me">
     <h2>Remind me</h2>
-    <label class="field">
-      When
-      <input type="datetime-local" bind:value={fireAt} disabled={busy} />
-    </label>
+    <DateTimeField bind:value={fireAt} min={toLocalDateTime(nextMinute())} disabled={busy} title="Remind me at" />
     <label class="field">
       Note
       <textarea bind:value={note} rows="3" placeholder="Optional reminder note" disabled={busy}></textarea>
     </label>
     <div class="actions">
       <button type="button" class="cancel" onclick={onclose} disabled={busy}>Cancel</button>
-      <button type="button" class="submit" onclick={submit} disabled={busy || !fireAt}>Set reminder</button>
+      <button type="button" class="submit" onclick={submit} disabled={busy || !isFutureLocalDateTime(fireAt)}>Set reminder</button>
     </div>
   </div>
 {/if}
@@ -92,7 +86,6 @@
     color: var(--text-muted);
   }
 
-  input,
   textarea {
     font: inherit;
     color: var(--text-primary);

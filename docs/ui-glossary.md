@@ -74,7 +74,7 @@ Each chat is a **conv-item** (conversation row):
 | Number badge | unread badge |
 | Pin icon | pinned conversation |
 
-Pinned chats appear in a **pinned section** above the rest.
+Pinned chats appear in a **pinned section** above the rest: a compact horizontal row of small avatars with the network badge, the unread badge and the name under it (long names scroll on hover). When a pinned chat gets a message the row scrolls back to its left end so the newest chat is visible.
 
 ### Compose modals (from "New")
 - **New contact chat** — start a DM
@@ -108,10 +108,15 @@ Pinned chats appear in a **pinned section** above the rest.
 | Your messages (right) | outbound messages |
 | Their messages (left) | inbound messages |
 | Sender name in groups | sender label |
+| Quoted block at the top of a reply bubble (original's author + 1-2 lines, a thumbnail for images; click jumps to the original) | reply quote |
 | Images/videos/audio | message media |
 | Timestamp + checkmarks | msg-time / read receipts (✓ sent, ✓✓ delivered/read) |
 
-Right-click a message → **context menu** (Copy, Reply, Forward, etc.)
+Right-click a message → **context menu** (Copy, Reply, Forward, Select, etc.). **Reply** opens the reply bar; the next send is a real WhatsApp reply linked to that message. **View contact** appears only in groups, on other members' messages, and opens **contact details** for that sender: their direct chat on the same account, or a transient view (name, number, account) when there is no chat.
+
+**Selection mode** (`select-bar`): **Select** in the message menu puts a checkbox on every message. Click toggles a message, shift-click selects a range, Esc or × leaves. The bar shows "N selected" and Copy, Forward, Star (Unstar when all are starred), Translate and Delete.
+
+A forwarded message shows a small **Forwarded** label at the top of its bubble.
 
 ### Composer (bottom input area)
 **Class:** `composer`
@@ -124,6 +129,7 @@ Right-click a message → **context menu** (Copy, Reply, Forward, etc.)
 | Paperclip | attach button → attach menu (Photo, Video, Audio, Document, Location, Poll) |
 | Clock icon | send later picker |
 | Mic button | voice record |
+| Bar above the input while replying (author, snippet, × or Esc to cancel) | reply bar |
 | Text input box | composer input / draft / message box |
 | Send button | send button |
 
@@ -140,9 +146,8 @@ Opens from the `ⓘ` button in the thread header. Sections:
 
 | Section | Name |
 |---|---|
-| Local notes textarea | Notes |
-| Checkbox todo list | Todos |
-| "Remind me" datetime + note | Remind me |
+| Note items (optionally quoting a message, with a timer or alarm) and the "Add note" composer | Notes |
+| Checkbox todo list (todos made from a message show a quoted snippet that jumps to it) | Todos |
 | Queued future messages | Send later (scheduled messages for this chat) |
 
 On narrow screens it moves to the **top** of the thread instead of the side.
@@ -175,9 +180,10 @@ Replaces the list pane when Settings is open. Tabs:
 | UI | Component | When it appears |
 |---|---|---|
 | Account setup | `AccountSetup.svelte` | Adding a new account, QR login, connector install |
-| Contact details | `ContactDetails.svelte` | Click thread header → workspace/priority for that chat |
-| Remind modal | `RemindModal.svelte` | "Remind me about this chat" from message menu |
-| Forward modal | inline in `+page.svelte` | Forward a message to another chat |
+| Contact details | `ContactDetails.svelte` | Click thread header → workspace/priority for that chat; also "View contact" on a group member's message (`transient` when there is no chat) |
+| Remind modal | `RemindModal.svelte` | "Remind" in the chat context menu; creates a note with an alarm |
+| Date-time picker | `DateTimeField.svelte` / `DateTimePopover.svelte` | Month calendar + hour/minute popover (follows the 12h/24h setting) used for send later, forward-at, reminders and note alarms |
+| Forward modal | `ForwardModal.svelte` | "Forward…" in the message menu or the selection bar. Header: "Forward to", schedule (clock) button, Send (N). Then account chips (none = all accounts), search, and chats by last activity with ticks. The ticked set survives filter and search changes |
 | Context menu | `ContextMenu.svelte` | Right-click on conversation, message, or account |
 | Compose modal | inside `ConversationList.svelte` | New DM or new group |
 
@@ -204,7 +210,8 @@ Replaces the list pane when Settings is open. Tabs:
 | "add account flow" / "setup wizard" | `AccountSetup.svelte` |
 | "settings" + tab name | `SettingsPanel.svelte` → that tab |
 | "right-click menu" / "context menu" | `ContextMenu.svelte` |
-| "forward modal" | forward dialog in `+page.svelte` |
+| "forward modal" / "forward dialog" | `ForwardModal.svelte` |
+| "selection bar" / "select mode" | `select-bar` in `ThreadView.svelte` |
 | "workspace/priority dropdowns" | `org-filters` above the list |
 
 ---

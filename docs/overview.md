@@ -17,7 +17,7 @@ This document is the current architecture. For the public pitch and integrator t
 - **Connectors are processes.** Sidecars speak newline-delimited JSON on stdin/stdout. The WebView never talks to networks or the filesystem.
 - **Credentials stay out of SQLite and the UI.** OS keyring first; mode `0600` file fallback. Backup/restore must keep that split.
 - **Unofficial APIs stay marked.** Messenger (`fbchat`) and Instagram (`instagrapi`) are optional and easy to disable. They may conflict with those networks’ terms of service.
-- **Copyleft on Shuttle, not on every helper.** The app is AGPL-3.0. GOWA, TDLib, signal-cli, and Python libraries keep their own licenses ([licensing.md](licensing.md)).
+- **Copyleft on Shuttle, and helpers keep their own terms.** The app is AGPL-3.0-or-later with a separate commercial license. GOWA, TDLib, signal-cli, and Python libraries keep their own licenses ([licensing.md](licensing.md)).
 
 ## Stack
 
@@ -50,11 +50,11 @@ Protocol, commands, and schema: [core.md](core.md). Files on disk: [storage.md](
 - Unified inbox, multi-account setup (QR / phone / password / IMAP), search, unread badges
 - Seven connectors: WhatsApp (GOWA), Telegram (TDLib), Signal (signal-cli), Messenger, Instagram, Matrix, email
 - History sync into per-account SQLite; native notifications; read receipts off by default
-- Workspaces, priority groups, notes, todos, reminders
+- Workspaces, priority groups, per-chat notes (with timers/alarms), todos
 - Text forwarding, forwarding rules, scheduled send
 - Channel-aware composer, password-protected backup, themes
-- amd64 + arm64 packaging on Windows, Linux, and macOS; embedded Python; AGPL + attributions
-- Opt-in Sentry / PostHog; local `.env` vs GitHub `production` / `testing` environments
+- amd64 + arm64 packaging on Windows, Linux, and macOS; embedded Python; MIT/Apache + attributions
+- Opt-in PostHog; local `.env` vs GitHub `production` / `testing` environments
 
 Version history: [CHANGELOG.md](../CHANGELOG.md).
 

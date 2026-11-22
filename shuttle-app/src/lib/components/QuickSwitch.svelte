@@ -146,6 +146,7 @@
   <div
     class="palette"
     role="dialog"
+    tabindex="-1"
     aria-modal="true"
     aria-label="Quick switch"
     onclick={(e) => e.stopPropagation()}

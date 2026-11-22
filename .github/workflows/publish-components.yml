@@ -10,7 +10,7 @@ on:
         required: false
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   publish:
@@ -24,6 +24,8 @@ jobs:
             platform: linux-arm64
           - os: macos-latest
             platform: macos-universal
+          - os: macos-15-intel
+            platform: macos-x86_64
           - os: windows-latest
             platform: windows-amd64
           - os: windows-11-arm
@@ -69,7 +71,7 @@ jobs:
         shell: bash
         env:
           SHUTTLE_COMPONENTS_VERSION: ${{ steps.version.outputs.value }}
-          SHUTTLE_COMPONENTS_BASE_URL: ${{ secrets.SHUTTLE_COMPONENTS_BASE_URL }}
+          SHUTTLE_COMPONENTS_BASE_URL: ${{ secrets.SHUTTLE_COMPONENTS_BASE_URL || format('https://github.com/{0}/releases/download', github.repository) }}
           SHUTTLE_COMPONENTS_PLATFORM: ${{ matrix.platform == 'macos-universal' && 'macos-arm64' || matrix.platform }}
         run: ./scripts/publish-components.sh
 
@@ -139,6 +141,29 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.value }}
           PUBLISH: dist/components/publish/v${{ steps.version.outputs.value }}
+
+      - name: Attach component archives to the GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.value }}"
+          ROOT="dist/components/publish/v${VERSION}"
+          mkdir -p release-components
+          for dir in "$ROOT"/*/; do
+            platform="$(basename "$dir")"
+            [[ "$platform" == scripts ]] && continue
+            for f in "$dir"*; do
+              [[ -f "$f" ]] && cp "$f" "release-components/${platform}-$(basename "$f")"
+            done
+          done
+          ls -lh release-components
+
+      - name: Publish component assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: release-components/*
 
       - name: Upload to S3-compatible bucket
         if: env.S3_BUCKET != ''

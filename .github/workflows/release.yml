@@ -125,18 +125,54 @@ jobs:
         working-directory: shuttle-app
         run: npm ci
 
+      - name: Windows code signing certificate
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE) {
+            Write-Host "No WINDOWS_CERTIFICATE secret: building an unsigned Windows installer."
+            exit 0
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP "shuttle-signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $pwd = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pwd
+          Remove-Item $pfx
+          $conf = "shuttle-app/src-tauri/tauri.conf.json"
+          $json = Get-Content $conf -Raw | ConvertFrom-Json
+          if (-not $json.bundle.windows) {
+            $json.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([pscustomobject]@{})
+          }
+          $json.bundle.windows | Add-Member -NotePropertyName certificateThumbprint -NotePropertyValue $cert.Thumbprint -Force
+          $json.bundle.windows | Add-Member -NotePropertyName digestAlgorithm -NotePropertyValue "sha256" -Force
+          $json.bundle.windows | Add-Member -NotePropertyName timestampUrl -NotePropertyValue "http://timestamp.digicert.com" -Force
+          $json | ConvertTo-Json -Depth 20 | Set-Content $conf
+          Write-Host "Signing with certificate $($cert.Thumbprint)"
+
       - name: Build bundles
         working-directory: shuttle-app
         shell: bash
         env:
-          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
           POSTHOG_HOST: ${{ secrets.POSTHOG_HOST }}
           SHUTTLE_BUILD_CHANNEL: ${{ needs.resolve-environment.outputs.channel }}
           SHUTTLE_GIT_COMMIT: ${{ github.sha }}
-          SHUTTLE_COMPONENTS_BASE_URL: ${{ secrets.SHUTTLE_COMPONENTS_BASE_URL }}
-          VITE_GIPHY_API_KEY: ${{ secrets.VITE_GIPHY_API_KEY }}
+          SHUTTLE_COMPONENTS_BASE_URL: ${{ secrets.SHUTTLE_COMPONENTS_BASE_URL || format('https://github.com/{0}/releases/download', github.repository) }}
+          # macOS signing and notarization (read by `tauri build` when all are set).
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          # Unsigned builds: an empty secret is exported as an empty variable, which Tauri would try to use.
+          for var in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            [[ -z "${!var}" ]] && unset "$var"
+          done
           if [[ -n "${{ matrix.tauri_target }}" ]]; then
             npm run tauri build -- --target "${{ matrix.tauri_target }}"
           elif [[ "${{ matrix.rust_target }}" != "x86_64-unknown-linux-gnu" && "${{ runner.os }}" != "Windows" ]]; then
@@ -200,8 +236,30 @@ jobs:
             -path '*/bundle/deb/*.deb' \
             -o -path '*/bundle/dmg/*.dmg' \
             -o -path '*/bundle/msi/*.msi' \
+            -o -path '*/bundle/nsis/*.exe' \
+            -o -path '*/bundle/appimage/*.AppImage' \
+            -o -path '*/bundle/rpm/*.rpm' \
           \) -size +1024c -print -exec cp {} release-assets/ \;
           cp CHANGELOG.md release-assets/
+
+      - name: Checksums and Linux signatures
+        shell: bash
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          cd release-assets
+          sha256sum -- *.deb *.rpm *.AppImage *.dmg *.msi *.exe 2>/dev/null > SHA256SUMS || true
+          if [[ -n "$GPG_PRIVATE_KEY" ]]; then
+            echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+            for f in *.deb *.rpm *.AppImage SHA256SUMS; do
+              [[ -f "$f" ]] || continue
+              gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --armor --detach-sign "$f"
+            done
+          else
+            echo "No GPG_PRIVATE_KEY secret: Linux packages are published with checksums only."
+          fi
+          ls -lh
           echo "Release assets:"
           ls -lh release-assets/
 

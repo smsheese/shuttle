@@ -1,4 +1,4 @@
-use super::privacy::{is_globally_allowed_key, sanitize_map, sanitize_value};
+use super::privacy::{is_globally_allowed_key, sanitize_value};
 use serde_json::{Map, Value};
 
 pub const APP_EVENTS: &[&str] = &[
@@ -20,6 +20,7 @@ pub const APP_EVENTS: &[&str] = &[
     "performance_snapshot",
     "search_used",
     "command_failed",
+    "operation_timing",
 ];
 
 const APP_EVENT_PROPS: &[(&str, &[&str])] = &[
@@ -31,10 +32,7 @@ const APP_EVENT_PROPS: &[(&str, &[&str])] = &[
     ("account_add_completed", &["connector_type"]),
     ("account_add_failed", &["connector_type", "error_category"]),
     ("account_removed", &["connector_type"]),
-    (
-        "connector_sync_started",
-        &["connector_type", "duration_ms"],
-    ),
+    ("connector_sync_started", &["connector_type", "duration_ms"]),
     (
         "connector_sync_completed",
         &["connector_type", "duration_ms", "items_processed", "errors"],
@@ -60,17 +58,19 @@ const APP_EVENT_PROPS: &[(&str, &[&str])] = &[
     ),
     ("search_used", &[]),
     ("command_failed", &["operation", "error_category"]),
+    ("operation_timing", &["operation", "count", "p50_ms", "p95_ms", "max_ms"]),
 ];
 
-const CONNECTOR_EVENTS: &[&str] = &[
-    "sync_started",
-    "sync_completed",
-    "sync_failed",
-    "crashed",
-];
+const CONNECTOR_EVENTS: &[&str] = &["sync_started", "sync_completed", "sync_failed", "crashed"];
 
 const CONNECTOR_TYPES: &[&str] = &[
-    "whatsapp", "telegram", "signal", "messenger", "instagram", "email", "matrix",
+    "whatsapp",
+    "telegram",
+    "signal",
+    "messenger",
+    "instagram",
+    "email",
+    "matrix",
 ];
 
 pub fn validate_app_event(name: &str, props: &Map<String, Value>) -> Option<Map<String, Value>> {
@@ -120,14 +120,6 @@ fn map_connector_event(event: &str) -> String {
         "crashed" => "connector_crashed".into(),
         other => other.into(),
     }
-}
-
-pub fn validate_error_context(context: &Map<String, Value>) -> Map<String, Value> {
-    let sanitized = sanitize_map(context);
-    filter_props(
-        &sanitized,
-        &["operation", "error_category", "connector_type"],
-    )
 }
 
 fn filter_props(props: &Map<String, Value>, allowed: &[&str]) -> Map<String, Value> {

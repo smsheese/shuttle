@@ -14,6 +14,17 @@ When adding platform-specific code:
 - Test the logic path mentally (or manually) on each OS: clean quit, force-kill, orphan reclaim, and second-instance launch.
 - Document OS-specific limitations in code comments only when a true platform gap remains.
 
+## Modals and popovers
+
+A click that opens a modal, popover, menu or chooser must open it **next to the element that launched it** (anchored to the button, input or message), never centred on the window or in a far corner, so the person can answer without moving the pointer. Examples: the call buttons' panel opens under the header buttons, and the paste-as-media-or-file chooser opens above the composer. Use a full-window modal only when the task is genuinely window-wide (settings, media lightbox).
+
+## WhatsApp sync rules
+
+- Connectors report facts. `shuttle-app/src-tauri/src/db/chat.rs` is the only place that decides titles, chat time, previews, unread and chat merges. Do not add per-path flags that change stored state (the old `force_recency`, `replace_title` and `list_rank` are gone; `history` only gates notifications and UI events) or a second writer for chat rows.
+- One connector process and one GOWA serve all WhatsApp accounts. Every reply and event must carry `account_id`. Never read shared GOWA storage (`gowa/storages`, the WhatsApp chat-settings table, history dumps) without filtering by the account's own number.
+- After changing `connectors/whatsapp-connector.py` or the chat rules, run `python3 -m unittest discover -s connectors/tests` and `cargo test` (in `shuttle-app/src-tauri`).
+- The GOWA version is pinned in `connectors/gowa/fetch.sh`. Move it deliberately, together with `connectors/gowa/checksums.txt` (see [`connectors/gowa/README.md`](connectors/gowa/README.md)).
+
 ## Documentation
 
 Keep docs aligned with the code in the **same change set** when behavior, setup, packaging, or agent conventions change:
@@ -52,6 +63,10 @@ When the user asks to **commit** or to produce a **release build**, finish docum
 5. **Commit all relevant files** together: code, version files, lockfiles if they changed, docs, and `CHANGELOG.md`. Follow the user’s git commit rules (no commit unless they asked; no push unless they asked).
 6. **Release build** (when requested) — e.g. `./scripts/build-release.sh -b deb` on Linux; artifacts under `shuttle-app/src-tauri/target/release/bundle/`.
 
+## Licensing
+
+Shuttle is AGPL-3.0-or-later plus a paid commercial license ([`docs/licensing.md`](docs/licensing.md)). New linked dependencies (Rust crates, npm runtime packages) must be AGPL-compatible **and** relicensable under the commercial license: no GPL-only, LGPL-only, AGPL, SSPL, BUSL or proprietary code in the binary. GPL helpers stay separate downloaded processes, like signal-cli. Outside contributions need the signed [CLA](CLA.md). Do not copy code or assets without recording their source and license.
+
 ## Environment variables
 
 Whenever you add or use a variable that belongs in `.env` (runtime config, API keys, feature flags, URLs, etc.):
@@ -59,3 +74,7 @@ Whenever you add or use a variable that belongs in `.env` (runtime config, API k
 - Add it to `.env.example` in the relevant section with a comment explaining what it is.
 - Use an empty value (`KEY=`) for secrets and a sensible default for non-secret settings.
 - Never commit `.env` itself.
+
+## PostHog project
+
+Shuttle uses its own PostHog project, not the shared TFS PostHog instance. Use Shuttle’s configured project ingestion token and EU Cloud ingest host (`https://eu.i.posthog.com`). Keep the token out of tracked files; see [`docs/telemetry-events.md`](docs/telemetry-events.md).

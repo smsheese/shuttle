@@ -99,6 +99,71 @@ def to_rfc3339(value: Any) -> str:
         return now_iso()
 
 
+_MIN_VALID_YEAR = 2000
+_MAX_FUTURE_SECONDS = 3 * 24 * 3600
+
+
+def parse_timestamp_strict(value: Any) -> Optional[datetime]:
+    """Parse an API timestamp into an aware UTC datetime, or None when it is missing or invalid.
+
+    Unlike ``to_rfc3339`` this never substitutes "now". Zero/negative epochs, zero dates
+    such as ``0001-01-01``, years before 2000 and times far in the future are invalid.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    dt: Optional[datetime] = None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, (int, float)):
+        dt = _epoch_to_dt(float(value))
+    else:
+        s = str(value).strip()
+        if not s:
+            return None
+        try:
+            dt = _epoch_to_dt(float(s))
+        except ValueError:
+            if "T" not in s and " " in s:
+                s = s.replace(" ", "T", 1)
+            if s.endswith(("Z", "z")):
+                s = s[:-1] + "+00:00"
+            try:
+                dt = datetime.fromisoformat(s)
+            except ValueError:
+                dt = None
+    if dt is None:
+        return None
+    try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+        if dt.year < _MIN_VALID_YEAR:
+            return None
+        if dt.timestamp() > time.time() + _MAX_FUTURE_SECONDS:
+            return None
+    except (OverflowError, OSError, ValueError):
+        # e.g. a zero date with a positive UTC offset
+        return None
+    return dt
+
+
+def _epoch_to_dt(n: float) -> Optional[datetime]:
+    if n != n or n in (float("inf"), float("-inf")) or n <= 0:
+        return None
+    if abs(n) > 1e12:
+        n /= 1000.0
+    try:
+        return datetime.fromtimestamp(n, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def to_rfc3339_strict(value: Any) -> Optional[str]:
+    """RFC 3339 string for a valid timestamp, else None (never "now")."""
+    dt = parse_timestamp_strict(value)
+    return dt.isoformat() if dt else None
+
+
 def emit_event(account_id: str, event: str, payload: dict[str, Any]) -> None:
     send(
         {

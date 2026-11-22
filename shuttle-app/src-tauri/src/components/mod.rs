@@ -80,12 +80,7 @@ impl ComponentManager {
     }
 
     pub fn installed_components(&self) -> Vec<InstalledComponent> {
-        self.registry
-            .lock()
-            .components
-            .values()
-            .cloned()
-            .collect()
+        self.registry.lock().components.values().cloned().collect()
     }
 
     pub fn connector_component_ids(connector_id: &str) -> Vec<&'static str> {
@@ -209,10 +204,7 @@ impl ComponentManager {
         Ok(())
     }
 
-    pub async fn ensure_connector_installed_async(
-        &self,
-        connector_id: &str,
-    ) -> Result<(), String> {
+    pub async fn ensure_connector_installed_async(&self, connector_id: &str) -> Result<(), String> {
         if dev_has_connector(connector_id) {
             return Ok(());
         }
@@ -348,11 +340,10 @@ impl ComponentManager {
     }
 
     async fn install_component_async(&self, component_id: &str) -> Result<(), String> {
-        if component_id == "python-runtime" {
-            if detect_system_python().is_some() {
+        if component_id == "python-runtime"
+            && detect_system_python().is_some() {
                 return self.ensure_system_python_registered();
             }
-        }
         if self.registry.lock().is_installed(component_id) {
             return Ok(());
         }
@@ -591,9 +582,16 @@ impl ComponentManager {
         }
     }
 
-    pub fn pythonpath_for_connector(&self, connector_id: &str, script_dir: &Path) -> Option<std::ffi::OsString> {
+    pub fn pythonpath_for_connector(
+        &self,
+        connector_id: &str,
+        script_dir: &Path,
+    ) -> Option<std::ffi::OsString> {
         let mut paths = vec![script_dir.to_path_buf()];
-        if let Some(ipc) = self.shuttle_ipc_script().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        if let Some(ipc) = self
+            .shuttle_ipc_script()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
             if ipc != script_dir.to_path_buf() {
                 paths.push(ipc);
             }
@@ -632,9 +630,13 @@ fn dev_component_exists(component_id: &str) -> bool {
         return false;
     }
     match component_id {
-        "python-runtime" => detect_system_python().is_some() || dev_path(&["python-runtime/current"]).exists(),
+        "python-runtime" => {
+            detect_system_python().is_some() || dev_path(&["python-runtime/current"]).exists()
+        }
         "native:gowa" => dev_path(&["gowa", "whatsapp"]).exists(),
-        "native:tdlib" => tdlib_names().iter().any(|n| dev_path(&["tdlib", n]).exists()),
+        "native:tdlib" => tdlib_names()
+            .iter()
+            .any(|n| dev_path(&["tdlib", n]).exists()),
         "native:signal-cli" => dev_path(&["signal", "signal-cli"]).exists(),
         "python:deps:messenger" | "python:deps:instagram" => {
             dev_path(&["python-runtime/current"]).exists()

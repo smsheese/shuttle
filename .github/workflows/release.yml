@@ -259,9 +259,8 @@ jobs:
           else
             echo "No GPG_PRIVATE_KEY secret: Linux packages are published with checksums only."
           fi
-          ls -lh
           echo "Release assets:"
-          ls -lh release-assets/
+          ls -lh
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2

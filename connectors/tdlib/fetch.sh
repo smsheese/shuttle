@@ -28,6 +28,8 @@ req = urllib.request.Request(
     "https://api.github.com/repos/pylakey/aiotdlib/releases/latest",
     headers={"User-Agent": "shuttle-tdlib-fetch"},
 )
+if os.environ.get("GITHUB_TOKEN"):
+    req.add_header("Authorization", "Bearer " + os.environ["GITHUB_TOKEN"])
 try:
     data = json.loads(urllib.request.urlopen(req, timeout=30).read())
 except Exception as e:

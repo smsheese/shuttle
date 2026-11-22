@@ -67,6 +67,8 @@ jobs:
         shell: bash
         env:
           SHUTTLE_COMPONENTS_VERSION: ${{ steps.version.outputs.value }}
+          # Authenticated GitHub API calls: the unauthenticated limit is shared by runner IPs and trips on macOS.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHUTTLE_COMPONENTS_BASE_URL: ${{ secrets.SHUTTLE_COMPONENTS_BASE_URL || format('https://github.com/{0}/releases/download', github.repository) }}
           SHUTTLE_COMPONENTS_PLATFORM: ${{ matrix.platform == 'macos-universal' && 'macos-arm64' || matrix.platform }}
         run: ./scripts/publish-components.sh

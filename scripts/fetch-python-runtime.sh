@@ -27,7 +27,9 @@ esac
 fi
 
 meta_file_json="$TMPDIR/release.json"
-curl -fsSL https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest -o "$meta_file_json"
+auth=()
+[[ -n "${GITHUB_TOKEN:-}" ]] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+curl -fsSL "${auth[@]}" https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest -o "$meta_file_json"
 
 asset_json="$(node - "$triple" "$meta_file_json" <<'NODE'
 const fs = require('fs');

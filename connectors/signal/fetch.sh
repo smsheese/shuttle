@@ -32,6 +32,8 @@ req = urllib.request.Request(
     "https://api.github.com/repos/AsamK/signal-cli/releases/latest",
     headers={"User-Agent": "shuttle-signal-fetch"},
 )
+if os.environ.get("GITHUB_TOKEN"):
+    req.add_header("Authorization", "Bearer " + os.environ["GITHUB_TOKEN"])
 data = json.loads(urllib.request.urlopen(req, timeout=30).read())
 native_url = jvm_url = None
 for a in data.get("assets", []):

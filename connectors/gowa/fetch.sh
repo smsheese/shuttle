@@ -79,6 +79,9 @@ req = urllib.request.Request(
     f"https://api.github.com/repos/{repo}/releases/tags/{tag}",
     headers={"User-Agent": "shuttle-gowa-fetch", "Accept": "application/vnd.github+json"},
 )
+import os
+if os.environ.get("GITHUB_TOKEN"):
+    req.add_header("Authorization", "Bearer " + os.environ["GITHUB_TOKEN"])
 try:
     data = json.loads(urllib.request.urlopen(req).read())
 except urllib.error.HTTPError as e:

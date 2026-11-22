@@ -108,12 +108,18 @@ jobs:
             echo "value=$(node -p "require('./shuttle-app/package.json').version")" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Download all component artifacts
+      - name: Download component archives
         uses: actions/download-artifact@v4
         with:
-          path: dist/components/merged
+          path: dist/components/publish/v${{ steps.version.outputs.value }}
           pattern: components-*
           merge-multiple: true
+
+      - name: Download manifest fragments
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/components/fragments
+          pattern: manifest-*
 
       - name: Merge manifest fragments
         shell: bash
@@ -127,8 +133,8 @@ jobs:
           const version = process.env.VERSION;
           const root = process.env.PUBLISH;
           const merged = { schema: 1, shuttle_version: version, platforms: {} };
-          for (const dir of fs.readdirSync('dist/components/merged')) {
-            const manifestPath = path.join('dist/components/merged', dir, 'manifest.json');
+          for (const dir of fs.readdirSync('dist/components/fragments')) {
+            const manifestPath = path.join('dist/components/fragments', dir, 'manifest.json');
             if (!fs.existsSync(manifestPath)) continue;
             const part = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
             Object.assign(merged.platforms, part.platforms || {});

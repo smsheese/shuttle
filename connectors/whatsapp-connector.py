@@ -2747,7 +2747,7 @@ class WhatsAppSession:
         self._contacts_signature: Optional[str] = None
         self._saved_jids: Optional[set[str]] = None
         self._groups_checked_at = 0.0
-        self._metadata_checked_at = 0.0
+        self._metadata_checked_at = float("-inf")  # time.monotonic() can be small right after boot, so 0 is not "never"
         self._metadata_lock = threading.Lock()
         self._chat_settings: dict[str, dict[str, bool]] = {}
         # group jid -> (announce only, this account is an admin), from GOWA's group info.

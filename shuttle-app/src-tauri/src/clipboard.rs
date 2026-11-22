@@ -135,7 +135,7 @@ fn contents(path: &str, png: Option<Vec<u8>>) -> Vec<ClipboardContent> {
 /// format (keeps transparency for Chromium/Electron apps), then `CF_HDROP`.
 #[cfg(target_os = "windows")]
 fn contents(path: &str, png: Option<Vec<u8>>) -> Vec<ClipboardContent> {
-    use clipboard_rs::{RustImage, RustImageData};
+    use clipboard_rs::{common::RustImage, RustImageData};
     let mut out = Vec::with_capacity(4);
     let is_image = png.is_some();
     if let Some(png) = png {
@@ -154,7 +154,7 @@ fn contents(path: &str, png: Option<Vec<u8>>) -> Vec<ClipboardContent> {
 /// macOS: PNG on the pasteboard plus the file URL (clipboard-rs writes files as NSURLs).
 #[cfg(target_os = "macos")]
 fn contents(path: &str, png: Option<Vec<u8>>) -> Vec<ClipboardContent> {
-    use clipboard_rs::{RustImage, RustImageData};
+    use clipboard_rs::{common::RustImage, RustImageData};
     let mut out = Vec::with_capacity(2);
     if let Some(png) = png {
         if let Ok(img) = RustImageData::from_bytes(&png) {

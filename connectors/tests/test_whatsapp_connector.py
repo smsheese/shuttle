@@ -159,7 +159,7 @@ class LateMetadataTests(unittest.TestCase):
             s._refresh_contacts()  # An open-chat refresh may load names before metadata export.
             s.client.groups = [{"JID": group, "Name": "Community"}]
             settings.return_value = {PHONE: {"pinned": True, "archived": False}}
-            s._metadata_checked_at = 0
+            s._metadata_checked_at = float("-inf")
             s._history_done = True
             s.catch_up_recent()  # /chats is empty: cached rows still have to refresh.
             updates = {x["payload"]["remote_id"]: x["payload"] for x in cap.events("conversation.updated")}

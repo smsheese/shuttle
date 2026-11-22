@@ -45,7 +45,8 @@ mod windows_job {
         OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
     };
 
-    static JOB: OnceLock<HANDLE> = OnceLock::new();
+    // HANDLE is a raw pointer (not Sync); the job handle lives for the whole process, so keep its address.
+    static JOB: OnceLock<usize> = OnceLock::new();
 
     pub fn init() {
         JOB.get_or_init(|| unsafe {
@@ -54,7 +55,7 @@ mod windows_job {
                 tracing::warn!(
                     "CreateJobObjectW failed; connector orphans may survive Shuttle exit"
                 );
-                return job;
+                return 0;
             }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -69,24 +70,25 @@ mod windows_job {
                     "SetInformationJobObject failed; connector orphans may survive Shuttle exit"
                 );
             }
-            job
+            job as usize
         });
     }
 
     pub fn assign(pid: u32) {
-        let Some(job) = JOB.get() else {
+        let Some(&job) = JOB.get() else {
             return;
         };
-        if job.is_null() {
+        if job == 0 {
             return;
         }
+        let job = job as HANDLE;
         unsafe {
             let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
             if proc.is_null() {
                 tracing::warn!("OpenProcess failed for connector pid {pid}");
                 return;
             }
-            if AssignProcessToJobObject(*job, proc) == 0 {
+            if AssignProcessToJobObject(job, proc) == 0 {
                 tracing::warn!("AssignProcessToJobObject failed for connector pid {pid}");
             }
             CloseHandle(proc);

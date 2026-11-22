@@ -60,7 +60,7 @@ jobs:
 
       - name: macOS Python
         if: runner.os == 'macOS'
-        run: python3 -m pip install --upgrade pip wheel
+        run: python3 -m pip install --upgrade --break-system-packages pip wheel
 
       - name: Windows Python
         if: runner.os == 'Windows'
@@ -176,7 +176,7 @@ jobs:
           S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
           VERSION: ${{ steps.version.outputs.value }}
         run: |
-          pip install awscli --quiet
+          pip install --break-system-packages awscli --quiet
           EXTRA=()
           if [[ -n "$S3_ENDPOINT" ]]; then
             EXTRA+=(--endpoint-url "$S3_ENDPOINT")

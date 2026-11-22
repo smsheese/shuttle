@@ -15,20 +15,18 @@ fi
 
 strip_dir() {
   local target="$1"
-  [[ -d "$target" ]] && rm -rf "$target"
+  if [[ -d "$target" ]]; then rm -rf "$target"; fi
 }
 
 strip_dir "$ROOT/include"
 strip_dir "$ROOT/share"
-strip_dir "$PY_LIB/python3.14/idlelib"
-strip_dir "$PY_LIB/python3.14/tkinter"
-strip_dir "$PY_LIB/python3.14/turtledemo"
-strip_dir "$PY_LIB/python3.14/test"
-strip_dir "$PY_LIB/python3.14/unittest"
-strip_dir "$PY_LIB/python3.14/ensurepip"
-strip_dir "$PY_LIB/python3.14/site-packages/pip"
-strip_dir "$PY_LIB/python3.14/site-packages/setuptools"
-strip_dir "$PY_LIB/python3.14/site-packages/wheel"
+for lib in "$PY_LIB"/python3.*; do
+  [[ -d "$lib" ]] || continue
+  for sub in idlelib tkinter turtledemo test unittest ensurepip \
+    site-packages/pip site-packages/setuptools site-packages/wheel; do
+    strip_dir "$lib/$sub"
+  done
+done
 find "$PY_LIB" -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
 find "$ROOT" -name '*.pyc' -delete 2>/dev/null || true
 

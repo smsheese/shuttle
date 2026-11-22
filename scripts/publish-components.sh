@@ -138,8 +138,15 @@ pack_python_deps() {
   local dest="$TMP/$name"
   rm -rf "$dest"
   mkdir -p "$dest"
-  python3 -m pip install --disable-pip-version-check --upgrade pip wheel >/dev/null
-  python3 -m pip install --disable-pip-version-check "$requirement" -t "$dest" >/dev/null
+  # A venv, because Homebrew and Debian Pythons refuse system-wide pip installs (PEP 668).
+  local venv="$TMP/pip-venv"
+  if [[ ! -d "$venv" ]]; then
+    python3 -m venv "$venv"
+  fi
+  local vpy="$venv/bin/python"
+  [[ -x "$vpy" ]] || vpy="$venv/Scripts/python.exe"
+  "$vpy" -m pip install --disable-pip-version-check --upgrade pip wheel >/dev/null
+  "$vpy" -m pip install --disable-pip-version-check "$requirement" -t "$dest" >/dev/null
   local out="$PLATFORM_DIR/python-deps-$name.tar.gz"
   pack_dir "$dest" "$out"
   add_entry "python:deps:$name" "$out" "$PLATFORM_KEY-python-deps-$name.tar.gz"

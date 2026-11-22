@@ -2746,7 +2746,7 @@ class WhatsAppSession:
         self._contacts_loaded = False
         self._contacts_signature: Optional[str] = None
         self._saved_jids: Optional[set[str]] = None
-        self._groups_checked_at = 0.0
+        self._groups_checked_at = float("-inf")
         self._metadata_checked_at = float("-inf")  # time.monotonic() can be small right after boot, so 0 is not "never"
         self._metadata_lock = threading.Lock()
         self._chat_settings: dict[str, dict[str, bool]] = {}
@@ -2762,7 +2762,7 @@ class WhatsAppSession:
         self._self_aliases: set[str] = set()
         self._lid_map: dict[str, str] = {}
         self._pn_to_lid: dict[str, str] = {}
-        self._lid_loaded_at = 0.0
+        self._lid_loaded_at = float("-inf")
         self._names: dict[str, dict[str, str]] = {}
         self._chat_cache: dict[str, dict[str, Any]] = {}
         self._lid_chats: set[str] = set()

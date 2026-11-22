@@ -84,7 +84,7 @@ case "$gowa_rc" in
   *) echo "warn: GOWA fetch skipped (exit $gowa_rc)" ;;
 esac
 "$ROOT/connectors/tdlib/fetch.sh" || echo "warn: TDLib fetch skipped"
-"$ROOT/connectors/signal/fetch.sh"
+"$ROOT/connectors/signal/fetch.sh" || echo "warn: signal-cli has no build for this platform; Signal is not offered here"
 
 echo "==> Slim Python runtime (no connector deps)"
 SHUTTLE_PYTHON_SKIP_DEPS=1 "$ROOT/scripts/fetch-python-runtime.sh"

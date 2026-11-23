@@ -20,6 +20,7 @@ import type {
   PriorityGroup,
   BackupManifest,
   ChatNote,
+  ComponentsOverview,
   NoteSchedule,
   ScheduledMessage,
   ScheduleMessageDraft,
@@ -996,9 +997,82 @@ function applyMockOp(conversationId: string, msg: Message, op: MessageOp): strin
   return undefined;
 }
 
+/** Browser preview of Settings, About: the same shape the Rust command returns. */
+const MOCK_COMPONENTS: ComponentsOverview = {
+  platform: 'linux-x86_64',
+  expected_version: '0.0.0-dev',
+  manifest_version: null,
+  manifest_available: false,
+  connectors: [
+    {
+      connector_id: 'whatsapp',
+      connector_label: 'WhatsApp',
+      components: [
+        { id: 'script:whatsapp', label: 'Whatsapp connector', installed: true, optional: false, version: '0.0.0-dev', size: 18_400, source: 'managed' },
+        { id: 'native:gowa', label: 'WhatsApp helper (GOWA)', installed: false, optional: false, version: null, size: 24_800_000, source: null },
+      ],
+    },
+    {
+      connector_id: 'telegram',
+      connector_label: 'Telegram',
+      components: [
+        { id: 'script:telegram', label: 'Telegram connector', installed: false, optional: false, version: null, size: 21_000, source: null },
+        { id: 'native:tdlib', label: 'Telegram library (TDLib)', installed: false, optional: false, version: null, size: 9_600_000, source: null },
+      ],
+    },
+    {
+      connector_id: 'signal',
+      connector_label: 'Signal',
+      components: [
+        { id: 'script:signal', label: 'Signal connector', installed: false, optional: false, version: null, size: 19_500, source: null },
+        { id: 'native:signal-cli', label: 'Signal CLI', installed: false, optional: false, version: null, size: 61_000_000, source: null },
+      ],
+    },
+    {
+      connector_id: 'messenger',
+      connector_label: 'Messenger',
+      components: [
+        { id: 'script:messenger', label: 'Messenger connector', installed: false, optional: false, version: null, size: 33_000, source: null },
+        { id: 'script:shuttle_ipc', label: 'Shuttle Ipc connector', installed: false, optional: false, version: null, size: 12_000, source: null },
+        { id: 'python-runtime', label: 'Python runtime', installed: true, optional: false, version: '3.13.2', size: 15_000_000, source: 'system' },
+        { id: 'python:deps:messenger', label: 'Messenger libraries', installed: false, optional: false, version: null, size: 4_200_000, source: null },
+      ],
+    },
+    {
+      connector_id: 'instagram',
+      connector_label: 'Instagram',
+      components: [
+        { id: 'script:instagram', label: 'Instagram connector', installed: false, optional: false, version: null, size: 29_000, source: null },
+        { id: 'script:shuttle_ipc', label: 'Shuttle Ipc connector', installed: false, optional: false, version: null, size: 12_000, source: null },
+        { id: 'python-runtime', label: 'Python runtime', installed: true, optional: false, version: '3.13.2', size: 15_000_000, source: 'system' },
+        { id: 'python:deps:instagram', label: 'Instagram libraries', installed: false, optional: false, version: null, size: 4_600_000, source: null },
+      ],
+    },
+    {
+      connector_id: 'matrix',
+      connector_label: 'Matrix',
+      components: [
+        { id: 'script:matrix', label: 'Matrix connector', installed: false, optional: false, version: null, size: 26_000, source: null },
+        { id: 'script:shuttle_ipc', label: 'Shuttle Ipc connector', installed: false, optional: false, version: null, size: 12_000, source: null },
+        { id: 'python-runtime', label: 'Python runtime', installed: false, optional: true, version: null, size: 15_000_000, source: null },
+      ],
+    },
+    {
+      connector_id: 'email',
+      connector_label: 'Email',
+      components: [
+        { id: 'script:email', label: 'Email connector', installed: false, optional: false, version: null, size: 31_000, source: null },
+        { id: 'script:shuttle_ipc', label: 'Shuttle Ipc connector', installed: false, optional: false, version: null, size: 12_000, source: null },
+        { id: 'python-runtime', label: 'Python runtime', installed: false, optional: true, version: null, size: 15_000_000, source: null },
+      ],
+    },
+  ],
+};
+
 export const mockApi = {
   listAccounts: async () => accounts,
   listConnectors: async () => CONNECTORS,
+  componentsOverview: async () => MOCK_COMPONENTS,
   createAccount: async (connectorId: string, name: string) => {
     const a: Account = {
       id: crypto.randomUUID(),

@@ -1,6 +1,6 @@
 [package]
 name = "shuttle"
-version = "0.6.1"
+version = "0.6.2"
 description = "Local-first unified messaging desktop app"
 authors = ["Sheese Sheikh <https://shee.se>"]
 homepage = "https://shee.se"
@@ -38,6 +38,8 @@ age = "0.12.1"
 tar = "0.4.46"
 tempfile = "3.27.0"
 regex = "1"
+# Release tag comparison for the About page update check. Already in the tree via tauri.
+semver = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 sha2 = "0.10"
 base64 = "0.22"

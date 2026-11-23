@@ -6,11 +6,15 @@ import type {
   AccountPatch,
   AppConfig,
   AttachmentPayload,
+  AppInfo,
   ChatTodo,
   ConnectorInfo,
   ComponentInstallProgress,
+  ComponentsOverview,
   ConnectorRequirements,
   InstalledComponent,
+  UpdateCheck,
+  UpdateDownloadProgress,
   MediaCacheInfo,
   Conversation,
   Contact,
@@ -64,6 +68,42 @@ export async function getInstalledComponents(): Promise<InstalledComponent[]> {
   return isTauri() ? invoke('get_installed_components') : [];
 }
 
+export async function appInfo(): Promise<AppInfo> {
+  return isTauri()
+    ? invoke('app_info')
+    : { version: '0.0.0-dev', os: 'web', platform: 'web' };
+}
+
+export async function componentsOverview(): Promise<ComponentsOverview> {
+  return isTauri() ? invoke('components_overview') : mockApi.componentsOverview();
+}
+
+export async function checkForUpdate(force: boolean): Promise<UpdateCheck> {
+  if (!isTauri()) throw new Error('Update checks need the desktop app.');
+  return invoke('check_for_update', { force });
+}
+
+export async function downloadUpdate(): Promise<string> {
+  return isTauri() ? invoke('download_update') : '';
+}
+
+export async function runUpdateInstaller(): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('run_update_installer');
+}
+
+export function onUpdateDownloadProgress(
+  handler: (progress: UpdateDownloadProgress) => void
+): Promise<UnlistenFn> {
+  if (!isTauri()) return Promise.resolve(async () => {});
+  return listen<ShuttleEvent>('shuttle-event', (e) => {
+    if (e.payload.kind === 'update.download.progress') {
+      // SAFETY: the Rust side emits `{bytes_done, bytes_total}` for this kind only (updates.rs).
+      handler(e.payload.payload as unknown as UpdateDownloadProgress);
+    }
+  });
+}
+
 export async function ensureConnectorComponents(connectorId: string): Promise<void> {
   if (!isTauri()) return;
   await invoke('ensure_connector_components', { connectorId });
@@ -80,6 +120,7 @@ export function onComponentInstallProgress(
   if (!isTauri()) return Promise.resolve(async () => {});
   return listen<ShuttleEvent>('shuttle-event', (e) => {
     if (e.payload.kind === 'component.install.progress') {
+      // SAFETY: components/mod.rs emits exactly this shape for `component.install.progress`.
       handler(e.payload.payload as unknown as ComponentInstallProgress);
     }
   });

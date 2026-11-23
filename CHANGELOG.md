@@ -9,6 +9,23 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-11-23
+
+### Added
+- Settings, About shows the running version, checks GitHub for a newer release (once an hour when the tab opens, or on demand), and lists every network's components with installed state, version and download size. A newer release offers **Download update**, verifies the file against the release's `SHA256SUMS` when one is published, then **Run installer**: `.deb`/`.rpm` open in your system installer, an AppImage is marked executable and started, Windows runs the setup, macOS opens the disk image. Shuttle never asks for elevation itself. Drafts and prereleases are ignored, and offline or rate-limited checks say so in plain words.
+- Settings, Feedback has a **Copy diagnostics** button: one line with the app version, OS, platform key and installed component ids, ready to paste into the form. It holds no account, chat or message data.
+
+### Changed
+- Settings, Feedback opens forms.tfs.qa in your system browser. That form sends `X-Frame-Options: SAMEORIGIN`, so it could never render inside Shuttle; the iframe and its CSP `frame-src` entry are gone.
+- Settings, Accounts and every About list (components, attributions) lay their items out in a compact grid of two to four cards per row depending on window width, instead of one full-width row per item.
+- Component installs record the manifest version in `components/installed.json`, and the About page reads it back. Entries installed before this change show `Installed` until they are installed again.
+- The `built with Cursor Agent` credit is gone from the About page and from the installer's file metadata.
+- Idle CPU and memory are lower on every platform. The sidebar's active-account ring is a static gradient, unread badges no longer pulse, a chat preview scrolls only while its row is hovered or focused, and the window title is set once at startup and again only when the unread count changes instead of every second.
+- The boot screen is drawn inside the main window and removed once the app loads, instead of a second transparent always-on-top window that kept its own WebView process alive for the whole session. Same look on Linux, Windows and macOS.
+- Linux: WebKit runs with its smallest cache model, no page cache and no WebGL (nothing in the UI uses it). `performance.low_memory_webview` in `config.json` (default `true`) turns this off; the hardware-acceleration policy is unchanged.
+- The startup message prefill now loads 5 chats per account once per session, and the in-memory message cache keeps the 30 most recently used chats, evicting the least recently used. It used to read 20 chats per account on every inbox reload and cache 200. Opening a chat still paints from the cache at once.
+- Conversation rows below the fold skip layout and paint (`content-visibility: auto`) until they scroll into view.
+
 ## [0.6.1] - 2026-11-23
 
 ### Fixed

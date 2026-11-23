@@ -23,6 +23,8 @@ pub struct AppConfig {
     pub ai: AiConfig,
     #[serde(default)]
     pub integrations: IntegrationsConfig,
+    #[serde(default)]
+    pub performance: PerformanceConfig,
 }
 
 impl Default for AppConfig {
@@ -36,6 +38,23 @@ impl Default for AppConfig {
             media: MediaConfig::default(),
             ai: AiConfig::default(),
             integrations: IntegrationsConfig::default(),
+            performance: PerformanceConfig::default(),
+        }
+    }
+}
+
+/// Runtime tuning for the WebView process. Editing `config.json` is the only way to change it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceConfig {
+    /// Linux: shrink WebKit's caches and drop WebGL (nothing in the UI uses it). On by default.
+    #[serde(default = "default_true")]
+    pub low_memory_webview: bool,
+}
+
+impl Default for PerformanceConfig {
+    fn default() -> Self {
+        Self {
+            low_memory_webview: true,
         }
     }
 }

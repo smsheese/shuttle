@@ -51,12 +51,19 @@ impl Registry {
             .filter(|p| p.exists())
     }
 
-    pub fn mark(&mut self, id: &str, path: PathBuf, sha256: Option<String>, source: &str) {
+    pub fn mark(
+        &mut self,
+        id: &str,
+        path: PathBuf,
+        sha256: Option<String>,
+        source: &str,
+        version: Option<String>,
+    ) {
         self.components.insert(
             id.to_string(),
             InstalledComponent {
                 id: id.to_string(),
-                version: None,
+                version,
                 sha256,
                 path: path.to_string_lossy().into_owned(),
                 source: source.to_string(),

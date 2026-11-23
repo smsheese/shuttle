@@ -1,39 +1,37 @@
-let unreadCount = 0;
-let refreshTitle: (() => void) | undefined;
-
-export function setWindowTitleUnread(count: number): void {
-  unreadCount = count;
-  refreshTitle?.();
+/** The native window title: the unread count in front when there is one, then the app name. */
+export function windowTitle(version: string, unread: number): string {
+  return `${unread > 0 ? `(${unread}) ` : ''}Shuttle ${version}`;
 }
 
-/** Keep the native window title as `Shuttle <version> — <locale date/time>`. */
-export async function startWindowTitleClock(): Promise<() => void> {
+let unreadCount = 0;
+let applyTitle: ((count: number) => void) | undefined;
+
+/** Set the unread count the title shows. The title changes only when the count does. */
+export function setWindowTitleUnread(count: number): void {
+  unreadCount = count;
+  applyTitle?.(count);
+}
+
+/** Set the title once at start (Tauri only). Nothing here runs on a timer. */
+export async function startWindowTitle(): Promise<void> {
   try {
     const { isTauri } = await import('@tauri-apps/api/core');
-    if (!isTauri()) return () => {};
+    if (!isTauri()) return;
 
     const { getCurrentWindow } = await import('@tauri-apps/api/window');
     const { getVersion } = await import('@tauri-apps/api/app');
     const win = getCurrentWindow();
-    if (win.label !== 'main') return () => {};
+    if (win.label !== 'main') return;
 
     const version = await getVersion();
-
-    const tick = async () => {
-      const when = new Date().toLocaleString(undefined, {
-        dateStyle: 'medium',
-        timeStyle: 'medium',
-      });
-      await win.setTitle(`${unreadCount > 0 ? `(${unreadCount}) ` : ''}Shuttle ${version} — ${when}`);
+    let shown = -1;
+    applyTitle = (count) => {
+      if (count === shown) return;
+      shown = count;
+      void win.setTitle(windowTitle(version, count));
     };
-
-    refreshTitle = () => { void tick(); };
-    await tick();
-    const id = window.setInterval(() => {
-      void tick();
-    }, 1000);
-    return () => { window.clearInterval(id); refreshTitle = undefined; };
+    applyTitle(unreadCount);
   } catch {
-    return () => {};
+    // Browser dev has no window handle.
   }
 }

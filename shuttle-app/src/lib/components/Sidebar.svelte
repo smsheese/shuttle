@@ -79,7 +79,7 @@
         <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
       </svg>
       {#if unreadTotal > 0}
-        <span class="badge badge-pulse">{unreadTotal > 99 ? '99+' : unreadTotal}</span>
+        <span class="badge">{unreadTotal > 99 ? '99+' : unreadTotal}</span>
       {/if}
     </button>
 
@@ -343,12 +343,11 @@
     position: absolute;
     pointer-events: none;
     padding: 2px;
-    background: conic-gradient(from var(--ring-angle), var(--ring-a), var(--ring-b), var(--ring-a));
+    background: conic-gradient(var(--ring-a), var(--ring-b), var(--ring-a));
     -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
     -webkit-mask-composite: xor;
     mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
     mask-composite: exclude;
-    animation: ring-spin 2.4s linear infinite;
   }
 
   .network.active .network-avatar::after {
@@ -363,16 +362,6 @@
     --ring-b: color-mix(in srgb, var(--accent) 20%, white);
     inset: -2px;
     border-radius: calc(var(--radius-md) + 2px);
-  }
-
-  @property --ring-angle {
-    syntax: '<angle>';
-    initial-value: 0deg;
-    inherits: false;
-  }
-
-  @keyframes ring-spin {
-    to { --ring-angle: 360deg; }
   }
 
   .network.active .network-avatar:not(.photo) {
@@ -437,32 +426,13 @@
     opacity: 0.65;
   }
 
-  .badge-pulse {
-    animation: badge-breathe 2.4s ease-in-out infinite;
-  }
-
   @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.35; }
   }
 
-  @keyframes badge-breathe {
-    0%, 100% {
-      transform: scale(1);
-      box-shadow: 0 0 0 2px var(--bg-sidebar), 0 0 0 0 color-mix(in srgb, var(--accent) 50%, transparent);
-    }
-    50% {
-      transform: scale(1.1);
-      box-shadow: 0 0 0 2px var(--bg-sidebar), 0 0 0 5px color-mix(in srgb, var(--accent) 0%, transparent);
-    }
-  }
-
   @media (prefers-reduced-motion: reduce) {
-    .network.active .network-avatar::after,
-    .all-chats.active::after {
-      animation: none;
-    }
-    .badge-pulse {
+    .status-dot.connecting {
       animation: none;
     }
   }

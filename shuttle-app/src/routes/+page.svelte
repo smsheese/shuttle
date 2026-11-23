@@ -1,5 +1,6 @@
 <script lang="ts">
   import { messageSnippet } from '$lib/messageSnippet';
+  import { MessageCache } from '$lib/messageCache';
   import { setWindowTitleUnread } from '$lib/windowTitle';
   import { page } from '$app/state';
   import { onMount, tick, untrack } from 'svelte';
@@ -17,7 +18,6 @@
     deletePriorityGroup,
     deleteScheduledMessage,
     deleteWorkspace,
-    downloadMessageMedia,
     downloadStatusMedia,
     exportBackup,
     fetchConversationAvatar,
@@ -114,7 +114,6 @@
     type PriorityGroup,
     type ReactionGroup,
     type ScheduledMessage,
-    type ScheduleMessageDraft,
     type SearchMessageHit,
     type SearchScope,
     type StatusItem,
@@ -142,24 +141,17 @@
   let messages = $state<Message[]>([]);
   /** True while the open chat has nothing to show yet and its first read is in flight. */
   let messagesLoading = $state(false);
+  const MESSAGE_CACHE_CHATS = 30;
+  const MESSAGE_CACHE_ROWS = 100;
   /**
    * Recent messages by conversation id, so opening a chat paints at once. Every open still
    * re-reads the database and replaces the cached rows, so a stale entry is only ever shown briefly.
    */
-  const messageCache = new Map<string, Message[]>();
-  const MESSAGE_CACHE_CHATS = 200;
-  const MESSAGE_CACHE_ROWS = 100;
-  const PREFILL_CHATS_PER_ACCOUNT = 20;
+  const messageCache = new MessageCache(MESSAGE_CACHE_CHATS, MESSAGE_CACHE_ROWS);
+  const PREFILL_CHATS_PER_ACCOUNT = 5;
   const PREFILL_MESSAGES = 15;
-
-  function cacheMessages(convId: string, rows: Message[]) {
-    messageCache.delete(convId);
-    messageCache.set(convId, rows.slice(-MESSAGE_CACHE_ROWS));
-    if (messageCache.size > MESSAGE_CACHE_CHATS) {
-      const oldest = messageCache.keys().next().value;
-      if (oldest !== undefined) messageCache.delete(oldest);
-    }
-  }
+  /** One prefill per session: later inbox reloads open chats from the database as usual. */
+  let prefillStarted = false;
 
   async function prefillMessageCache() {
     for (const account of accounts) {
@@ -174,7 +166,7 @@
         if (messageCache.has(chat.id)) continue;
         try {
           const rows = await getMessages(chat.id, PREFILL_MESSAGES);
-          if (!messageCache.has(chat.id)) cacheMessages(chat.id, rows);
+          if (!messageCache.has(chat.id)) messageCache.set(chat.id, rows);
         } catch {
           /* the chat reads from the database when opened */
         }
@@ -472,7 +464,7 @@
     if (msg && selectedConversationId === msg.conversation_id) upsertMessage(msg);
     else if (msg) {
       const cached = messageCache.get(msg.conversation_id);
-      if (cached && !cached.some((m) => m.id === msg.id)) cacheMessages(msg.conversation_id, [...cached, msg]);
+      if (cached && !cached.some((m) => m.id === msg.id)) messageCache.set(msg.conversation_id, [...cached, msg]);
     }
   }
 
@@ -634,7 +626,10 @@
       await reloadConversationList();
       searchMessageHits = [];
     }
-    void prefillMessageCache();
+    if (!prefillStarted) {
+      prefillStarted = true;
+      void prefillMessageCache();
+    }
   }
 
   const profileQueued = new Set<string>();
@@ -673,7 +668,7 @@
 
   async function loadMessages(convId: string) {
     const loaded = await getMessages(convId);
-    cacheMessages(convId, loaded);
+    messageCache.set(convId, loaded);
     if (selectedConversationId === convId) {
       messages = loaded;
       messagesLoading = false;
@@ -704,7 +699,7 @@
   }
 
   async function selectConversation(id: string) {
-    if (selectedConversationId && !messagesLoading) cacheMessages(selectedConversationId, messages);
+    if (selectedConversationId && !messagesLoading) messageCache.set(selectedConversationId, messages);
     selectedConversationId = id;
     listFocusId = id;
     mobileView = 'thread';
@@ -1365,7 +1360,7 @@
     const items: MenuItem[] = [
       { id: 'copy', label: 'Copy' },
       ...(inner ? [{ id: 'copy-inner', label: 'Copy inner text' }] : []),
-      ...urls.map((u, i) => ({ id: `url:${i}`, label: `Open URL` })),
+      ...urls.map((_, i) => ({ id: `url:${i}`, label: `Open URL` })),
     ];
     openMenu(x, y, items, async (id) => {
       if (id === 'copy') await navigator.clipboard.writeText(value);

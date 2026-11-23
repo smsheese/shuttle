@@ -191,7 +191,7 @@ Each `ConnectorInfo` carries `actions` (`MessageActions`), from the one table in
 
 ### App config (not SQLite)
 
-`config.json` in the data dir holds appearance, app-wide notification prefs, per-connector channel styles, and `translate` (`endpoint`, `api_key`, both empty by default, which keeps translation off). See [storage.md](storage.md) and `config.rs`. Invalid / missing files fall back to defaults (`color_scheme: system`, `theme_id: shuttle`).
+`config.json` in the data dir holds appearance, app-wide notification prefs, per-connector channel styles, `translate` (`endpoint`, `api_key`, both empty by default, which keeps translation off), and `performance` (`low_memory_webview`, Linux WebKit tuning, default on). See [storage.md](storage.md) and `config.rs`. Invalid / missing files fall back to defaults (`color_scheme: system`, `theme_id: shuttle`).
 
 ## Chat state rules
 

@@ -345,6 +345,57 @@ export interface ComponentInstallProgress {
   phase: string;
 }
 
+export interface AppInfo {
+  version: string;
+  os: string;
+  platform: string;
+}
+
+/** One component row of the About page; `size` stays null when the manifest is out of reach. */
+export interface ComponentStatus {
+  id: string;
+  label: string;
+  installed: boolean;
+  optional: boolean;
+  version?: string | null;
+  size?: number | null;
+  source?: string | null;
+}
+
+export interface ConnectorComponentStatus {
+  connector_id: string;
+  connector_label: string;
+  components: ComponentStatus[];
+}
+
+export interface ComponentsOverview {
+  platform: string;
+  expected_version: string;
+  manifest_version?: string | null;
+  manifest_available: boolean;
+  connectors: ConnectorComponentStatus[];
+}
+
+export interface UpdateAsset {
+  name: string;
+  url: string;
+  size: number;
+}
+
+export interface UpdateCheck {
+  current: string;
+  latest: string;
+  available: boolean;
+  notes_url: string;
+  asset?: UpdateAsset | null;
+  checksums_url?: string | null;
+}
+
+export interface UpdateDownloadProgress {
+  bytes_done: number;
+  bytes_total: number;
+}
+
 /**
  * Event kinds the UI reacts to. Kinds it does not handle still arrive as plain strings.
  * Payload shapes: message.* / conversation.* carry the row, conversation.removed carries
@@ -572,6 +623,8 @@ export interface AppConfig {
   /** The user's own OpenRouter account for translation and later AI features. Empty key = off. */
   ai?: { openrouter_api_key: string; model: string };
   integrations?: { giphy_api_key: string };
+  /** Linux WebView tuning; read by the Rust core at startup, never edited from the UI. */
+  performance?: { low_memory_webview: boolean };
 }
 
 export interface AccountPatch {

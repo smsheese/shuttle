@@ -13,7 +13,7 @@ use install::{
 };
 use manifest::{manifest_cache_path, manifest_url};
 use parking_lot::Mutex;
-use python::{detect_system_python, find_managed_python, python_deps_dir};
+use python::{detect_system_python, find_managed_python, python_deps_dir, python_version};
 use registry::Registry as ComponentRegistry;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +34,92 @@ pub struct ConnectorRequirements {
     pub connector_id: String,
     pub components: Vec<ComponentRequirement>,
     pub total_download_bytes: u64,
+}
+
+/// One connector network and the components it needs. The constructor of installs and the
+/// About page both read this table, so a new network gets its row in one place.
+struct ConnectorComponents {
+    id: &'static str,
+    label: &'static str,
+    components: &'static [&'static str],
+}
+
+const CONNECTORS: &[ConnectorComponents] = &[
+    ConnectorComponents {
+        id: "whatsapp",
+        label: "WhatsApp",
+        components: &["script:whatsapp", "native:gowa"],
+    },
+    ConnectorComponents {
+        id: "telegram",
+        label: "Telegram",
+        components: &["script:telegram", "native:tdlib"],
+    },
+    ConnectorComponents {
+        id: "signal",
+        label: "Signal",
+        components: &["script:signal", "native:signal-cli"],
+    },
+    ConnectorComponents {
+        id: "messenger",
+        label: "Messenger",
+        components: &[
+            "script:messenger",
+            "script:shuttle_ipc",
+            "python-runtime",
+            "python:deps:messenger",
+        ],
+    },
+    ConnectorComponents {
+        id: "instagram",
+        label: "Instagram",
+        components: &[
+            "script:instagram",
+            "script:shuttle_ipc",
+            "python-runtime",
+            "python:deps:instagram",
+        ],
+    },
+    ConnectorComponents {
+        id: "matrix",
+        label: "Matrix",
+        components: &["script:matrix", "script:shuttle_ipc", "python-runtime"],
+    },
+    ConnectorComponents {
+        id: "email",
+        label: "Email",
+        components: &["script:email", "script:shuttle_ipc", "python-runtime"],
+    },
+];
+
+/// One component row of the About page. `size` stays `None` when the manifest is out of reach,
+/// so an offline machine still gets a full list instead of an error page.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ComponentStatus {
+    pub id: String,
+    pub label: String,
+    pub installed: bool,
+    pub optional: bool,
+    pub version: Option<String>,
+    pub size: Option<u64>,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConnectorComponentStatus {
+    pub connector_id: String,
+    pub connector_label: String,
+    pub components: Vec<ComponentStatus>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ComponentsOverview {
+    pub platform: String,
+    /// Version the app expects its manifest to match.
+    pub expected_version: String,
+    pub manifest_version: Option<String>,
+    pub manifest_available: bool,
+    pub connectors: Vec<ConnectorComponentStatus>,
 }
 
 pub struct ComponentManager {
@@ -84,26 +170,13 @@ impl ComponentManager {
     }
 
     pub fn connector_component_ids(connector_id: &str) -> Vec<&'static str> {
-        match connector_id {
-            "whatsapp" => vec!["script:whatsapp", "native:gowa"],
-            "telegram" => vec!["script:telegram", "native:tdlib"],
-            "signal" => vec!["script:signal", "native:signal-cli"],
-            "messenger" => vec![
-                "script:messenger",
-                "script:shuttle_ipc",
-                "python-runtime",
-                "python:deps:messenger",
-            ],
-            "instagram" => vec![
-                "script:instagram",
-                "script:shuttle_ipc",
-                "python-runtime",
-                "python:deps:instagram",
-            ],
-            "email" => vec!["script:email", "script:shuttle_ipc", "python-runtime"],
-            "matrix" => vec!["script:matrix", "script:shuttle_ipc", "python-runtime"],
-            _ => vec![],
-        }
+        Self::connector_row(connector_id)
+            .map(|row| row.components.to_vec())
+            .unwrap_or_default()
+    }
+
+    fn connector_row(connector_id: &str) -> Option<&'static ConnectorComponents> {
+        CONNECTORS.iter().find(|row| row.id == connector_id)
     }
 
     fn component_label(id: &str) -> String {
@@ -186,6 +259,54 @@ impl ComponentManager {
         self.resolve_requirements(connector_id)
     }
 
+    /// Every connector's components with what the About page shows. Never fails on a missing
+    /// manifest: sizes and manifest version read as unknown instead.
+    pub async fn components_overview(&self) -> ComponentsOverview {
+        let platform = platform_key();
+        let manifest = self.fetch_manifest().await.ok();
+        let registry = self.registry.lock().clone();
+        let python_ready = self.python_runtime_ready();
+        let connectors = CONNECTORS
+            .iter()
+            .map(|row| ConnectorComponentStatus {
+                connector_id: row.id.to_string(),
+                connector_label: row.label.to_string(),
+                components: row
+                    .components
+                    .iter()
+                    .map(|id| {
+                        let artifact = manifest.as_ref().and_then(|m| m.artifact(platform, id));
+                        let optional = *id == "python-runtime" && !python_ready;
+                        let managed = registry.components.get(*id);
+                        let installed = if *id == "python-runtime" {
+                            python_ready
+                        } else {
+                            registry.is_installed(id) || dev_component_exists(id)
+                        };
+                        ComponentStatus {
+                            id: (*id).to_string(),
+                            label: Self::component_label(id),
+                            installed,
+                            optional,
+                            version: managed
+                                .and_then(|c| c.version.clone())
+                                .or_else(|| artifact.and_then(|a| a.version.clone())),
+                            size: artifact.map(|a| a.size).filter(|size| *size > 0),
+                            source: managed.map(|c| c.source.clone()),
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        ComponentsOverview {
+            platform: platform.to_string(),
+            expected_version: env!("CARGO_PKG_VERSION").to_string(),
+            manifest_version: manifest.as_ref().map(|m| m.shuttle_version.clone()),
+            manifest_available: manifest.is_some(),
+            connectors,
+        }
+    }
+
     pub fn ensure_connector_installed(&self, connector_id: &str) -> Result<(), String> {
         if dev_has_connector(connector_id) {
             return Ok(());
@@ -238,7 +359,13 @@ impl ComponentManager {
             path = PathBuf::from(format!("{}|{}", bin, args.join("|")));
         }
         let mut registry = self.registry.lock();
-        registry.mark("python-runtime", path, None, "system");
+        registry.mark(
+            "python-runtime",
+            path,
+            None,
+            "system",
+            python_version(&bin, &args),
+        );
         registry.save(&self.registry_path)?;
         Ok(())
     }
@@ -427,11 +554,16 @@ impl ComponentManager {
             extract_archive(&archive_path, &dest)?;
             let final_path = finalize_native_layout(component_id, &dest)?;
             let mut registry = self.registry.lock();
+            let managed_version = artifact
+                .version
+                .clone()
+                .or_else(|| Some(manifest.shuttle_version.clone()));
             registry.mark(
                 component_id,
                 final_path,
                 Some(artifact.sha256.clone()),
                 "managed",
+                managed_version,
             );
             registry.save(&self.registry_path)?;
             self.emit_progress(component_id, artifact.size, artifact.size, "complete");
@@ -447,11 +579,16 @@ impl ComponentManager {
         };
 
         let mut registry = self.registry.lock();
+        let managed_version = artifact
+            .version
+            .clone()
+            .or_else(|| Some(manifest.shuttle_version.clone()));
         registry.mark(
             component_id,
             installed_path,
             Some(artifact.sha256.clone()),
             "managed",
+            managed_version,
         );
         registry.save(&self.registry_path)?;
         self.emit_progress(component_id, artifact.size, artifact.size, "complete");
@@ -668,5 +805,110 @@ fn capitalize(s: &str) -> String {
     match chars.next() {
         None => String::new(),
         Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manager(dir: &Path) -> ComponentManager {
+        let (event_tx, _) = broadcast::channel(16);
+        ComponentManager::new(dir, event_tx)
+    }
+
+    fn write_registry(dir: &Path, id: &str, version: Option<&str>, path: &Path) {
+        std::fs::create_dir_all(dir.join("components")).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"installed").unwrap();
+        let entry = serde_json::json!({
+            "id": id,
+            "version": version,
+            "sha256": null,
+            "path": path.to_string_lossy(),
+            "source": "managed",
+        });
+        let raw = serde_json::json!({ "components": { id: entry } });
+        std::fs::write(
+            dir.join("components").join("installed.json"),
+            serde_json::to_string(&raw).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn row<'a>(overview: &'a ComponentsOverview, connector: &str) -> &'a ConnectorComponentStatus {
+        overview
+            .connectors
+            .iter()
+            .find(|c| c.connector_id == connector)
+            .expect("connector row")
+    }
+
+    #[test]
+    fn overview_lists_every_network_with_its_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let overview = tauri::async_runtime::block_on(manager(dir.path()).components_overview());
+        let ids: Vec<&str> = overview
+            .connectors
+            .iter()
+            .map(|c| c.connector_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["whatsapp", "telegram", "signal", "messenger", "instagram", "matrix", "email"]
+        );
+        let telegram: Vec<&str> = row(&overview, "telegram")
+            .components
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(telegram, vec!["script:telegram", "native:tdlib"]);
+        assert_eq!(row(&overview, "telegram").connector_label, "Telegram");
+    }
+
+    #[test]
+    fn an_unreachable_manifest_leaves_sizes_unknown_without_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let overview = tauri::async_runtime::block_on(manager(dir.path()).components_overview());
+        assert!(!overview.manifest_available);
+        assert!(overview.manifest_version.is_none());
+        assert_eq!(overview.expected_version, env!("CARGO_PKG_VERSION"));
+        for connector in &overview.connectors {
+            for component in &connector.components {
+                assert!(component.size.is_none(), "{} has a size", component.id);
+            }
+        }
+    }
+
+    #[test]
+    fn an_installed_component_reports_its_recorded_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("scripts").join("whatsapp-connector.py");
+        write_registry(dir.path(), "script:whatsapp", Some("0.6.1"), &script);
+        let overview = tauri::async_runtime::block_on(manager(dir.path()).components_overview());
+        let whatsapp = row(&overview, "whatsapp");
+        let installed = whatsapp
+            .components
+            .iter()
+            .find(|c| c.id == "script:whatsapp")
+            .unwrap();
+        assert!(installed.installed);
+        assert_eq!(installed.version.as_deref(), Some("0.6.1"));
+        assert_eq!(installed.source.as_deref(), Some("managed"));
+    }
+
+    #[test]
+    fn a_component_installed_before_versions_were_recorded_still_reads_as_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("scripts").join("telegram-connector.py");
+        write_registry(dir.path(), "script:telegram", None, &script);
+        let overview = tauri::async_runtime::block_on(manager(dir.path()).components_overview());
+        let telegram = row(&overview, "telegram")
+            .components
+            .iter()
+            .find(|c| c.id == "script:telegram")
+            .unwrap();
+        assert!(telegram.installed);
+        assert!(telegram.version.is_none());
     }
 }

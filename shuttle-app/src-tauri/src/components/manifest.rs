@@ -9,6 +9,10 @@ pub struct ManifestArtifact {
     pub sha256: String,
     #[serde(default)]
     pub size: u64,
+    /// Per-artifact version, when the publisher records one. Older manifests leave it out and
+    /// the installer falls back to `Manifest::shuttle_version`.
+    #[serde(default)]
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

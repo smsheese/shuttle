@@ -81,6 +81,9 @@ Written by `ConfigStore` (`config.rs`). Defaults are created on first launch. Sh
   },
   "channel_styles": {
     "whatsapp": { "tag": "#25D366", "background": null, "font": null }
+  },
+  "performance": {
+    "low_memory_webview": true
   }
 }
 ```
@@ -89,6 +92,7 @@ Written by `ConfigStore` (`config.rs`). Defaults are created on first launch. Sh
 - `theme_id`: bundled preset (`shuttle`, `zinc`, `ocean`, `twilight`) or `custom` when pasted tweakcn CSS is applied.
 - `tweakcn_css`: cached CSS fetched from a tweakcn theme URL or ID and mapped onto Shuttle tokens in the WebView.
 - `channel_styles`: per-connector tag/background/font on top of the theme (conversation list row, etc.).
+- `performance.low_memory_webview`: default `true`. Linux only: WebKit runs with the `DocumentViewer` cache model, no page cache and no WebGL (nothing in the UI uses it). Set it to `false` and restart if something needs WebGL. Ignored on Windows and macOS, and it never changes the hardware-acceleration policy. See [platforms.md](platforms.md#startup-and-idle-cost).
 
 This file is **not encrypted**. It must not hold API keys.
 

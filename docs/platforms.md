@@ -30,6 +30,8 @@ Release installers ship **core only**. Connector scripts, native binaries (GOWA,
 
 Installed under `~/.local/share/shuttle/components/` (or `$SHUTTLE_DATA_DIR/components/`).
 
+Each install records its manifest version in `components/installed.json`, and Settings, About reads it back into a per-network list: installed or not, version, and the download size from the manifest. Nothing installs from that page; components still arrive only when you add or use an account on the network. When the manifest cannot be fetched the page shows sizes as unknown instead of failing.
+
 Publish component archives with `./scripts/publish-components.sh` (CI: `.github/workflows/publish-components.yml` on `v*` tags).
 
 Local development still uses repo `connectors/` when running `npm run tauri dev` (debug fallback).
@@ -84,6 +86,14 @@ Behaviour notes:
 - **Fallback:** if the native copy fails, only the file path is copied as text and the toast says so. The button never does nothing.
 - **Windows paths:** `canonicalize` yields `\\?\C:\...`; the prefix is stripped before `CF_HDROP` because Explorer rejects it.
 - **Unverified here:** Windows, macOS and native Wayland were written from the library sources and not run; the X11 path was checked with `xclip` (`cargo test live_ -- --ignored --nocapture` lists the targets and reads them back; on Wayland it uses `wl-paste`).
+
+### Startup and idle cost
+
+Shuttle opens **one** window and keeps one WebView process. The boot screen is inline HTML and CSS in `src/app.html` (`#boot-splash`), painted before any app CSS or JS runs and removed by `+layout.svelte` once the app config is applied (with a 15 s fallback if that round-trip hangs). There is no second transparent always-on-top window, which used to leave a second WebKitWebProcess running for the life of the app after the splash closed. The behaviour is the same on Linux, Windows and macOS.
+
+Nothing animates while the app is idle: the sidebar's active-account ring is a static gradient, unread badges do not pulse, a chat preview scrolls its text only while its row is hovered or focused, and loading spinners run only while a real load is pending. `prefers-reduced-motion` stops the remaining transitions. The window title is set once at startup and again only when the unread count changes; there is no per-second redraw.
+
+On Linux the WebView gets WebKit's smallest cache model (`DocumentViewer`), no page cache and no WebGL, since the UI draws 2D canvas only. `performance.low_memory_webview` in `config.json` (default `true`) turns that off when something needs WebGL (see [storage.md](storage.md#configjson)). Windows and macOS keep their engines' defaults, and the hardware-acceleration policy is unchanged on all three. Conversation rows carry `content-visibility: auto`, so rows below the fold skip layout and paint until they scroll into view.
 
 ### Microphone access (voice notes)
 

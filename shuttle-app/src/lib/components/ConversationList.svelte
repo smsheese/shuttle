@@ -487,7 +487,7 @@
           {/if}
         </span>
         {#if conv.unread_count > 0}
-          <span class="unread-badge unread-badge-pulse">{conv.unread_count > 99 ? '99+' : conv.unread_count}</span>
+          <span class="unread-badge">{conv.unread_count > 99 ? '99+' : conv.unread_count}</span>
         {/if}
       </div>
       <div class="row preview-row">
@@ -541,7 +541,7 @@
       <div class="header-title-row">
         <h1>{headerTitle}</h1>
         {#if unreadInView > 0}
-          <span class="header-badge header-badge-pulse">{unreadInView}</span>
+          <span class="header-badge">{unreadInView}</span>
         {/if}
       </div>
       <div class="header-actions">
@@ -605,7 +605,7 @@
         <div class="header-title-row">
           <h1>{headerTitle}</h1>
           {#if unreadInView > 0}
-            <span class="header-badge header-badge-pulse">{unreadInView}</span>
+            <span class="header-badge">{unreadInView}</span>
           {/if}
         </div>
         {#if accountActions}
@@ -845,7 +845,7 @@
               </span>
             {/if}
             {#if conv.unread_count > 0}
-              <span class="unread-badge unread-badge-pulse pin-badge">{conv.unread_count > 99 ? '99+' : conv.unread_count}</span>
+              <span class="unread-badge pin-badge">{conv.unread_count > 99 ? '99+' : conv.unread_count}</span>
             {/if}
           </span>
           <span class="pin-name" use:marquee><span>{displayTitle(conv)}</span></span>
@@ -1420,12 +1420,7 @@
     }
   }
 
-  .header-badge-pulse,
-  .unread-badge-pulse {
-    animation: unread-breathe 1.8s ease-in-out infinite;
-  }
-
-  .conv-item.muted .unread-badge-pulse {
+  .conv-item.muted .unread-badge {
     opacity: 0.72;
   }
 
@@ -1743,6 +1738,9 @@
     gap: 11px;
     padding: 9px 10px;
     min-height: 62px;
+    /* Rows below the fold skip layout and paint until they scroll into view. */
+    content-visibility: auto;
+    contain-intrinsic-size: auto 64px;
     border: none;
     border-radius: var(--radius-md);
     background: transparent;
@@ -1889,7 +1887,19 @@
   }
 
   .preview > span { display: inline-block; min-width: max-content; }
-  .preview:global(.overflowing) > span { animation: marquee var(--marquee-duration) linear infinite; }
+
+  /* The preview scrolls only while its row is hovered or focused, so no marquee runs at rest. */
+  .conv-item:hover .preview:global(.overflowing) > span,
+  .conv-item:focus-visible .preview:global(.overflowing) > span {
+    animation: marquee var(--marquee-duration) linear infinite;
+  }
+
+  /* No hover on touch screens: let the selected chat's long preview scroll instead. */
+  @media (hover: none) {
+    .conv-item.selected .preview:global(.overflowing) > span {
+      animation: marquee var(--marquee-duration) linear infinite;
+    }
+  }
   @keyframes marquee { 0%, 20% { transform: translateX(0); } 95%, 100% { transform: translateX(calc(-1 * var(--marquee-distance))); } }
 
   .conv-item.unread .preview {
@@ -2050,10 +2060,6 @@
 
   @media (prefers-reduced-motion: reduce) {
     .preview:global(.overflowing) > span { animation: none; }
-    .header-badge-pulse,
-    .unread-badge-pulse {
-      animation: none;
-    }
     .pin-item:hover .pin-name:global(.overflowing) > span,
     .pin-item:focus-visible .pin-name:global(.overflowing) > span,
     .pin-item.selected .pin-name:global(.overflowing) > span {

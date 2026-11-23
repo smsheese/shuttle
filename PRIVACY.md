@@ -47,7 +47,8 @@ Only when you use the related feature.
 | --- | --- | --- |
 | OpenRouter (<https://openrouter.ai>) | You press Translate | The text you chose to translate, your OpenRouter key and the model id you set. OpenRouter and the model provider handle it under their policies. |
 | Giphy (<https://giphy.com>) | You open the GIF or sticker picker | Your search words and your Giphy key. GIFs and stickers load from Giphy's servers. |
-| Feedback form (`forms.tfs.qa`) | You press "Open feedback form" in Settings, Feedback | Nothing loads until you press the button. After that the form page runs inside Shuttle and receives what you type into it. Shuttle does not add any chat data or identifiers. |
+| Feedback form (`forms.tfs.qa`) | You press "Open the feedback form" in Settings, Feedback | Shuttle opens the form in your system browser. The form page receives what you type into it. Shuttle does not add any chat data or identifiers. |
+| GitHub API (`api.github.com`) | You open Settings, About, or press "Check for updates" | A request for the latest release of Shuttle: the app version only. No account, installation ID, chat data or other identifiers. GitHub sees your IP address. Shuttle checks at most once an hour. |
 | GitHub (<https://github.com>) | You install a network component, such as WhatsApp or Telegram support | A download request for that component. GitHub sees your IP address. |
 | Open-Meteo (<https://open-meteo.com>) | You search for a location for automatic dark mode | The place name you type. |
 | tweakcn (<https://tweakcn.com>) and Google Fonts | You apply a tweakcn theme | A request for the theme and its fonts. |

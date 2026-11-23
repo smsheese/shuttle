@@ -13,6 +13,7 @@ mod secrets;
 mod telemetry;
 mod translate;
 mod tray;
+mod updates;
 
 use commands::{init_state, AppState, APP_HANDLE};
 use tauri::{Manager, RunEvent, WindowEvent};
@@ -29,6 +30,24 @@ fn apply_window_icon(win: &tauri::WebviewWindow) -> tauri::Result<()> {
         Some(icon) => win.set_icon(icon),
         None => Ok(()),
     }
+}
+
+/// Shrink WebKit's memory footprint for a local messaging UI: the smallest cache model, no
+/// page cache, and no WebGL (the frontend draws 2D canvas only). See docs/platforms.md.
+#[cfg(target_os = "linux")]
+fn apply_low_memory_webview(win: &tauri::WebviewWindow) {
+    use webkit2gtk::{CacheModel, SettingsExt, WebContextExt, WebViewExt};
+
+    let _ = win.with_webview(|platform| {
+        let view = platform.inner();
+        if let Some(settings) = view.settings() {
+            settings.set_enable_page_cache(false);
+            settings.set_enable_webgl(false);
+        }
+        if let Some(context) = view.web_context() {
+            context.set_cache_model(CacheModel::DocumentViewer);
+        }
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -55,6 +74,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let state = init_state(app.handle());
+            #[cfg(target_os = "linux")]
+            let low_memory_webview = state.config.get().performance.low_memory_webview;
             // Downloads live in the app-private cache; older builds wrote to Documents, and
             // those files stay viewable.
             let cache = media_store::media_cache_root(state.db.data_dir());
@@ -69,6 +90,12 @@ pub fn run() {
                 .allow_directory(media_store::shuttle_documents_root(), true)?;
             app.manage(state);
             *APP_HANDLE.lock() = Some(app.handle().clone());
+            #[cfg(target_os = "linux")]
+            if low_memory_webview {
+                if let Some(win) = app.get_webview_window("main") {
+                    apply_low_memory_webview(&win);
+                }
+            }
             // macOS uses the application bundle icon (.icns, up to 1024 px) for the Dock. On
             // Windows and Linux, also apply a large icon to the native window: alt-tab
             // switchers read it (X11 `_NET_WM_ICON`) and a 32 px one looks pixelated.
@@ -192,6 +219,11 @@ pub fn run() {
             commands::fetch_tweakcn_theme,
             commands::get_connector_requirements,
             commands::get_installed_components,
+            commands::app_info,
+            commands::components_overview,
+            commands::check_for_update,
+            commands::download_update,
+            commands::run_update_installer,
             commands::ensure_connector_components,
             commands::cancel_component_install,
             tray::update_tray_unread,

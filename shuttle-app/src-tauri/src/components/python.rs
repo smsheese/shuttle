@@ -61,6 +61,30 @@ fn python_import_probe(bin: &str, extra_args: &[String]) -> bool {
         .unwrap_or(false)
 }
 
+/// Full version of a working Python (`3.13.2`), for the About page.
+pub fn python_version(bin: &str, extra_args: &[String]) -> Option<String> {
+    let mut cmd = Command::new(bin);
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    let output = cmd
+        .args([
+            "-c",
+            "import sys; print('.'.join(str(part) for part in sys.version_info[:3]))",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
+    }
+}
+
 fn parse_version(raw: &str) -> Option<(u32, u32)> {
     let mut parts = raw.split('.');
     let major = parts.next()?.parse().ok()?;

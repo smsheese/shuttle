@@ -1,7 +1,7 @@
 <script lang="ts">
   import { tick } from 'svelte';
   import NetworkIcon from '$lib/components/NetworkIcon.svelte';
-  import { clearMediaCache, DATETIME_FORMATS, fetchTweakcnTheme, formatTime, mediaCacheInfo, openExternal, restartApp, saveAppConfig, telemetryInstallationId } from '$lib/api';
+  import { appInfo, checkForUpdate, clearMediaCache, componentsOverview, DATETIME_FORMATS, downloadUpdate, fetchTweakcnTheme, formatBytes, formatTime, mediaCacheInfo, onUpdateDownloadProgress, openExternal, restartApp, runUpdateInstaller, saveAppConfig, telemetryInstallationId } from '$lib/api';
   import { AUTO_DOWNLOAD_DEFAULTS } from '$lib/mediaSave';
   import { formatFileSize } from '$lib/messageMedia';
   import { isTauri } from '$lib/mock';
@@ -25,6 +25,10 @@
     type AccountPatch,
     type AppConfig,
     type AutoDownloadGroup,
+    type AppInfo,
+    type ComponentsOverview,
+    type UpdateCheck,
+    type UpdateDownloadProgress,
     type MediaCacheInfo,
     type MediaConfig,
     type Conversation,
@@ -192,11 +196,99 @@
   ];
 
   const FEEDBACK_FORM_URL = 'https://forms.tfs.qa/forms/contact-form-xj6nhk';
-  let feedbackOpen = $state(false);
   let installationId = $state('');
+
+  // ---- About ---------------------------------------------------------------------------
+  let appFacts = $state<AppInfo | null>(null);
+  let overview = $state<ComponentsOverview | null>(null);
+  let update = $state<UpdateCheck | null>(null);
+  let updateError = $state<string | null>(null);
+  let updateBusy = $state(false);
+  let updateDownloadPath = $state<string | null>(null);
+  let updateProgress = $state<UpdateDownloadProgress | null>(null);
+  let diagnosticsCopied = $state(false);
+
+  let aboutLoaded = false;
   $effect(() => {
-    if (activeTab === 'about' && !installationId) void telemetryInstallationId().then((id) => (installationId = id));
+    if (activeTab !== 'about' || aboutLoaded) return;
+    aboutLoaded = true;
+    void loadAbout();
   });
+
+  async function loadAbout() {
+    void telemetryInstallationId().then((id) => (installationId = id));
+    void appInfo().then((value) => (appFacts = value)).catch(() => (appFacts = null));
+    void componentsOverview()
+      .then((value) => (overview = value))
+      .catch(() => (overview = null));
+    // The Rust side keeps this answer for an hour, so opening About twice is one request.
+    await checkUpdates(false);
+  }
+
+  async function checkUpdates(force: boolean) {
+    if (!isTauri() || updateBusy) return;
+    updateBusy = true;
+    updateError = null;
+    try {
+      update = await checkForUpdate(force);
+    } catch (e) {
+      updateError = e instanceof Error ? e.message : String(e);
+    } finally {
+      updateBusy = false;
+    }
+  }
+
+  async function startUpdateDownload() {
+    if (!isTauri() || updateBusy) return;
+    updateBusy = true;
+    updateError = null;
+    updateDownloadPath = null;
+    updateProgress = { bytes_done: 0, bytes_total: update?.asset?.size ?? 0 };
+    const unlisten = await onUpdateDownloadProgress((progress) => (updateProgress = progress));
+    try {
+      updateDownloadPath = await downloadUpdate();
+    } catch (e) {
+      updateError = e instanceof Error ? e.message : String(e);
+    } finally {
+      unlisten();
+      updateProgress = null;
+      updateBusy = false;
+    }
+  }
+
+  async function startUpdateInstaller() {
+    updateError = null;
+    try {
+      await runUpdateInstaller();
+    } catch (e) {
+      updateError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  const installedComponentIds = $derived(
+    overview
+      ? [...new Set(overview.connectors.flatMap((connector) => connector.components.filter((component) => component.installed).map((component) => component.id)))]
+      : []
+  );
+
+  const diagnosticsLine = $derived(
+    [
+      `Shuttle ${appFacts?.version ?? 'unknown version'}`,
+      appFacts?.os ?? 'unknown OS',
+      appFacts?.platform ?? 'unknown platform',
+      `components: ${installedComponentIds.length ? installedComponentIds.join(', ') : 'none installed'}`,
+    ].join(' | ')
+  );
+
+  async function copyDiagnostics() {
+    try {
+      await navigator.clipboard.writeText(diagnosticsLine);
+      diagnosticsCopied = true;
+      setTimeout(() => (diagnosticsCopied = false), 2000);
+    } catch {
+      diagnosticsCopied = false;
+    }
+  }
 
   const modKey = shortcutModKey();
 
@@ -1137,21 +1229,23 @@
         <section>
           <h2>Feedback</h2>
           <p class="hint">
-            Found a bug or have an idea? Tell us here. The form is hosted on forms.tfs.qa, so nothing is loaded until you
-            open it, and Shuttle sends no chat data with it. Say what happened and which OS you use.
+            Found a bug or have an idea? The form lives on forms.tfs.qa and does not allow itself to be shown inside
+            another app, so Shuttle opens it in your browser. Nothing about your chats goes with it.
           </p>
-          {#if feedbackOpen}
-            <iframe
-              class="feedback-frame"
-              title="Send feedback"
-              src={FEEDBACK_FORM_URL}
-              referrerpolicy="no-referrer"
-            ></iframe>
-          {:else}
-            <div class="feedback-actions">
-              <button type="button" class="apply-theme-btn" onclick={() => (feedbackOpen = true)}>Open feedback form</button>
-              <button type="button" class="linkish" onclick={() => openLink(FEEDBACK_FORM_URL)}>Open in browser instead</button>
-            </div>
+          <div class="feedback-actions">
+            <button type="button" class="apply-theme-btn" onclick={() => void openLink(FEEDBACK_FORM_URL)}>
+              Open the feedback form
+            </button>
+            <button type="button" class="tiny" onclick={() => void copyDiagnostics()}>
+              {diagnosticsCopied ? 'Copied' : 'Copy diagnostics'}
+            </button>
+          </div>
+          <p class="hint">
+            The diagnostics line holds the app version, your OS, the platform key and the installed component ids. Paste
+            it into the form so we know what to reproduce.
+          </p>
+          {#if diagnosticsCopied}
+            <p class="hint"><code>{diagnosticsLine}</code></p>
           {/if}
         </section>
       {:else if activeTab === 'about'}
@@ -1166,8 +1260,52 @@
             <button type="button" class="linkish" onclick={() => openLink('https://shee.se')}>Sheese Sheikh</button>
             ·
             <button type="button" class="linkish" onclick={() => openLink('https://github.com/smsheese')}>GitHub</button>
-            · built with Cursor Agent
           </p>
+
+          <div class="about-card version-card">
+            <span class="about-card-label">Shuttle</span>
+            <span class="about-card-value">v{appFacts?.version ?? '…'}</span>
+            <button type="button" class="tiny" onclick={() => void checkUpdates(true)} disabled={updateBusy}>
+              {updateBusy && !updateProgress ? 'Checking…' : 'Check for updates'}
+            </button>
+          </div>
+
+          {#if update?.available}
+            <p class="update-available">Update available: v{update.latest}</p>
+            <div class="feedback-actions">
+              {#if updateDownloadPath}
+                <button type="button" class="apply-theme-btn" onclick={() => void startUpdateInstaller()}>
+                  Run installer
+                </button>
+              {:else}
+                <button
+                  type="button"
+                  class="apply-theme-btn"
+                  onclick={() => void startUpdateDownload()}
+                  disabled={updateBusy}
+                >
+                  Download update
+                </button>
+              {/if}
+              {#if update.notes_url}
+                <button type="button" class="linkish" onclick={() => openLink(update?.notes_url)}>Release notes</button>
+              {/if}
+            </div>
+            {#if updateProgress}
+              <p class="hint">
+                Downloading {formatBytes(updateProgress.bytes_done)} of {formatBytes(updateProgress.bytes_total)}
+              </p>
+            {/if}
+            {#if updateDownloadPath}
+              <p class="hint">Saved to <code>{updateDownloadPath}</code>. Run it when you are ready.</p>
+            {/if}
+          {:else if update}
+            <p class="hint">You have the newest version.</p>
+          {/if}
+          {#if updateError}
+            <p class="update-error">{updateError}</p>
+          {/if}
+
           {#if installationId}
             <p class="hint">
               Installation ID: <code>{installationId}</code>. Quote it if you ask us to delete diagnostics sent from this
@@ -1177,19 +1315,61 @@
         </section>
 
         <section>
-          <h2>Attributions</h2>
-          <div class="attribution-block">
-            <h3>{SHUTTLE_LICENSE.name}</h3>
-            <p class="hint">{SHUTTLE_LICENSE.summary}</p>
-            <p class="attribution-meta">
-              <button type="button" class="linkish" onclick={() => openLink(SHUTTLE_LICENSE.url)}>
-                {SHUTTLE_LICENSE.license}
-              </button>
-              ·
-              <button type="button" class="linkish" onclick={() => openLink(SHUTTLE_LICENSE.sourceUrl)}>
-                Source
-              </button>
+          <h2>Components</h2>
+          <p class="hint">
+            A network's components install only when you add or use an account on it. Nothing installs on its own.
+          </p>
+          {#if overview}
+            <p class="hint">
+              {overview.platform} · manifest v{overview.manifest_version ?? overview.expected_version}
+              {#if !overview.manifest_available}(unreachable, so sizes show as unknown){/if}
             </p>
+            <div class="components-grid">
+              {#each overview.connectors as connector (connector.connector_id)}
+                <div class="component-group">
+                  <div class="component-group-head">
+                    <NetworkIcon connectorId={connector.connector_id} size={14} />
+                    {connector.connector_label}
+                  </div>
+                  <ul class="component-list">
+                    {#each connector.components as component (component.id)}
+                      <li class="component-row" class:missing={!component.installed}>
+                        <span class="component-name">
+                          {component.label}{component.optional ? ' (optional)' : ''}
+                        </span>
+                        <span class="component-state">
+                          {component.installed ? (component.version ?? 'Installed') : 'Not installed'}
+                        </span>
+                        <span class="component-size">
+                          {component.size ? formatBytes(component.size) : 'Size unknown'}
+                        </span>
+                      </li>
+                    {/each}
+                  </ul>
+                </div>
+              {/each}
+            </div>
+          {:else}
+            <p class="hint">Reading components…</p>
+          {/if}
+        </section>
+
+        <section>
+          <h2>Attributions</h2>
+          <div class="attribution-grid">
+            <div class="attribution-block">
+              <h3>{SHUTTLE_LICENSE.name}</h3>
+              <p class="hint">{SHUTTLE_LICENSE.summary}</p>
+              <p class="attribution-meta">
+                <button type="button" class="linkish" onclick={() => openLink(SHUTTLE_LICENSE.url)}>
+                  {SHUTTLE_LICENSE.license}
+                </button>
+                ·
+                <button type="button" class="linkish" onclick={() => openLink(SHUTTLE_LICENSE.sourceUrl)}>
+                  Source
+                </button>
+              </p>
+            </div>
           </div>
 
           {#each ATTRIBUTION_SECTIONS as section (section.title)}
@@ -1387,12 +1567,19 @@
     flex-direction: column;
     gap: 8px;
   }
+  /* Accounts and About blocks read as compact cards, two to four per row. */
+  .account-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 10px;
+    align-items: start;
+  }
   .account-item {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 12px;
-    padding: 12px;
+    gap: 8px;
+    padding: 10px;
     background: var(--bg-input);
     border-radius: var(--radius-md);
   }
@@ -1415,9 +1602,9 @@
     opacity: 0.65;
   }
   .account-icon {
-    width: 40px;
-    height: 40px;
-    border-radius: var(--radius-md);
+    width: 30px;
+    height: 30px;
+    border-radius: var(--radius-sm);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1429,7 +1616,7 @@
   }
   .account-name {
     font-weight: 600;
-    font-size: 14px;
+    font-size: 13px;
   }
   .account-identity {
     display: block;
@@ -1474,14 +1661,105 @@
   }
   .add-account-btn {
     width: 100%;
-    min-height: 44px;
+    min-height: 38px;
     border-style: dashed;
+    margin-top: 10px;
+  }
+  .about-card {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    background: var(--bg-input);
+    border-radius: var(--radius-md);
+  }
+  .about-card-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+  }
+  .about-card-value {
+    font-size: 15px;
+    font-weight: 600;
+    margin-right: auto;
+  }
+  .update-available {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent);
+    margin-bottom: 6px;
+  }
+  .update-error {
+    font-size: 13px;
+    color: #ef4444;
+    line-height: 1.5;
+  }
+  .components-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 10px;
+    align-items: start;
+  }
+  .component-group {
+    padding: 10px 12px;
+    background: var(--bg-input);
+    border-radius: var(--radius-md);
+  }
+  .component-group-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 6px;
+  }
+  .component-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 0;
+    margin: 0;
+  }
+  .component-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px 8px;
+    font-size: 12px;
+  }
+  .component-name {
+    flex: 1;
+    min-width: 0;
+    color: var(--text-primary, inherit);
+  }
+  .component-state {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .component-size {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-left: auto;
+  }
+  .component-row.missing .component-state {
+    color: var(--text-muted);
+    opacity: 0.8;
+  }
+  .attribution-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 10px;
+    align-items: start;
   }
   .attribution-block {
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    margin-bottom: 16px;
+    gap: 6px;
+    margin-bottom: 14px;
   }
   .attribution-block h3 {
     font-size: 14px;
@@ -1490,13 +1768,6 @@
     text-transform: none;
     letter-spacing: normal;
     margin: 0;
-  }
-  .feedback-frame {
-    border: none;
-    width: 100%;
-    height: 640px;
-    border-radius: 8px;
-    background: var(--bg-elevated, transparent);
   }
   .feedback-actions {
     display: flex;
@@ -1515,19 +1786,20 @@
   }
   .attribution-list {
     list-style: none;
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
     gap: 8px;
     padding: 0;
     margin: 0;
   }
   .attribution-item {
-    padding: 10px 12px;
+    padding: 8px 10px;
     background: var(--bg-input);
     border-radius: var(--radius-md);
     display: flex;
     flex-direction: column;
     gap: 2px;
+    font-size: 12px;
   }
   .attribution-head {
     display: flex;
@@ -1617,6 +1889,16 @@
     font-family: inherit;
     font-size: 12px;
     line-height: 1.3;
+  }
+
+  /* Narrow windows keep two card columns: a slimmer nav and tighter body padding buy the room. */
+  @media (max-width: 900px) {
+    .settings-nav {
+      width: 148px;
+    }
+    .settings-body {
+      padding: 12px 14px 20px;
+    }
   }
 
   @media (max-width: 639px) {

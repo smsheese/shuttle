@@ -5,6 +5,7 @@ use crate::db::Database;
 use crate::models::*;
 use crate::notifications;
 use crate::telemetry::TelemetryManager;
+use crate::updates::{UpdateCheck, UpdateManager};
 use age::secrecy::SecretString;
 use age::{Decryptor, Encryptor};
 use parking_lot::Mutex;
@@ -27,6 +28,7 @@ pub struct AppState {
     pub components: Arc<ComponentManager>,
     pub config: Arc<ConfigStore>,
     pub telemetry: Arc<TelemetryManager>,
+    pub updates: Arc<UpdateManager>,
 }
 
 #[tauri::command]
@@ -57,6 +59,48 @@ pub fn get_installed_components(
     state: State<'_, AppState>,
 ) -> Vec<crate::components::InstalledComponent> {
     state.components.installed_components()
+}
+
+/// Version and platform facts the About page shows and the feedback diagnostics line uses.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AppInfo {
+    pub version: String,
+    pub os: String,
+    pub platform: String,
+}
+
+#[tauri::command]
+pub fn app_info() -> AppInfo {
+    AppInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        os: std::env::consts::OS.to_string(),
+        platform: crate::components::platform_key().to_string(),
+    }
+}
+
+#[tauri::command]
+pub async fn components_overview(
+    state: State<'_, AppState>,
+) -> Result<crate::components::ComponentsOverview, String> {
+    Ok(state.components.components_overview().await)
+}
+
+#[tauri::command]
+pub async fn check_for_update(
+    state: State<'_, AppState>,
+    force: bool,
+) -> Result<UpdateCheck, String> {
+    state.updates.check(force).await
+}
+
+#[tauri::command]
+pub async fn download_update(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    state.updates.download(&app).await
+}
+
+#[tauri::command]
+pub fn run_update_installer(state: State<'_, AppState>) -> Result<(), String> {
+    state.updates.run_installer()
 }
 
 #[tauri::command]
@@ -497,7 +541,13 @@ pub async fn copy_media_to_clipboard(
     let data_dir = state.db.data_dir().to_path_buf();
     let roots = crate::media_store::media_read_roots(&data_dir);
     let stage = crate::media_store::clipboard_stage_dir(&data_dir);
-    let hint = crate::media_store::MediaNameHint { kind, filename, timestamp, account_name, chat_name };
+    let hint = crate::media_store::MediaNameHint {
+        kind,
+        filename,
+        timestamp,
+        account_name,
+        chat_name,
+    };
     tauri::async_runtime::spawn_blocking(move || {
         crate::clipboard::copy_media_file(std::path::Path::new(&path), &roots, &stage, &hint)
     })
@@ -1525,12 +1575,18 @@ pub fn init_state(app: &AppHandle) -> AppState {
     connectors.spawn_sleep_loop();
     connectors.resume_saved_accounts();
 
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| data_dir.clone())
+        .join("shuttle")
+        .join("updates");
+
     AppState {
         db,
         connectors,
         components,
         config,
         telemetry,
+        updates: Arc::new(UpdateManager::new(cache_dir)),
     }
 }
 

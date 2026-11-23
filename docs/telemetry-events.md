@@ -102,7 +102,7 @@ Values resolve in this order: **process env** → **`.env` file** (local) → **
 
 | Variable | Purpose |
 | --- | --- |
-| `POSTHOG_API_KEY` | PostHog project ingestion token (not a personal API key) |
+| `POSTHOG_API_KEY` | PostHog project ingestion token (not a personal API key). In CI it comes from the repository variable `POSTHOG_PROJECT_TOKEN` |
 | `POSTHOG_HOST` | PostHog ingest host (default `https://eu.i.posthog.com` (EU Cloud)) |
 | `SHUTTLE_BUILD_CHANNEL` | `testing` or `production` |
 | `SHUTTLE_GIT_COMMIT` | Optional release metadata |

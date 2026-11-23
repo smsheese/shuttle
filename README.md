@@ -111,7 +111,7 @@ cd shuttle-app && npm run tauri dev
 ./scripts/build-release.sh -- --target universal-apple-darwin
 
 # Publish lazy-install component archives to S3 (maintainers):
-SHUTTLE_COMPONENTS_BASE_URL=https://your-cdn.example/shuttle/components ./scripts/publish-components.sh
+SHUTTLE_COMPONENTS_BASE_URL=https://your-cdn.example/components ./scripts/publish-components.sh
 ```
 
 Set `SHUTTLE_COMPONENTS_BASE_URL` when building release installers so the app knows where to fetch `v{version}/manifest.json`.

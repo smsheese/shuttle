@@ -69,7 +69,7 @@ jobs:
           SHUTTLE_COMPONENTS_VERSION: ${{ steps.version.outputs.value }}
           # Authenticated GitHub API calls: the unauthenticated limit is shared by runner IPs and trips on macOS.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SHUTTLE_COMPONENTS_BASE_URL: ${{ secrets.SHUTTLE_COMPONENTS_BASE_URL || format('https://github.com/{0}/releases/download', github.repository) }}
+          SHUTTLE_COMPONENTS_BASE_URL: ${{ vars.SHUTTLE_COMPONENTS_BASE_URL || format('https://github.com/{0}/releases/download', github.repository) }}
           SHUTTLE_COMPONENTS_PLATFORM: ${{ matrix.platform == 'macos-universal' && 'macos-arm64' || (matrix.platform == 'linux-amd64' && 'linux-x86_64') || (matrix.platform == 'windows-amd64' && 'windows-x86_64') || matrix.platform }}
         run: ./scripts/publish-components.sh
 
@@ -146,8 +146,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.value }}
           PUBLISH: dist/components/publish/v${{ steps.version.outputs.value }}
 
-      - name: Attach component archives to the GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Flatten component archives
         shell: bash
         run: |
           VERSION="${{ steps.version.outputs.value }}"
@@ -162,22 +161,26 @@ jobs:
           done
           ls -lh release-components
 
-      - name: Publish component assets
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Add manifest to the flat layout
+        shell: bash
+        run: cp "dist/components/publish/v${{ steps.version.outputs.value }}/manifest.json" release-components/manifest.json
+
+      - name: Attach components to the GitHub release (only when no bucket is configured)
+        if: startsWith(github.ref, 'refs/tags/v') && vars.S3_BUCKET == ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           files: release-components/*
 
       - name: Upload to S3-compatible bucket
-        if: env.S3_BUCKET != ''
+        if: vars.S3_BUCKET != ''
         shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_KEY }}
-          AWS_DEFAULT_REGION: ${{ secrets.S3_REGION || 'auto' }}
-          S3_BUCKET: ${{ secrets.S3_BUCKET }}
-          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          AWS_DEFAULT_REGION: ${{ vars.S3_REGION || 'auto' }}
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+          S3_ENDPOINT: ${{ vars.S3_ENDPOINT }}
           VERSION: ${{ steps.version.outputs.value }}
         run: |
           pip install --break-system-packages awscli --quiet
@@ -185,10 +188,4 @@ jobs:
           if [[ -n "$S3_ENDPOINT" ]]; then
             EXTRA+=(--endpoint-url "$S3_ENDPOINT")
           fi
-          aws s3 sync "dist/components/publish/v${VERSION}/" "s3://${S3_BUCKET}/shuttle/components/v${VERSION}/" "${EXTRA[@]}"
-
-      - name: Attach manifest to GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/components/publish/v${{ steps.version.outputs.value }}/manifest.json
+          aws s3 sync release-components/ "s3://${S3_BUCKET}/components/v${VERSION}/" "${EXTRA[@]}"

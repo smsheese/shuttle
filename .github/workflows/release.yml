@@ -152,15 +152,30 @@ jobs:
           $json | ConvertTo-Json -Depth 20 | Set-Content $conf
           Write-Host "Signing with certificate $($cert.Thumbprint)"
 
+      - name: Check telemetry config
+        shell: bash
+        env:
+          TOKEN: ${{ vars.POSTHOG_PROJECT_TOKEN }}
+          HOST: ${{ vars.POSTHOG_HOST }}
+        run: |
+          if [[ "$TOKEN" != phc_* ]]; then
+            echo "::error::Repository variable POSTHOG_PROJECT_TOKEN is missing or is not a phc_ project token."
+            exit 1
+          fi
+          if [[ -z "$HOST" ]]; then
+            echo "::error::Repository variable POSTHOG_HOST is missing."
+            exit 1
+          fi
+
       - name: Build bundles
         working-directory: shuttle-app
         shell: bash
         env:
-          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
-          POSTHOG_HOST: ${{ secrets.POSTHOG_HOST }}
+          POSTHOG_API_KEY: ${{ vars.POSTHOG_PROJECT_TOKEN }}
+          POSTHOG_HOST: ${{ vars.POSTHOG_HOST }}
           SHUTTLE_BUILD_CHANNEL: ${{ needs.resolve-environment.outputs.channel }}
           SHUTTLE_GIT_COMMIT: ${{ github.sha }}
-          SHUTTLE_COMPONENTS_BASE_URL: ${{ secrets.SHUTTLE_COMPONENTS_BASE_URL || format('https://github.com/{0}/releases/download', github.repository) }}
+          SHUTTLE_COMPONENTS_BASE_URL: ${{ vars.SHUTTLE_COMPONENTS_BASE_URL || format('https://github.com/{0}/releases/download', github.repository) }}
           # macOS signing and notarization (read by `tauri build` when all are set).
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}

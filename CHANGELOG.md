@@ -14,6 +14,7 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 ### Fixed
 - Installed builds could not download connectors: the components URL baked into 0.6.0 pointed at a bucket that never received files, so no WhatsApp connector started and no messages arrived. The upload step never ran (its condition could not see its own env), and the bucket layout did not match the manifest URLs.
 - Component archives are no longer attached to the GitHub release when a bucket is configured, so the release holds only the installers.
+- The installers were named 0.6.0 because `tauri.conf.json` kept the old version; it now matches the other version files. The components workflow also runs in the `production` environment and clears stale component files from the release.
 
 ### Changed
 - Release CI reads `POSTHOG_PROJECT_TOKEN`, `POSTHOG_HOST`, `S3_BUCKET`, `S3_ENDPOINT` and `SHUTTLE_COMPONENTS_BASE_URL` from repository variables; only the S3 keys stay secrets. The build fails if the PostHog token is missing.

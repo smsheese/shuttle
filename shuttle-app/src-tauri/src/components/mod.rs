@@ -311,6 +311,10 @@ impl ComponentManager {
         if dev_has_connector(connector_id) {
             return Ok(());
         }
+        // Several accounts on one network start together; let one of them download, the rest then
+        // find everything installed.
+        static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _installing = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let requirements = self.resolve_requirements(connector_id)?;
         for component in requirements.components {
             if component.installed {
@@ -389,7 +393,7 @@ impl ComponentManager {
         let url = manifest_url().ok_or_else(|| {
             "Component manifest URL not configured (SHUTTLE_COMPONENTS_BASE_URL)".to_string()
         })?;
-        let response = tauri::async_runtime::block_on(async {
+        let response = block_on_anywhere(async {
             self.http
                 .get(&url)
                 .send()
@@ -402,7 +406,7 @@ impl ComponentManager {
                 response.status().as_u16()
             ));
         }
-        let body = tauri::async_runtime::block_on(async {
+        let body = block_on_anywhere(async {
             response.text().await.map_err(|e| e.to_string())
         })?;
         let manifest: Manifest =
@@ -463,7 +467,7 @@ impl ComponentManager {
     }
 
     fn install_component(&self, component_id: &str) -> Result<(), String> {
-        tauri::async_runtime::block_on(self.install_component_async(component_id))
+        block_on_anywhere(self.install_component_async(component_id))
     }
 
     async fn install_component_async(&self, component_id: &str) -> Result<(), String> {
@@ -750,6 +754,21 @@ fn tdlib_names() -> &'static [&'static str] {
     }
 }
 
+/// Runs a future to completion from sync code. Connector start-up reaches the download code from
+/// inside the async runtime, where `block_on` panics, so the future runs on its own short-lived thread.
+fn block_on_anywhere<F>(future: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| tauri::async_runtime::block_on(future))
+            .join()
+            .unwrap_or_else(|_| panic!("component download thread panicked"))
+    })
+}
+
 fn dev_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../connectors")
 }
@@ -910,5 +929,17 @@ mod tests {
             .unwrap();
         assert!(telegram.installed);
         assert!(telegram.version.is_none());
+    }
+
+    #[test]
+    fn block_on_anywhere_works_inside_the_async_runtime() {
+        // Connector start-up calls the sync download helpers from a tokio task; a plain
+        // `block_on` there panics and left every account stuck on "connecting".
+        let out = tauri::async_runtime::block_on(async {
+            tauri::async_runtime::spawn(async { super::block_on_anywhere(async { 41 + 1 }) })
+                .await
+                .unwrap()
+        });
+        assert_eq!(out, 42);
     }
 }

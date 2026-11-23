@@ -9,6 +9,11 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-11-23
+
+### Fixed
+- Installed builds never started saved accounts: connector start-up called the blocking component download from inside the async runtime, which panics, so every account stayed on "connecting" and no component was ever downloaded. The download now runs on its own thread, and accounts on the same network install a component once instead of racing each other.
+
 ## [0.6.2] - 2026-11-23
 
 ### Added

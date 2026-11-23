@@ -48,17 +48,32 @@ const CONNECTORS: &[ConnectorComponents] = &[
     ConnectorComponents {
         id: "whatsapp",
         label: "WhatsApp",
-        components: &["script:whatsapp", "native:gowa"],
+        components: &[
+            "script:whatsapp",
+            "script:shuttle_ipc",
+            "python-runtime",
+            "native:gowa",
+        ],
     },
     ConnectorComponents {
         id: "telegram",
         label: "Telegram",
-        components: &["script:telegram", "native:tdlib"],
+        components: &[
+            "script:telegram",
+            "script:shuttle_ipc",
+            "python-runtime",
+            "native:tdlib",
+        ],
     },
     ConnectorComponents {
         id: "signal",
         label: "Signal",
-        components: &["script:signal", "native:signal-cli"],
+        components: &[
+            "script:signal",
+            "script:shuttle_ipc",
+            "python-runtime",
+            "native:signal-cli",
+        ],
     },
     ConnectorComponents {
         id: "messenger",
@@ -881,7 +896,10 @@ mod tests {
             .iter()
             .map(|c| c.id.as_str())
             .collect();
-        assert_eq!(telegram, vec!["script:telegram", "native:tdlib"]);
+        assert_eq!(
+            telegram,
+            vec!["script:telegram", "script:shuttle_ipc", "python-runtime", "native:tdlib"]
+        );
         assert_eq!(row(&overview, "telegram").connector_label, "Telegram");
     }
 
@@ -941,5 +959,15 @@ mod tests {
                 .unwrap()
         });
         assert_eq!(out, 42);
+    }
+
+    #[test]
+    fn every_connector_script_ships_with_its_ipc_helper_and_python() {
+        // Each *-connector.py imports shuttle_ipc and runs under Python; a list missing either
+        // crashed the connector on a clean install ("No module named 'shuttle_ipc'").
+        for row in CONNECTORS {
+            assert!(row.components.contains(&"script:shuttle_ipc"), "{} lacks shuttle_ipc", row.id);
+            assert!(row.components.contains(&"python-runtime"), "{} lacks python-runtime", row.id);
+        }
     }
 }

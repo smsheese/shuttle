@@ -9,6 +9,11 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-11-24
+
+### Fixed
+- WhatsApp, Telegram and Signal crashed on a clean install with `No module named 'shuttle_ipc'`: their component lists lacked the shared IPC helper script and the Python runtime that every connector script needs. All seven networks now install both.
+
 ## [0.6.3] - 2026-11-23
 
 ### Fixed

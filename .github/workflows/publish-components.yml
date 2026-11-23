@@ -15,6 +15,8 @@ permissions:
 jobs:
   publish:
     environment: production
+    # GitHub's macOS arm64 pool is sometimes out of capacity; do not let that block the other platforms.
+    continue-on-error: ${{ startsWith(matrix.platform, 'macos') }}
     strategy:
       fail-fast: false
       matrix:
@@ -90,7 +92,7 @@ jobs:
     needs: publish
     environment: production
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: ${{ !cancelled() && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -140,6 +142,15 @@ jobs:
             if (!fs.existsSync(manifestPath)) continue;
             const part = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
             Object.assign(merged.platforms, part.platforms || {});
+          }
+          for (const required of ['linux-x86_64', 'windows-x86_64']) {
+            if (!merged.platforms[required]) {
+              console.error(`::error::${required} components are missing from the merged manifest`);
+              process.exit(1);
+            }
+          }
+          for (const key of ['linux-arm64', 'windows-arm64', 'macos-arm64', 'macos-x86_64']) {
+            if (!merged.platforms[key]) console.log(`::warning::${key} components are missing; re-run the workflow for that platform`);
           }
           fs.mkdirSync(root, { recursive: true });
           fs.writeFileSync(path.join(root, 'manifest.json'), JSON.stringify(merged, null, 2));

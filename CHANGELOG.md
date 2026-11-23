@@ -13,6 +13,7 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 
 ### Fixed
 - Installed builds never started saved accounts: connector start-up called the blocking component download from inside the async runtime, which panics, so every account stayed on "connecting" and no component was ever downloaded. The download now runs on its own thread, and accounts on the same network install a component once instead of racing each other.
+- The components workflow no longer fails when GitHub has no macOS arm64 runner free: it publishes the other platforms and warns about the missing ones.
 
 ## [0.6.2] - 2026-11-23
 

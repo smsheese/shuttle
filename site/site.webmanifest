@@ -1,0 +1,21 @@
+{
+ "name": "Shuttle",
+ "short_name": "Shuttle",
+ "description": "One light inbox for all your messages.",
+ "start_url": ".",
+ "display": "browser",
+ "background_color": "#09090b",
+ "theme_color": "#0047c9",
+ "icons": [
+  {
+   "src": "icon-512.png",
+   "sizes": "512x512",
+   "type": "image/png"
+  },
+  {
+   "src": "apple-touch-icon.png",
+   "sizes": "180x180",
+   "type": "image/png"
+  }
+ ]
+}

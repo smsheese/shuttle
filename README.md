@@ -20,6 +20,8 @@ Shuttle aims to be the **no-thought answer** for low resource use: fast and resp
 - **Backup / restore** — password-protected export/import with optional media; restart after restore
 - **Optional telemetry** (PostHog) — off by default, with Settings → Privacy toggles
 
+**Website:** <https://smsheese.github.io/shuttle/> (static landing page, source in [`site/`](site/)).
+
 Product north star (lightweight · responsive · cross-platform · QoL · contributor-friendly) and remaining work: [docs/roadmap.md](docs/roadmap.md). Architecture: [docs/](docs/README.md).
 
 ## Connectors

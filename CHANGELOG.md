@@ -9,6 +9,9 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 
 ## [Unreleased]
 
+### Added
+- Static landing page in `site/` (features, tweakcn themes, tech stack, feedback, download links), published to GitHub Pages by `.github/workflows/pages.yml`. Download buttons read the latest GitHub release at page load, pick the installer for the visitor's OS and CPU, and fall back to the releases page if the API is unavailable.
+
 ## [0.6.4] - 2026-11-24
 
 ### Fixed

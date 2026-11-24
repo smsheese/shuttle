@@ -83,7 +83,9 @@ Written by `ConfigStore` (`config.rs`). Defaults are created on first launch. Sh
     "whatsapp": { "tag": "#25D366", "background": null, "font": null }
   },
   "performance": {
-    "low_memory_webview": true
+    "low_memory_webview": true,
+    "unload_hidden_window": true,
+    "unload_hidden_after_secs": 120
   }
 }
 ```
@@ -93,6 +95,8 @@ Written by `ConfigStore` (`config.rs`). Defaults are created on first launch. Sh
 - `tweakcn_css`: cached CSS fetched from a tweakcn theme URL or ID and mapped onto Shuttle tokens in the WebView.
 - `channel_styles`: per-connector tag/background/font on top of the theme (conversation list row, etc.).
 - `performance.low_memory_webview`: default `true`. Linux only: WebKit runs with the `DocumentViewer` cache model, no page cache and no WebGL (nothing in the UI uses it). Set it to `false` and restart if something needs WebGL. Ignored on Windows and macOS, and it never changes the hardware-acceleration policy. See [platforms.md](platforms.md#startup-and-idle-cost).
+- `performance.unload_hidden_window`: default `true`. While the window sits hidden in the tray, its WebView is destroyed and its renderer process exits, which is most of Shuttle's idle memory. Showing the window again (tray icon, second launch, Dock icon) rebuilds it in about a second with the same chat, filters and unsent drafts. Notifications, sync, reminders, scheduled sends and the tray unread count run in Rust and are untouched. Set it to `false` to keep the hidden window loaded, for example while profiling.
+- `performance.unload_hidden_after_secs`: default `120`, minimum 5. How long the window stays hidden before the unload. Shorter means lower idle memory and a slightly slower first show. A window that is ringing or in a call is never unloaded.
 
 This file is **not encrypted**. It must not hold API keys.
 

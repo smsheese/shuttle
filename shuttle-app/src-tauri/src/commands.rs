@@ -247,20 +247,29 @@ pub fn count_conversations(
         .map_err(|e| e.to_string())
 }
 
+/// One page of a chat's messages, oldest first, with whether the chat has more on each side.
 #[tauri::command]
 pub fn get_messages(
     state: State<'_, AppState>,
     conversation_id: String,
     limit: Option<i64>,
-) -> Result<Vec<Message>, String> {
+    anchor: Option<MessageAnchor>,
+) -> Result<MessagePage, String> {
     let started = std::time::Instant::now();
     let result = state
         .db
-        .list_messages(&conversation_id, limit.unwrap_or(500))
+        .message_page(
+            &conversation_id,
+            anchor.as_ref().unwrap_or(&MessageAnchor::Newest),
+            limit.unwrap_or(MESSAGE_PAGE_ROWS),
+        )
         .map_err(|e| e.to_string());
     state.telemetry.time("chat_open", started);
     result
 }
+
+/// The default page a chat opens with.
+pub const MESSAGE_PAGE_ROWS: i64 = 50;
 
 #[tauri::command]
 pub async fn send_message(
@@ -506,6 +515,40 @@ pub fn download_status_media(
     state
         .connectors
         .download_status_media(&account_id, &message_id)
+}
+
+/// Title, description and image of the page behind a link. `None` when link previews are off
+/// in Privacy settings, or the page has nothing to show.
+#[tauri::command]
+pub async fn get_link_preview(
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<Option<crate::link_preview::LinkPreview>, String> {
+    if !state.config.get().privacy.link_previews {
+        return Ok(None);
+    }
+    crate::link_preview::link_preview(state.db.data_dir(), &url).await
+}
+
+/// Base URL of the loopback page host that gives a YouTube or Vimeo player a normal http
+/// origin. Started on the first video play.
+#[tauri::command]
+pub async fn get_embed_host() -> Result<String, String> {
+    crate::link_preview::embed_host().await
+}
+
+/// Path of a small map image for a shared location. `None` when map images are off in
+/// Privacy settings, or the tiles could not be fetched.
+#[tauri::command]
+pub async fn get_map_tile(
+    state: State<'_, AppState>,
+    lat: f64,
+    lng: f64,
+) -> Result<Option<String>, String> {
+    if !state.config.get().privacy.map_tiles {
+        return Ok(None);
+    }
+    crate::link_preview::map_tile(state.db.data_dir(), lat, lng).await
 }
 
 /// Validate a media/preview path (cache or legacy Documents folder) and mark it as used.
@@ -932,6 +975,21 @@ pub fn unread_by_account(
 #[tauri::command]
 pub fn total_unread(state: State<'_, AppState>) -> Result<i64, String> {
     state.db.total_unread().map_err(|e| e.to_string())
+}
+
+/// The call in progress, so a window rebuilt from the tray puts its call panel back.
+#[tauri::command]
+pub fn current_call() -> Option<CallState> {
+    crate::main_window::current_call()
+}
+
+/// Live performance settings, read by the main-window lifecycle as it hides and rebuilds.
+pub fn performance_config<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> crate::config::PerformanceConfig {
+    app.try_state::<AppState>()
+        .map(|state| state.config.get().performance)
+        .unwrap_or_default()
 }
 
 #[tauri::command]
@@ -1420,6 +1478,7 @@ pub fn spawn_event_forwarder(app: AppHandle, connectors: Arc<ConnectorManager>) 
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    crate::main_window::note_event(&app, &event);
                     let _ = app.emit("shuttle-event", &event);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

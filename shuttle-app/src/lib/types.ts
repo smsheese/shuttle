@@ -135,6 +135,21 @@ export interface SearchResults {
   messages: SearchMessageHit[];
 }
 
+/**
+ * Where a message page starts. Every anchor but `newest` names a message the caller already
+ * holds, so history and the live end are read from the same total order.
+ */
+export type MessageAnchor =
+  | { kind: 'newest' }
+  | { kind: 'before' | 'after' | 'from' | 'around'; message_id: string };
+
+/** One contiguous page of a chat, oldest first, and whether the chat goes on each side. */
+export interface MessagePage {
+  messages: Message[];
+  has_older: boolean;
+  has_newer: boolean;
+}
+
 export interface CallState {
   call_id: string;
   conversation_id: string;
@@ -387,6 +402,7 @@ export interface UpdateCheck {
   latest: string;
   available: boolean;
   notes_url: string;
+  notes?: string;
   asset?: UpdateAsset | null;
   checksums_url?: string | null;
 }
@@ -612,6 +628,10 @@ export interface AppConfig {
   privacy: {
     crash_reports: boolean;
     usage_diagnostics: boolean;
+    /** Fetch a title, description and image for the first link in a message (default on). */
+    link_previews?: boolean;
+    /** Fetch a small OpenStreetMap image for shared locations (default on). */
+    map_tiles?: boolean;
   };
   sleep: {
     enabled: boolean;
@@ -623,8 +643,14 @@ export interface AppConfig {
   /** The user's own OpenRouter account for translation and later AI features. Empty key = off. */
   ai?: { openrouter_api_key: string; model: string };
   integrations?: { giphy_api_key: string };
-  /** Linux WebView tuning; read by the Rust core at startup, never edited from the UI. */
-  performance?: { low_memory_webview: boolean };
+  /** Linux WebView tuning, read by the Rust core at startup. */
+  performance?: {
+    low_memory_webview: boolean;
+    /** Destroy the hidden window's WebView so its renderer exits; rebuilt when shown. */
+    unload_hidden_window?: boolean;
+    /** Seconds hidden before that happens. */
+    unload_hidden_after_secs?: number;
+  };
 }
 
 export interface AccountPatch {

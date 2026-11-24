@@ -36,6 +36,13 @@ fn at(fx: &Fx, secs: i64) -> DateTime<Utc> {
     fx.t0 + Duration::seconds(secs)
 }
 
+/// The newest `limit` stored messages of a chat, oldest first.
+fn newest(db: &Database, conversation_id: &str, limit: i64) -> Result<Vec<Message>, DbError> {
+    Ok(db
+        .message_page(conversation_id, &MessageAnchor::Newest, limit)?
+        .messages)
+}
+
 fn names(v: Value) -> Option<Map<String, Value>> {
     Some(v.as_object().unwrap().clone())
 }
@@ -556,7 +563,7 @@ fn alias_rename_and_merge() {
         .unwrap()
         .is_none());
     assert_eq!(c.title, "Pat");
-    assert_eq!(f.db.list_messages(&c.id, 10).unwrap().len(), 1);
+    assert_eq!(newest(&f.db, &c.id, 10).unwrap().len(), 1);
     // A later message that still names the old JID lands in the same chat.
     ingest(
         &f,
@@ -565,7 +572,7 @@ fn alias_rename_and_merge() {
         false,
         msg("x2", "again", at(&f, 20), false),
     );
-    assert_eq!(f.db.list_messages(&c.id, 10).unwrap().len(), 2);
+    assert_eq!(newest(&f.db, &c.id, 10).unwrap().len(), 2);
 
     // Two separate rows for one person get merged into the remote_id row.
     let other_lid = "5544332211@lid";
@@ -605,7 +612,7 @@ fn alias_rename_and_merge() {
         merged.pinned && merged.notes == "remember",
         "gaps are filled from the other chat"
     );
-    let msgs = f.db.list_messages(&merged.id, 20).unwrap();
+    let msgs = newest(&f.db, &merged.id, 20).unwrap();
     let ids: Vec<_> = msgs.iter().filter_map(|m| m.remote_id.clone()).collect();
     assert_eq!(ids.len(), 3, "x1, x2 once, y1: {ids:?}");
     assert!(ids.contains(&"y1".to_string()));
@@ -697,7 +704,7 @@ fn send_ok_error_and_echo_adoption() {
         msg("WAID1", "hi", at(&f, 10), true),
     );
     assert_eq!(out.kind, IngestKind::Duplicate);
-    assert_eq!(f.db.list_messages(&cid, 10).unwrap().len(), 1);
+    assert_eq!(newest(&f.db, &cid, 10).unwrap().len(), 1);
 
     // error with request id: failed (only while pending).
     let m2 = local_send(&f, &cid, "oops", 20);
@@ -724,7 +731,7 @@ fn send_ok_error_and_echo_adoption() {
     assert_eq!(adopted.id, m3.id);
     assert_eq!(adopted.remote_id.as_deref(), Some("WAID3"));
     assert_eq!(adopted.status, MessageStatus::Sent);
-    assert_eq!(f.db.list_messages(&cid, 20).unwrap().len(), 3);
+    assert_eq!(newest(&f.db, &cid, 20).unwrap().len(), 3);
     // ok after adoption changes nothing.
     assert!(matches!(
         f.db.reconcile_send_ok(Some(&f.account), &m3.id, "WAID3")
@@ -1271,14 +1278,14 @@ fn purged_files_lose_their_media_path_and_nothing_else() {
         ["/cache/a/media/gone.mp4".to_string()].into_iter().collect();
     let affected = f.db.clear_media_paths(&purged).unwrap();
     assert_eq!(affected, vec![(f.account.clone(), 1)]);
-    let gone = f.db.list_messages(&cid, 50).unwrap();
+    let gone = newest(&f.db, &cid, 50).unwrap();
     let gone = gone.iter().find(|m| m.remote_id.as_deref() == Some("gone")).unwrap();
     assert!(gone.metadata.get("media_path").is_none());
     // The thumbnail, size and type stay so the UI can draw the placeholder + download button.
     assert_eq!(gone.metadata["thumbnail_path"], "/cache/a/thumbs/gone.jpg");
     assert_eq!(gone.metadata["file_length"], 1234);
     assert_eq!(gone.metadata["media_type"], "video");
-    let all = f.db.list_messages(&cid, 50).unwrap();
+    let all = newest(&f.db, &cid, 50).unwrap();
     let path_of = |remote: &str| {
         all.iter()
             .find(|m| m.remote_id.as_deref() == Some(remote))
@@ -1313,7 +1320,7 @@ fn react(
 
 fn listed(fx: &Fx, remote: &str) -> Vec<Message> {
     let c = conv(fx, remote);
-    fx.db.list_messages(&c.id, 100).unwrap()
+    newest(&fx.db, &c.id, 100).unwrap()
 }
 
 #[test]
@@ -1611,6 +1618,294 @@ fn seed_chat(f: &Fx) -> String {
     conv(f, WA_PHONE).id
 }
 
+/// A chat of `count` messages whose first `ties` share one timestamp, so page boundaries land on
+/// equal keys.
+fn seed_long_chat(f: &Fx, count: usize, ties: usize) -> String {
+    let cid = seed_chat(f);
+    for i in 0..count {
+        let secs = if i < ties { 1 } else { 1 + i as i64 };
+        ingest(
+            f,
+            WA_PHONE,
+            &[],
+            true,
+            msg(&format!("M{i:03}"), &format!("body {i}"), at(f, secs), false),
+        );
+    }
+    cid
+}
+
+fn remote_ids(page: &MessagePage) -> Vec<String> {
+    page.messages
+        .iter()
+        .map(|m| m.remote_id.clone().unwrap_or_default())
+        .collect()
+}
+
+#[test]
+fn paging_back_through_equal_timestamps_skips_and_repeats_nothing() {
+    let f = fx();
+    // 12 of the 30 share a timestamp: a cursor that only compared timestamps would drop or repeat
+    // the rows on either side of that run.
+    let cid = seed_long_chat(&f, 30, 12);
+    let first = f
+        .db
+        .message_page(&cid, &MessageAnchor::Newest, 7)
+        .unwrap();
+    assert_eq!(first.messages.len(), 7);
+    assert!(first.has_older);
+    assert!(!first.has_newer, "the newest page reaches the end of the chat");
+    assert_eq!(remote_ids(&first), (23..30).map(|i| format!("M{i:03}")).collect::<Vec<_>>());
+    let mut seen: Vec<String> = remote_ids(&first);
+    let mut cursor = first.messages[0].id.clone();
+    loop {
+        let page = f
+            .db
+            .message_page(
+                &cid,
+                &MessageAnchor::Before {
+                    message_id: cursor.clone(),
+                },
+                7,
+            )
+            .unwrap();
+        assert!(page.has_newer, "one page back is never the whole chat");
+        if page.messages.is_empty() {
+            assert!(!page.has_older);
+            break;
+        }
+        cursor = page.messages[0].id.clone();
+        let has_older = page.has_older;
+        let mut older = remote_ids(&page);
+        older.extend(seen);
+        seen = older;
+        if !has_older {
+            break;
+        }
+    }
+    let in_one_read = newest(&f.db, &cid, 50).unwrap();
+    let expected: Vec<String> = in_one_read
+        .iter()
+        .map(|m| m.remote_id.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(seen.len(), 30, "no row repeated by a page boundary");
+    assert_eq!(seen, expected, "the pages reproduce the whole chat, in order");
+}
+
+#[test]
+fn the_last_page_says_there_is_nothing_older() {
+    let f = fx();
+    let cid = seed_long_chat(&f, 5, 2);
+    let page = f.db.message_page(&cid, &MessageAnchor::Newest, 5).unwrap();
+    assert_eq!(page.messages.len(), 5);
+    assert!(!page.has_older);
+    assert!(!page.has_newer);
+    let page = f.db.message_page(&cid, &MessageAnchor::Newest, 2).unwrap();
+    assert_eq!(page.messages.len(), 2);
+    assert!(page.has_older);
+
+    let older = f
+        .db
+        .message_page(
+            &cid,
+            &MessageAnchor::Before {
+                message_id: page.messages[0].id.clone(),
+            },
+            10,
+        )
+        .unwrap();
+    assert_eq!(older.messages.len(), 3, "the rest of the short chat in one page");
+    assert!(!older.has_older);
+    assert!(older.has_newer);
+}
+
+#[test]
+fn around_a_message_has_history_on_the_side_that_exists() {
+    let f = fx();
+    let cid = seed_long_chat(&f, 20, 0);
+    let all = newest(&f.db, &cid, 50).unwrap();
+
+    let middle = f
+        .db
+        .message_page(
+            &cid,
+            &MessageAnchor::Around {
+                message_id: all[10].id.clone(),
+            },
+            10,
+        )
+        .unwrap();
+    assert_eq!(middle.messages.len(), 10);
+    assert!(middle.has_older);
+    assert!(middle.has_newer);
+    assert!(
+        remote_ids(&middle).contains(&"M010".to_string()),
+        "the message jumped to is on the page"
+    );
+    let ids = remote_ids(&middle);
+    assert_eq!(ids[4], "M010", "half the page is older, the target sits in it");
+
+    let start = f
+        .db
+        .message_page(
+            &cid,
+            &MessageAnchor::Around {
+                message_id: all[0].id.clone(),
+            },
+            10,
+        )
+        .unwrap();
+    assert!(!start.has_older, "the oldest message has nothing above it");
+    assert!(start.has_newer);
+    assert_eq!(remote_ids(&start), (0..6).map(|i| format!("M{i:03}")).collect::<Vec<_>>());
+
+    let end = f
+        .db
+        .message_page(
+            &cid,
+            &MessageAnchor::Around {
+                message_id: all[19].id.clone(),
+            },
+            10,
+        )
+        .unwrap();
+    assert!(end.has_older);
+    assert!(!end.has_newer, "the newest message has nothing below it");
+    assert_eq!(*remote_ids(&end).last().unwrap(), "M019");
+}
+
+#[test]
+fn from_a_message_re_reads_the_same_window() {
+    let f = fx();
+    let cid = seed_long_chat(&f, 20, 0);
+    let tail = f.db.message_page(&cid, &MessageAnchor::Newest, 6).unwrap();
+    // Two messages arrive while the reader sits in that window.
+    ingest(&f, WA_PHONE, &[], false, msg("NEW1", "late", at(&f, 100), false));
+    ingest(&f, WA_PHONE, &[], false, msg("NEW2", "later", at(&f, 101), false));
+    let again = f
+        .db
+        .message_page(
+            &cid,
+            &MessageAnchor::From {
+                message_id: tail.messages[5].id.clone(),
+            },
+            6,
+        )
+        .unwrap();
+    assert_eq!(
+        remote_ids(&again),
+        remote_ids(&tail),
+        "the same span comes back, not the newest six"
+    );
+    assert!(again.has_newer, "rows arrived below the window");
+    assert!(again.has_older);
+}
+
+#[test]
+fn newer_pages_rejoin_the_live_end() {
+    let f = fx();
+    let cid = seed_long_chat(&f, 12, 0);
+    // Start at the oldest row, as a reader who scrolled all the way up then back down would.
+    let all = newest(&f.db, &cid, 12).unwrap();
+    let mut cursor = all[0].id.clone();
+    let mut newer_side: Vec<String> = Vec::new();
+    loop {
+        let page = f
+            .db
+            .message_page(
+                &cid,
+                &MessageAnchor::After {
+                    message_id: cursor.clone(),
+                },
+                4,
+            )
+            .unwrap();
+        if page.messages.is_empty() {
+            assert!(!page.has_newer);
+            break;
+        }
+        cursor = page.messages[page.messages.len() - 1].id.clone();
+        let has_newer = page.has_newer;
+        newer_side.extend(remote_ids(&page));
+        if !has_newer {
+            break;
+        }
+    }
+    assert_eq!(
+        newer_side,
+        (1..12).map(|i| format!("M{i:03}")).collect::<Vec<_>>(),
+        "the pages after the oldest row reach the live end without a gap"
+    );
+}
+
+#[test]
+fn a_reply_on_an_older_page_still_shows_its_quote() {
+    let f = fx();
+    let cid = seed_chat(&f);
+    let mut orig = msg("ORIG", "from the top of the chat", at(&f, 1), false);
+    orig.sender_name = Some("Bob".into());
+    ingest(&f, WA_PHONE, &[], true, orig);
+    for i in 0..20 {
+        ingest(&f, WA_PHONE, &[], true, msg(&format!("F{i}"), "filler", at(&f, 10 + i), false));
+    }
+    // The reply sits in the middle: neither the newest page nor the page that holds the original.
+    ingest(
+        &f,
+        WA_PHONE,
+        &[],
+        true,
+        reply_msg("R1", "answering the top", 40, &f, json!({ "remote_id": "ORIG" })),
+    );
+    for i in 0..20 {
+        ingest(&f, WA_PHONE, &[], true, msg(&format!("L{i}"), "later", at(&f, 50 + i), false));
+    }
+    let all = newest(&f.db, &cid, 100).unwrap();
+    let reply_index = all
+        .iter()
+        .position(|m| m.remote_id.as_deref() == Some("R1"))
+        .unwrap();
+    let page = f
+        .db
+        .message_page(
+            &cid,
+            &MessageAnchor::Around {
+                message_id: all[reply_index].id.clone(),
+            },
+            6,
+        )
+        .unwrap();
+    let assert_no_original = |page: &MessagePage| {
+        assert!(!page.messages.iter().any(|m| m.remote_id.as_deref() == Some("ORIG")));
+    };
+    assert_no_original(&page);
+    let reply = page
+        .messages
+        .iter()
+        .find(|m| m.remote_id.as_deref() == Some("R1"))
+        .expect("the reply is on the page");
+    let quote = reply.reply.clone().expect("resolved reply");
+    assert!(quote.available);
+    assert_eq!(quote.snippet, "from the top of the chat");
+    assert_eq!(quote.sender_name.as_deref(), Some("Bob"));
+    assert!(quote.message_id.is_some(), "the quote links to the stored original");
+}
+
+#[test]
+fn an_anchor_that_is_gone_is_an_error_the_ui_can_recover_from() {
+    let f = fx();
+    let cid = seed_long_chat(&f, 3, 0);
+    let err = f
+        .db
+        .message_page(
+            &cid,
+            &MessageAnchor::Before {
+                message_id: "no-such-message".into(),
+            },
+            10,
+        );
+    assert!(matches!(err, Err(DbError::NotFound(_))));
+}
+
 #[test]
 fn reply_quote_is_built_from_the_stored_original() {
     let f = fx();
@@ -1626,7 +1921,7 @@ fn reply_quote_is_built_from_the_stored_original() {
         false,
         reply_msg("R1", "yes!", 2, &f, json!({ "remote_id": "ORIG", "snippet": "old text" })),
     );
-    let list = f.db.list_messages(&cid, 10).unwrap();
+    let list = newest(&f.db, &cid, 10).unwrap();
     let reply = list.iter().find(|m| m.remote_id.as_deref() == Some("R1")).unwrap();
     let p = reply.reply.as_ref().expect("resolved reply");
     assert!(p.available);
@@ -1652,7 +1947,7 @@ fn reply_to_own_message_is_you_and_media_gets_a_label() {
         false,
         reply_msg("R1", "nice", 2, &f, json!({ "remote_id": "PHOTO" })),
     );
-    let list = f.db.list_messages(&cid, 10).unwrap();
+    let list = newest(&f.db, &cid, 10).unwrap();
     let p = list
         .iter()
         .find(|m| m.remote_id.as_deref() == Some("R1"))
@@ -1680,7 +1975,7 @@ fn reply_outside_the_loaded_window_still_resolves() {
         true,
         reply_msg("R1", "late answer", 100, &f, json!({ "remote_id": "OLD" })),
     );
-    let list = f.db.list_messages(&cid, 3).unwrap();
+    let list = newest(&f.db, &cid, 3).unwrap();
     assert_eq!(list.len(), 3);
     assert!(!list.iter().any(|m| m.remote_id.as_deref() == Some("OLD")));
     let p = list.last().unwrap().reply.clone().unwrap();
@@ -1718,7 +2013,7 @@ fn missing_original_falls_back_to_the_connector_snippet() {
             json!({ "remote_id": "GONE2", "media_type": "video", "from_me": true }),
         ),
     );
-    let list = f.db.list_messages(&cid, 10).unwrap();
+    let list = newest(&f.db, &cid, 10).unwrap();
     let a = list[0].reply.clone().unwrap();
     assert!(!a.available);
     assert_eq!(a.message_id, None);
@@ -1735,7 +2030,7 @@ fn later_report_adds_the_reply_link_to_a_stored_message() {
     let cid = seed_chat(&f);
     ingest(&f, WA_PHONE, &[], true, msg("ORIG", "q", at(&f, 1), false));
     ingest(&f, WA_PHONE, &[], true, msg("R1", "a", at(&f, 2), false));
-    assert!(f.db.list_messages(&cid, 10).unwrap()[1].reply.is_none());
+    assert!(newest(&f.db, &cid, 10).unwrap()[1].reply.is_none());
     // History repair pass: same message again, now with the fact.
     let out = ingest(
         &f,
@@ -1745,7 +2040,7 @@ fn later_report_adds_the_reply_link_to_a_stored_message() {
         reply_msg("R1", "a", 2, &f, json!({ "remote_id": "ORIG" })),
     );
     assert_eq!(out.kind, IngestKind::Duplicate);
-    let list = f.db.list_messages(&cid, 10).unwrap();
+    let list = newest(&f.db, &cid, 10).unwrap();
     assert_eq!(list.len(), 2);
     assert_eq!(list[1].reply.clone().unwrap().snippet, "q");
     // The chat row is untouched by a metadata-only report.
@@ -1762,7 +2057,7 @@ fn reply_target_gives_the_connector_remote_id_and_group_author() {
     orig.sender_id = Some(WA_PHONE.into());
     orig.sender_name = Some("Samah".into());
     ingest(&f, WA_GROUP, &[], false, orig);
-    let local = f.db.list_messages(&cid, 10).unwrap()[0].id.clone();
+    let local = newest(&f.db, &cid, 10).unwrap()[0].id.clone();
     let t = f.db.reply_target(&local).unwrap();
     assert_eq!(t.remote_id, "GM1");
     assert_eq!(t.sender.as_deref(), Some(WA_PHONE));
@@ -1781,7 +2076,7 @@ fn sent_reply_keeps_its_link_when_the_echo_arrives_first_or_thinner() {
     let f = fx();
     let cid = seed_chat(&f);
     ingest(&f, WA_PHONE, &[], false, msg("ORIG", "question", at(&f, 1), false));
-    let orig_local = f.db.list_messages(&cid, 10).unwrap()[0].id.clone();
+    let orig_local = newest(&f.db, &cid, 10).unwrap()[0].id.clone();
     let target = f.db.reply_target(&orig_local).unwrap();
 
     // The reply is stored locally with the link and shows it right away.
@@ -1818,7 +2113,7 @@ fn sent_reply_keeps_its_link_when_the_echo_arrives_first_or_thinner() {
         SendReconcile::Removed { .. } => {}
         other => panic!("{other:?}"),
     }
-    let list = f.db.list_messages(&cid, 10).unwrap();
+    let list = newest(&f.db, &cid, 10).unwrap();
     assert_eq!(list.len(), 2);
     let kept = list.iter().find(|m| m.remote_id.as_deref() == Some("WA2")).unwrap();
     let p = kept.reply.clone().unwrap();
@@ -2062,7 +2357,7 @@ fn a_caption_from_a_later_report_replaces_the_placeholder_body() {
     assert_eq!(out.kind, IngestKind::Duplicate);
 
     let c = conv(&f, WA_GROUP);
-    let stored = f.db.list_messages(&c.id, 10).unwrap();
+    let stored = newest(&f.db, &c.id, 10).unwrap();
     assert_eq!(stored[0].body, "3 BHK, monthly");
     assert_eq!(stored[0].metadata["media_type"], "video", "media facts still merge");
     assert_eq!(c.last_message_preview.as_deref(), Some("3 BHK, monthly"));
@@ -2092,8 +2387,7 @@ fn stored_unknown_bodies_are_repaired_from_the_caption() {
         .get_conversation_by_remote(&account, WA_GROUP)
         .unwrap()
         .unwrap();
-    let stored: Vec<String> = db
-        .list_messages(&c.id, 10)
+    let stored: Vec<String> = newest(&db, &c.id, 10)
         .unwrap()
         .into_iter()
         .map(|m| m.body)
@@ -2106,7 +2400,7 @@ fn stored_unknown_bodies_are_repaired_from_the_caption() {
         .get_conversation_by_remote(&account, WA_PHONE)
         .unwrap()
         .unwrap();
-    let blank = db.list_messages(&direct.id, 10).unwrap();
+    let blank = newest(&db, &direct.id, 10).unwrap();
     assert_eq!(blank[0].body, "");
 }
 
@@ -2167,9 +2461,7 @@ fn vote_named(
 /// The stored poll of one message, as the UI reads it.
 fn stored_poll(fx: &Fx, remote: &str, poll_id: &str) -> crate::models::PollData {
     let c = conv(fx, remote);
-    let m = fx
-        .db
-        .list_messages(&c.id, 50)
+    let m = newest(&fx.db, &c.id, 50)
         .unwrap()
         .into_iter()
         .find(|m| m.remote_id.as_deref() == Some(poll_id))
@@ -2288,9 +2580,7 @@ fn a_vote_that_arrives_before_the_poll_is_dropped_safely() {
     let out = vote(&fx, WA_PHONE, "P9", "ann@s.whatsapp.net", &["h1"]);
     assert!(!out.changed, "no poll message to fold into");
     assert!(out.message.is_none());
-    let stored: Vec<String> = fx
-        .db
-        .list_messages(&conv(&fx, WA_PHONE).id, 50)
+    let stored: Vec<String> = newest(&fx.db, &conv(&fx, WA_PHONE).id, 50)
         .unwrap()
         .into_iter()
         .map(|m| m.body)

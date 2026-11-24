@@ -380,23 +380,95 @@ impl Database {
     fn forget_conversation(&self, id: &str) {
         self.conv_index.lock().remove(id);
     }
-    pub fn list_messages(
+    /// One page of a chat's messages, oldest first, plus whether the chat has more on each side.
+    ///
+    /// The page is a keyset window over `(unixepoch(timestamp, 'subsec') DESC, id ASC)`, the total
+    /// order the chat rules use and the one `idx_messages_conv_epoch` stores, so equal timestamps
+    /// neither repeat nor skip a row and a page is an index range scan, not a sort of the chat.
+    pub fn message_page(
         &self,
         conversation_id: &str,
+        anchor: &MessageAnchor,
         limit: i64,
-    ) -> Result<Vec<Message>, DbError> {
+    ) -> Result<MessagePage, DbError> {
+        let limit = limit.clamp(1, 5000);
         let account_id = self.conversation_account(conversation_id)?;
         let inbox = self.inbox(&account_id)?;
         let conn = inbox.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, remote_id, sender_id, sender_name, direction, body, timestamp, status, metadata, starred, pinned
-             FROM messages WHERE conversation_id = ?1
-             ORDER BY timestamp DESC LIMIT ?2",
-        )?;
-        let mut rows = stmt
-            .query_map(params![conversation_id, limit], map_message_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.reverse();
+
+        let newest_first = |predicate: &str, values: &[&dyn rusqlite::ToSql]| {
+            let sql = format!(
+                "{PAGE_SELECT} {predicate} ORDER BY unixepoch(timestamp, 'subsec') DESC, id ASC LIMIT {limit}"
+            );
+            rows_in(&conn, &sql, values)
+        };
+        let oldest_first = |predicate: &str, values: &[&dyn rusqlite::ToSql]| {
+            let sql = format!(
+                "{PAGE_SELECT} {predicate} ORDER BY unixepoch(timestamp, 'subsec') ASC, id DESC LIMIT {limit}"
+            );
+            rows_in(&conn, &sql, values)
+        };
+
+        let mut rows: Vec<Message> = match anchor {
+            MessageAnchor::Newest => {
+                let mut page = newest_first("", params![conversation_id])?;
+                page.reverse();
+                page
+            }
+            MessageAnchor::Before { message_id } => {
+                let (epoch, id) = page_key(&conn, conversation_id, message_id)?;
+                let mut page = newest_first(
+                    "AND (unixepoch(timestamp, 'subsec') < ?2 OR (unixepoch(timestamp, 'subsec') = ?2 AND id > ?3))",
+                    params![conversation_id, epoch, id],
+                )?;
+                page.reverse();
+                page
+            }
+            MessageAnchor::From { message_id } => {
+                let (epoch, id) = page_key(&conn, conversation_id, message_id)?;
+                let mut page = newest_first(
+                    "AND (unixepoch(timestamp, 'subsec') < ?2 OR (unixepoch(timestamp, 'subsec') = ?2 AND id >= ?3))",
+                    params![conversation_id, epoch, id],
+                )?;
+                page.reverse();
+                page
+            }
+            MessageAnchor::After { message_id } => {
+                let (epoch, id) = page_key(&conn, conversation_id, message_id)?;
+                oldest_first(
+                    "AND (unixepoch(timestamp, 'subsec') > ?2 OR (unixepoch(timestamp, 'subsec') = ?2 AND id < ?3))",
+                    params![conversation_id, epoch, id],
+                )?
+            }
+            MessageAnchor::Around { message_id } => {
+                let (epoch, id) = page_key(&conn, conversation_id, message_id)?;
+                let older_count = (limit / 2).max(1);
+                let newer_count = (limit - older_count).max(0);
+                let mut older: Vec<Message> = {
+                    let sql = format!(
+                        "{PAGE_SELECT} AND (unixepoch(timestamp, 'subsec') < ?2 OR (unixepoch(timestamp, 'subsec') = ?2 AND id >= ?3)) ORDER BY unixepoch(timestamp, 'subsec') DESC, id ASC LIMIT {older_count}"
+                    );
+                    rows_in(&conn, &sql, params![conversation_id, epoch, id])?
+                };
+                older.reverse();
+                let newer = {
+                    let sql = format!(
+                        "{PAGE_SELECT} AND (unixepoch(timestamp, 'subsec') > ?2 OR (unixepoch(timestamp, 'subsec') = ?2 AND id < ?3)) ORDER BY unixepoch(timestamp, 'subsec') ASC, id DESC LIMIT {newer_count}"
+                    );
+                    rows_in(&conn, &sql, params![conversation_id, epoch, id])?
+                };
+                older.extend(newer);
+                older
+            }
+        };
+
+        if rows.is_empty() {
+            return Ok(MessagePage {
+                messages: Vec::new(),
+                has_older: false,
+                has_newer: false,
+            });
+        }
         let mut reactions = reactions::reactions_by_target(&conn, conversation_id)?;
         if !reactions.is_empty() {
             for m in &mut rows {
@@ -405,8 +477,16 @@ impl Database {
                 }
             }
         }
+        // An unloaded original of a reply is read here, so a quote resolves on every page.
         replies::resolve_in_conversation(&conn, conversation_id, &mut rows)?;
-        Ok(rows)
+
+        let oldest = page_key(&conn, conversation_id, &rows[0].id)?;
+        let newest = page_key(&conn, conversation_id, &rows[rows.len() - 1].id)?;
+        Ok(MessagePage {
+            messages: rows,
+            has_older: has_row_beyond(&conn, conversation_id, &oldest, PageSide::Older)?,
+            has_newer: has_row_beyond(&conn, conversation_id, &newest, PageSide::Newer)?,
+        })
     }
 
     pub fn set_message_starred(&self, message_id: &str, starred: bool) -> Result<Message, DbError> {
@@ -437,6 +517,8 @@ impl Database {
         kind: &str,
         limit: i64,
     ) -> Result<Vec<Message>, DbError> {
+        // The media, documents, links and starred tabs read the whole chat, newest first, and
+        // never page: their rows are their own list, not a window of the conversation.
         let account_id = self.conversation_account(conversation_id)?;
         let inbox = self.inbox(&account_id)?;
         let conn = inbox.conn.lock();
@@ -850,6 +932,7 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn upsert_contact(
         &self,
         account_id: &str,
@@ -2059,6 +2142,68 @@ fn map_scheduled_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Schedu
         failed: row.get::<_, i64>(12)? != 0,
         forward: row.get::<_, i64>(13)? != 0,
     })
+}
+
+/// The columns every message query selects, in the order [`map_message_row`] reads them.
+const PAGE_SELECT: &str = "SELECT id, conversation_id, remote_id, sender_id, sender_name, direction, body, timestamp, status, metadata, starred, pinned
+             FROM messages WHERE conversation_id = ?1";
+
+/// Which side of a page to look for more rows on.
+#[derive(Clone, Copy)]
+enum PageSide {
+    Older,
+    Newer,
+}
+
+fn rows_in(
+    conn: &Connection,
+    sql: &str,
+    values: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<Message>, DbError> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows = stmt
+        .query_map(values, map_message_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// The paging key of a stored message: its sub-second epoch and its id, the total order the
+/// page queries sort on. Keyset paging on the id keeps equal timestamps from repeating a row.
+fn page_key(
+    conn: &Connection,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<(f64, String), DbError> {
+    conn.query_row(
+        "SELECT unixepoch(timestamp, 'subsec'), id FROM messages WHERE conversation_id = ?1 AND id = ?2",
+        params![conversation_id, message_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()?
+    .ok_or_else(|| DbError::NotFound(message_id.to_string()))
+}
+
+/// Whether the chat has a row past `key` on `side`, which is what tells the reader that
+/// scrolling that way loads more.
+fn has_row_beyond(
+    conn: &Connection,
+    conversation_id: &str,
+    key: &(f64, String),
+    side: PageSide,
+) -> Result<bool, DbError> {
+    let comparison = match side {
+        PageSide::Older => "< ?2 OR (unixepoch(timestamp, 'subsec') = ?2 AND id > ?3)",
+        PageSide::Newer => "> ?2 OR (unixepoch(timestamp, 'subsec') = ?2 AND id < ?3)",
+    };
+    let sql = format!(
+        "SELECT 1 FROM messages WHERE conversation_id = ?1
+           AND (unixepoch(timestamp, 'subsec') {comparison}) LIMIT 1"
+    );
+    let found: Option<i64> = conn
+        .prepare_cached(&sql)?
+        .query_row(params![conversation_id, key.0, key.1], |row| row.get(0))
+        .optional()?;
+    Ok(found.is_some())
 }
 
 fn map_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {

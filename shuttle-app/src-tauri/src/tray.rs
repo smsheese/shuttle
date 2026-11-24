@@ -9,11 +9,7 @@ use tauri::{
 const TRAY_ID: &str = "main-tray";
 
 fn show_main<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.unminimize();
-        let _ = win.show();
-        let _ = win.set_focus();
-    }
+    crate::main_window::show(app);
 }
 
 pub fn setup_tray<R: Runtime>(app: &tauri::App<R>) -> Result<(), Box<dyn std::error::Error>> {
@@ -66,29 +62,32 @@ pub fn update_tray_unread(count: i64) -> Result<(), String> {
         .lock()
         .clone()
         .ok_or_else(|| "app not ready".to_string())?;
+    set_unread(&app, count);
+    Ok(())
+}
+
+/// The unread count the app shows without the UI: the tray tooltip always, plus the window's
+/// badge or overlay while a window exists to carry it.
+pub fn set_unread<R: Runtime>(app: &AppHandle<R>, count: i64) {
     if let Some(window) = app.get_webview_window("main") {
         #[cfg(target_os = "windows")]
-        window
-            .set_overlay_icon(if count > 0 {
-                Some(unread_overlay(count))
-            } else {
-                None
-            })
-            .map_err(|e| e.to_string())?;
+        let _ = window.set_overlay_icon(if count > 0 {
+            Some(unread_overlay(count))
+        } else {
+            None
+        });
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        window
-            .set_badge_count(if count > 0 { Some(count) } else { None })
-            .map_err(|e| e.to_string())?;
+        let _ = window.set_badge_count(if count > 0 { Some(count) } else { None });
     }
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
-        return Ok(());
+        return;
     };
     let tooltip = if count > 0 {
         format!("Shuttle ({count} unread)")
     } else {
         "Shuttle".to_string()
     };
-    tray.set_tooltip(Some(tooltip)).map_err(|e| e.to_string())
+    let _ = tray.set_tooltip(Some(tooltip));
 }
 
 // Windows taskbars support an overlay image rather than a native count badge.

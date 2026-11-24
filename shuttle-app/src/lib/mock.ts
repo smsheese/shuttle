@@ -15,8 +15,10 @@ import type {
   ForwardTarget,
   Message,
   MessageActions,
+  MessageAnchor,
   MessageOp,
   MessageOpResult,
+  MessagePage,
   PriorityGroup,
   BackupManifest,
   ChatNote,
@@ -506,6 +508,66 @@ const DEMO_MESSAGES: Record<string, Message[]> = {
       timestamp: new Date(Date.now() - 1800000).toISOString(),
       status: 'read',
       metadata: {},
+    },
+    {
+      id: 'm6c',
+      conversation_id: 'c1',
+      remote_id: 'rm6c',
+      sender_id: null,
+      sender_name: 'Sarah Chen',
+      direction: 'inbound',
+      body: 'Contact: Zunaira Sameen (+966 55 610 9476)',
+      timestamp: new Date(Date.now() - 1750000).toISOString(),
+      status: 'delivered',
+      metadata: {},
+    },
+    {
+      id: 'm6l',
+      conversation_id: 'c1',
+      remote_id: 'rm6l',
+      sender_id: null,
+      sender_name: 'Sarah Chen',
+      direction: 'inbound',
+      body: 'https://maps.google.com/?q=24.6803947,46.7077217',
+      timestamp: new Date(Date.now() - 1720000).toISOString(),
+      status: 'delivered',
+      metadata: {},
+    },
+    {
+      id: 'm6k',
+      conversation_id: 'c1',
+      remote_id: 'rm6k',
+      sender_id: null,
+      sender_name: 'Sarah Chen',
+      direction: 'inbound',
+      body: 'Menu is here https://example.com/thai-basil, see you at 12:30',
+      timestamp: new Date(Date.now() - 1700000).toISOString(),
+      status: 'delivered',
+      metadata: {},
+    },
+    {
+      id: 'm6call',
+      conversation_id: 'c1',
+      remote_id: 'rm6call',
+      sender_id: null,
+      sender_name: 'Sarah Chen',
+      direction: 'inbound',
+      body: 'Incoming call',
+      timestamp: new Date(Date.now() - 1690000).toISOString(),
+      status: 'delivered',
+      metadata: { media_type: 'call' },
+    },
+    {
+      id: 'm6u',
+      conversation_id: 'c1',
+      remote_id: 'rm6u',
+      sender_id: null,
+      sender_name: 'Sarah Chen',
+      direction: 'inbound',
+      body: '[order]',
+      timestamp: new Date(Date.now() - 1680000).toISOString(),
+      status: 'delivered',
+      metadata: { media_type: 'order' },
     },
     {
       id: 'm6p',
@@ -1182,7 +1244,57 @@ export const mockApi = {
     conversations = conversations.map((c) => (c.id === id ? { ...c, ...patch } : c));
     return conversations.find((c) => c.id === id)!;
   },
-  getMessages: async (conversationId: string) => messages[conversationId] ?? [],
+  getMessagePage: async (
+    conversationId: string,
+    anchor: MessageAnchor = { kind: 'newest' },
+    limit = 50
+  ): Promise<MessagePage> => {
+    const all = messages[conversationId] ?? [];
+    const at = (id: string) => all.findIndex((m) => m.id === id);
+    if (anchor.kind === 'newest') {
+      return {
+        messages: all.slice(-limit),
+        has_older: all.length > limit,
+        has_newer: false,
+      };
+    }
+    const index = at(anchor.message_id);
+    if (index < 0) return { messages: [], has_older: false, has_newer: false };
+    if (anchor.kind === 'before') {
+      const end = index;
+      const start = Math.max(0, end - limit);
+      return {
+        messages: all.slice(start, end),
+        has_older: start > 0,
+        has_newer: true,
+      };
+    }
+    if (anchor.kind === 'after') {
+      const start = index + 1;
+      const end = Math.min(all.length, start + limit);
+      return {
+        messages: all.slice(start, end),
+        has_older: true,
+        has_newer: end < all.length,
+      };
+    }
+    if (anchor.kind === 'from') {
+      const start = Math.max(0, index - limit + 1);
+      return {
+        messages: all.slice(start, index + 1),
+        has_older: start > 0,
+        has_newer: index < all.length - 1,
+      };
+    }
+    const half = Math.max(1, Math.floor(limit / 2));
+    const start = Math.max(0, index - half + 1);
+    const end = Math.min(all.length, index + (limit - half) + 1);
+    return {
+      messages: all.slice(start, end),
+      has_older: start > 0,
+      has_newer: end < all.length,
+    };
+  },
   sendMessage: async (
     _accountId: string,
     conversationId: string,

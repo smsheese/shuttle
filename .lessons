@@ -1,0 +1,46 @@
+# Project lessons
+
+## Destroying a Tauri webview window does not exit the WebKitGTK renderer
+
+- Component: `shuttle-app/src-tauri/src/main_window.rs` (Linux, WebKitGTK 4.1, Tauri 2.11).
+- Observed 2026-11-24 12:00 +0300, verified 2026-11-24 12:15 +0300.
+- Issue: `WebviewWindow::destroy()` removes the window and its X11 surface, but the child
+  `WebKitWebProcess` keeps running with its full page state (measured: renderer PSS 140 MB before,
+  113 MB minutes after destroy, no exit). A rebuild then spawned a second renderer, so the app held
+  both.
+- Cause: not pinned down. WebKitGTK keeps the WebProcess for its `WebContext`, and something in the
+  Tauri/wry teardown keeps that alive past the window.
+- Fix: call `webkit_web_view_terminate_web_process` through `with_webview` immediately before
+  `destroy()` (`main_window::try_unload`). Verified: renderer pid gone within one timer tick, zero
+  `WebKitWebProcess` children while unloaded, one fresh process after rebuild.
+- Status: active. Windows (WebView2) and macOS (WKWebView) take the same code path but their
+  renderer exit is unverified.
+- Safe verification: build a dev copy with a distinct `identifier` and `XDG_DATA_HOME` so the
+  installed Shuttle keeps its single-instance lock, hide the window, then
+  `ps -eo pid,ppid,args | grep WebKitWebProcess` and compare `/proc/<pid>/smaps_rollup` Pss before,
+  during and after the unload.
+- Review date: 2026-12-09.
+
+## pi-lens reports stale TypeScript errors against recently edited types
+
+- Component: pi-lens LSP diagnostics in this repo.
+- Observed 2026-11-24 12:05 +0300, verified 2026-11-24 12:12 +0300.
+- Issue: after adding fields to `src/lib/types.ts`, pi-lens kept reporting "property does not exist"
+  in `SettingsPanel.svelte` and a bogus `LightboxItem` import error in `messageMedia.ts`, while
+  `npx svelte-check` and a fresh `tsc` both reported zero errors on the same files.
+- Cause: the lens LSP server's program stayed stale for the edited type file. Touching the file did
+  not refresh it.
+- Fix or workaround: treat `npx svelte-check --tsconfig ./tsconfig.json` as authoritative, and prove
+  a suspected false positive by temporarily introducing a field name that cannot exist and
+  confirming the checker prints the current type. The bogus `LightboxItem` finding is a known
+  false positive for `export type` from a `<script module>` block.
+- More evidence 2026-11-24 12:41 +0300 (message paging work): the stale program also reports
+  *another agent's* in-flight `.svelte` prop as missing in `src/routes/+page.svelte`
+  (`updateAvailable` on `Sidebar`, which `Sidebar.svelte:16` declares and the working tree owns),
+  plus "has no exported member" for a symbol just added to `src/lib/api.ts`, plus a cascading
+  "implicitly has an 'any' type". `svelte-check` reported 0 errors and 0 warnings at the same time,
+  `npx tsc -p ./tsconfig.json --noEmit` resolved the new exports from a probe file, and
+  `npm run build` emitted the code. Cheap tell for a stale program: it flags an error in a file you
+  did not edit, or a symbol whose definition is two lines away.
+- Status: active.
+- Review date: 2026-12-09.

@@ -104,7 +104,9 @@ Unique constraint: `(account_id, remote_id)`. A chat that the network reports un
 
 Edits and deletions are facts too (`message.changed`, see [Events](#events-connectorevent)), applied only by `db/chat.rs`. An edit replaces `body` and sets `metadata.edited_at`; an older or repeated edit is ignored. "Deleted for everyone" turns the row into a tombstone: `body` becomes empty, `metadata` becomes `{revoked_at}`, its reactions are deleted, and a later report of the same message never refills it. "Deleted for me" deletes the row and records `(conversation_id, remote_id)` in `deleted_messages`, so a later sync of that message is ignored. When the changed message is the one the chat preview comes from, the preview is re-derived from the newest stored message (a tombstone previews as "This message was deleted"); chat time never moves.
 
-Unique index: `(conversation_id, remote_id)` where `remote_id IS NOT NULL`. History sync and live events share this; duplicates are ignored. `list_messages` takes the latest *n* rows then reverses so the UI gets chronological order.
+Unique index: `(conversation_id, remote_id)` where `remote_id IS NOT NULL`. History sync and live events share this; duplicates are ignored.
+
+A chat opens on its newest 50 messages, not its whole history. `Database::message_page` returns one contiguous page plus `has_older` / `has_newer`, keyed on `(unixepoch(timestamp, 'subsec'), id)` (`MessageAnchor`: `newest`, `before`, `from`, `after`, `around`). Keyset paging on that pair means equal timestamps never repeat or skip a row, and each page is an index range scan on `idx_messages_conv_epoch` rather than a sort of the chat. The frontend holds the page as one run and reads another when the reader scrolls to either end; a jump to a message outside the run (a search hit, a reply quote, a todo or note quote) reads the page around it, so there is no ladder of ever-larger limits. Reactions and reply previews resolve for every page, and `search_messages` still reads the whole chat, not the loaded run.
 
 ### Replies (`metadata.reply_to`)
 
@@ -191,7 +193,7 @@ Each `ConnectorInfo` carries `actions` (`MessageActions`), from the one table in
 
 ### App config (not SQLite)
 
-`config.json` in the data dir holds appearance, app-wide notification prefs, per-connector channel styles, `translate` (`endpoint`, `api_key`, both empty by default, which keeps translation off), and `performance` (`low_memory_webview`, Linux WebKit tuning, default on). See [storage.md](storage.md) and `config.rs`. Invalid / missing files fall back to defaults (`color_scheme: system`, `theme_id: shuttle`).
+`config.json` in the data dir holds appearance, app-wide notification prefs, per-connector channel styles, `translate` (`endpoint`, `api_key`, both empty by default, which keeps translation off), and `performance` (`low_memory_webview`, Linux WebKit tuning, default on; `unload_hidden_window` and `unload_hidden_after_secs`, the hidden-window unload, default on after 120 s). See [storage.md](storage.md) and `config.rs`. Invalid / missing files fall back to defaults (`color_scheme: system`, `theme_id: shuttle`).
 
 ## Chat state rules
 
@@ -435,7 +437,7 @@ All commands are registered in `lib.rs` and implemented in `commands.rs`.
 | `list_conversations` | `account_id?`, `workspace_id?`, `priority_group?`, `archived_only?`, `offset?`, `limit?` | `Conversation[]` | Sorted and paged in SQL. Omits archived unless `archived_only` |
 | `count_conversations` | same filters as `list_conversations` | `number` | Total for the paged list |
 | `update_conversation` | `conversation_id`, `patch` | `Conversation` | Pin, archive, mute, workspace, priority, notes, notify, receipts |
-| `get_messages` | `conversation_id`, `limit?` | `Message[]` | Default limit 100 |
+| `get_messages` | `conversation_id`, `limit?` (default 50), `anchor?` (`{kind: "newest"}` or `{kind: "before"\|"after"\|"from"\|"around", message_id}`) | `MessagePage` (`{messages, has_older, has_newer}`) | One contiguous page, oldest first. Anchors name a message the caller already holds, so a page never needs a timestamp on the wire |
 | `send_message` | `account_id`, `conversation_id`, `text`, `reply_to_message_id?` | `Message` | Stores the row as `pending`, then sets its network ID and `sent`, or `failed`, from the connector's reply. `reply_to_message_id` is the local ID of a message in the same chat; the row stores `metadata.reply_to` and the connector sends a real reply (an error if that message has no network ID yet). `send_attachment` takes the same field. Forwards and scheduled messages are never replies |
 | `apply_message_op` | `conversation_id`, `message_ids[]`, `op` (`MessageOp`, same shape as the `message_op` request) | `MessageOpResult[]` (`{message_id, error?}`) | Checks each message against the network's `actions` (ownership, text or caption, time window, sent, not deleted), sends one `message_op` per message and waits up to 30 s for each answer. The stored result arrives as events. Takes a list so several messages can be deleted at once |
 | `translate_text` | `conversation_id`, `message_ids[]`, `target` (language code, the UI sends the app locale) | `Translation[]` (`{message_id, text?, error?}`) | Sends each message body to the LibreTranslate-compatible server in `config.translate` (`POST <endpoint>/translate`, `source: auto`, `api_key` only when set). Errors with `{kind:"not_configured"}` when no endpoint is set. Results are not stored |
@@ -457,6 +459,7 @@ All commands are registered in `lib.rs` and implemented in `commands.rs`.
 | `list_notes` / `add_note` / `update_note` / `delete_note` | `add_note`: `body`, optional `message_id`, `message_snippet`, `schedule` (`{timer_secs}` or `{alarm_at}`); `update_note`: optional `body`, `schedule`, `clear_schedule` | `ChatNote` | Per conversation. Setting a schedule re-arms a fired note; `clear_schedule` cancels it |
 | `open_external` | `url` | `()` | System opener |
 | `open_devtools` | — | `()` | No-op in release (`#[cfg(debug_assertions)]` only) |
+| `get_link_preview` / `get_map_tile` | url / lat, lng | preview or image path | Link preview card and shared-location map. Fetched by Rust with an address guard, cached in `media_cache/previews`; return nothing when the Privacy toggles `link_previews` / `map_tiles` are off |
 | `telemetry_track` / `telemetry_error` / `telemetry_performance` / `telemetry_set_foreground` | | | Frontend → Rust telemetry (dropped unless the matching Privacy toggle is on) |
 
 `AccountPatch` / `ConversationPatch` use optional fields plus `clear_*` flags (`clear_workspace`, `clear_notify`, `clear_priority`, `clear_receipts`) so the UI can reset nullable columns to inherit.

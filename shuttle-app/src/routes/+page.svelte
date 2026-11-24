@@ -1,6 +1,15 @@
 <script lang="ts">
   import { messageSnippet } from '$lib/messageSnippet';
   import { MessageCache } from '$lib/messageCache';
+  import {
+    appendNewer,
+    emptyWindow,
+    mergeNewest,
+    openWindow,
+    prependOlder,
+    reReadSpan,
+    type MessageWindow,
+  } from '$lib/messageWindow';
   import { setWindowTitleUnread } from '$lib/windowTitle';
   import { page } from '$app/state';
   import { onMount, tick, untrack } from 'svelte';
@@ -23,10 +32,13 @@
     fetchConversationAvatar,
     fetchContactProfile,
     getAppConfig,
-    getMessages,
+    getMessagePage,
+    MESSAGE_PAGE_ROWS,
     listAccounts,
     listConnectors,
     countConversations,
+    checkForUpdate,
+    currentCall,
     listConversations,
     listForwardRules,
     listPriorityGroups,
@@ -86,6 +98,8 @@
   import Sidebar from '$lib/components/Sidebar.svelte';
   import StatusViewer from '$lib/components/StatusViewer.svelte';
   import ThreadView from '$lib/components/ThreadView.svelte';
+  import { isTauri } from '$lib/mock';
+  import UpdateNotice from '$lib/components/UpdateNotice.svelte';
   import UpdatesHome from '$lib/components/UpdatesHome.svelte';
   import { isModKey, isTypingTarget } from '$lib/shortcuts';
   import { normalizeRichText } from '$lib/richText';
@@ -96,6 +110,7 @@
   import { initTelemetry, markAppReady } from '$lib/telemetry';
   import { selectionContext, urlsIn } from '$lib/structuredText';
   import { compareConversations, convTime } from '$lib/conversationOrder';
+  import { draftFor, loadUiState, saveDraft, saveUiPlace } from '$lib/uiState';
   import {
     CONNECTOR_COLORS,
     type Account,
@@ -105,6 +120,7 @@
     type CallState,
     type ConnectorInfo,
     type Conversation,
+    type UpdateCheck,
     type ForwardRule,
     type ForwardRuleDraft,
     type MenuItem,
@@ -139,15 +155,31 @@
   let statusThumbs = $state<Record<string, string>>({});
   const statusMediaWaiters = new Map<string, Array<(url: string | null) => void>>();
   let messages = $state<Message[]>([]);
+  /**
+   * The open chat holds one contiguous run of its messages, not the whole history: 50 rows on
+   * open, another page each time the reader scrolls to either end, and a page around the message
+   * a search hit or a quote jumps to. `hasOlder` and `hasNewer` say which ends have more.
+   */
+  let hasOlder = $state(false);
+  let hasNewer = $state(false);
+  /** True while a page of older history or of the live end is in flight. */
+  let loadingOlder = $state(false);
+  let loadingNewer = $state(false);
   /** True while the open chat has nothing to show yet and its first read is in flight. */
   let messagesLoading = $state(false);
   const MESSAGE_CACHE_CHATS = 30;
   const MESSAGE_CACHE_ROWS = 100;
+  /** A chat nobody opened for this long gives its cached rows back. */
+  const MESSAGE_CACHE_TTL_MS = 5 * 60_000;
   /**
    * Recent messages by conversation id, so opening a chat paints at once. Every open still
    * re-reads the database and replaces the cached rows, so a stale entry is only ever shown briefly.
    */
-  const messageCache = new MessageCache(MESSAGE_CACHE_CHATS, MESSAGE_CACHE_ROWS);
+  const messageCache = new MessageCache(MESSAGE_CACHE_CHATS, MESSAGE_CACHE_ROWS, MESSAGE_CACHE_TTL_MS);
+  $effect(() => {
+    const timer = setInterval(() => messageCache.sweep(), 60_000);
+    return () => clearInterval(timer);
+  });
   const PREFILL_CHATS_PER_ACCOUNT = 5;
   const PREFILL_MESSAGES = 15;
   /** One prefill per session: later inbox reloads open chats from the database as usual. */
@@ -165,8 +197,8 @@
       for (const chat of chats) {
         if (messageCache.has(chat.id)) continue;
         try {
-          const rows = await getMessages(chat.id, PREFILL_MESSAGES);
-          if (!messageCache.has(chat.id)) messageCache.set(chat.id, rows);
+          const rows = await getMessagePage(chat.id, { kind: 'newest' }, PREFILL_MESSAGES);
+          if (!messageCache.has(chat.id)) messageCache.set(chat.id, rows.messages);
         } catch {
           /* the chat reads from the database when opened */
         }
@@ -213,6 +245,13 @@
   let searchMessageHits = $state<SearchMessageHit[]>([]);
   let activeCall = $state<CallState | null>(null);
   let draft = $state('');
+  /**
+   * What the previous window had open. Restored once the first list load has rows to find it in,
+   * which is what makes a window rebuilt from the tray come back looking like the one that left.
+   */
+  let restoreConversationId: string | null = null;
+  /** Effects only write the saved view after the restore, never over it with the empty defaults. */
+  let hydrated = $state(false);
   /** The message the next send answers; cleared on send, on Esc and when the chat changes. */
   let replyingTo = $state<Message | null>(null);
   // A reply belongs to the chat it was started in.
@@ -235,6 +274,20 @@
   let pendingAccountId = $state<string | null>(null);
   let mobileView = $state<'list' | 'thread'>('list');
   let mobileTab = $state<'inbox' | 'settings'>('inbox');
+  // Newer release found by the launch check or the 6-hourly check. The popover opens only for
+  // the launch check; a later find while the app runs shows just the dot on the settings button.
+  let availableUpdate = $state<UpdateCheck | null>(null);
+  let updateNoticeOpen = $state(false);
+  async function checkForNewRelease(atLaunch: boolean) {
+    if (!isTauri()) return;
+    try {
+      const result = await checkForUpdate(false);
+      availableUpdate = result.available ? result : null;
+      if (atLaunch && result.available) updateNoticeOpen = true;
+    } catch {
+      // Offline or rate-limited: try again at the next interval.
+    }
+  }
   let panelOpen = $state(false);
   /** Contact details: of the open chat, or of a group member (their chat, or a transient one). */
   let contactView = $state<
@@ -421,6 +474,12 @@
     const idx = messages.findIndex(
       (m) => m.id === msg.id || (!!msg.remote_id && m.remote_id === msg.remote_id)
     );
+    // A run that stops short of the live end has nothing to append to: the row is stored, and
+    // scrolling down reads it with the page it belongs to.
+    if (idx < 0 && hasNewer) return;
+    // An edit or receipt for a row above the loaded page belongs up there, not under the newest.
+    const newest = messages.at(-1);
+    if (idx < 0 && newest && new Date(msg.timestamp).getTime() < new Date(newest.timestamp).getTime()) return;
     // An updated row from the core carries no reactions of its own: keep the ones shown.
     messages =
       idx >= 0
@@ -626,6 +685,11 @@
       await reloadConversationList();
       searchMessageHits = [];
     }
+    const pending = restoreConversationId;
+    if (pending) {
+      restoreConversationId = null;
+      if (conversations.some((c) => c.id === pending)) await selectConversation(pending);
+    }
     if (!prefillStarted) {
       prefillStarted = true;
       void prefillMessageCache();
@@ -666,11 +730,30 @@
     }
   }
 
+  /** Replace the open run with a page the backend just read, flags included. */
+  function applyWindow(next: MessageWindow) {
+    messages = next.messages;
+    hasOlder = next.hasOlder;
+    hasNewer = next.hasNewer;
+  }
+
+  /** The run as the window helpers see it. */
+  function currentWindow(): MessageWindow {
+    return { messages, hasOlder, hasNewer };
+  }
+
+  /** Drop the run when no chat is open. */
+  function clearMessages() {
+    applyWindow(emptyWindow());
+    loadingOlder = false;
+    loadingNewer = false;
+  }
+
   async function loadMessages(convId: string) {
-    const loaded = await getMessages(convId);
-    messageCache.set(convId, loaded);
+    const page = await getMessagePage(convId);
+    messageCache.set(convId, page.messages);
     if (selectedConversationId === convId) {
-      messages = loaded;
+      applyWindow(openWindow(page));
       messagesLoading = false;
     }
     const conv = conversations.find((c) => c.id === convId);
@@ -684,6 +767,63 @@
       c.id === convId ? { ...c, unread_count: 0 } : c
     );
     noteLocalListChange();
+  }
+
+  /**
+   * Re-read what the open chat holds, for an event that may have changed stored rows the reader
+   * already sees. A run that reaches the newest message takes the newest page; a run stopped short
+   * of the live end (a jump into history) re-reads its own span, so no page is thrown away.
+   */
+  async function refreshWindow(convId: string) {
+    if (selectedConversationId !== convId) return;
+    const held = currentWindow();
+    const newest = held.messages[held.messages.length - 1];
+    const deepInHistory = held.hasNewer && !!newest;
+    const limit = Math.max(held.messages.length, MESSAGE_PAGE_ROWS);
+    const page = await getMessagePage(
+      convId,
+      deepInHistory ? { kind: 'from', message_id: newest.id } : { kind: 'newest' },
+      limit
+    );
+    if (selectedConversationId !== convId) return;
+    applyWindow(deepInHistory ? reReadSpan(held, page) : mergeNewest(held, page));
+    messageCache.set(convId, messages);
+  }
+
+  /** The page of history above the run, read when the reader scrolls to the top. */
+  async function loadOlder() {
+    const convId = selectedConversationId;
+    const oldest = messages[0];
+    if (!convId || !oldest || loadingOlder || !hasOlder) return;
+    loadingOlder = true;
+    try {
+      const page = await getMessagePage(convId, { kind: 'before', message_id: oldest.id });
+      if (selectedConversationId !== convId) return;
+      applyWindow(prependOlder(currentWindow(), page));
+    } catch (e) {
+      // The row the page keyed on is gone; start the run again instead of leaving it stuck.
+      console.error('older page failed', e);
+      await loadMessages(convId).catch(() => {});
+    } finally {
+      loadingOlder = false;
+    }
+  }
+
+  /** The page below a run the reader jumped into history from, read at the bottom. */
+  async function loadNewer() {
+    const convId = selectedConversationId;
+    const newest = messages[messages.length - 1];
+    if (!convId || !newest || loadingNewer || !hasNewer) return;
+    loadingNewer = true;
+    try {
+      const page = await getMessagePage(convId, { kind: 'after', message_id: newest.id });
+      if (selectedConversationId !== convId) return;
+      applyWindow(appendNewer(currentWindow(), page));
+    } catch (e) {
+      console.error('newer page failed', e);
+    } finally {
+      loadingNewer = false;
+    }
   }
 
   async function activateAccount(accountId: string | null) {
@@ -701,11 +841,16 @@
   async function selectConversation(id: string) {
     if (selectedConversationId && !messagesLoading) messageCache.set(selectedConversationId, messages);
     selectedConversationId = id;
+    draft = draftFor(id);
     listFocusId = id;
     mobileView = 'thread';
     contactView = null;
     const cached = messageCache.get(id);
     messages = cached ?? [];
+    hasOlder = false;
+    hasNewer = false;
+    loadingOlder = false;
+    loadingNewer = false;
     messagesLoading = !cached;
     const conv = conversations.find((c) => c.id === id);
     const load = loadMessages(id).catch((e) => {
@@ -729,7 +874,7 @@
     selectedConversationId = null;
     listFocusId = null;
     showArchived = false;
-    messages = [];
+    clearMessages();
     mobileView = 'list';
     mobileTab = 'inbox';
     await activateAccount(id);
@@ -740,7 +885,7 @@
     mobileTab = tab;
     mobileView = 'list';
     selectedConversationId = null;
-    messages = [];
+    clearMessages();
   }
 
   async function handleSearch(q: string) {
@@ -766,8 +911,8 @@
   }
 
   /**
-   * Scroll the open thread to a message and flash it, loading older history first when it is
-   * not among the loaded messages (todo and note quotes use this).
+   * Scroll the open thread to a message and flash it (todo and note quotes use this). A message
+   * outside the loaded run is read around instead of widening the run a page at a time.
    */
   async function jumpToMessage(messageId: string) {
     const convId = selectedConversationId;
@@ -777,28 +922,23 @@
       return threadView?.scrollToMessage(messageId) ?? false;
     };
     if (messages.some((m) => m.id === messageId) && (await show())) return;
-    let limit = Math.max(messages.length * 2, 1000);
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const loaded = await getMessages(convId, limit);
-      if (selectedConversationId !== convId) return;
-      messages = loaded;
-      if (loaded.some((m) => m.id === messageId)) {
-        await show();
-        return;
-      }
-      if (loaded.length < limit) return; // whole history loaded: the message is gone
-      limit *= 4;
-    }
+    const page = await getMessagePage(convId, { kind: 'around', message_id: messageId });
+    if (selectedConversationId !== convId) return;
+    if (!page.messages.some((m) => m.id === messageId)) return; // deleted since the jump started
+    applyWindow(openWindow(page));
+    await show();
   }
 
   async function jumpToSearchHit(hit: SearchMessageHit) {
-    selectedConversationId = hit.message.conversation_id;
+    const convId = hit.message.conversation_id;
+    selectedConversationId = convId;
     mobileView = 'thread';
-    await activateAccount(hit.account_id);
-    messages = await getMessages(hit.message.conversation_id);
     searchQuery = '';
     searchMessageHits = [];
+    await activateAccount(hit.account_id);
     await refresh();
+    await loadMessages(convId);
+    await jumpToMessage(hit.message.id);
   }
 
   async function handleStartCall(mode: 'audio' | 'video') {
@@ -814,7 +954,7 @@
   async function toggleArchived() {
     showArchived = !showArchived;
     selectedConversationId = null;
-    messages = [];
+    clearMessages();
     mobileView = 'list';
     await refresh();
   }
@@ -831,7 +971,10 @@
       const sent = await sendMessage(conversation.account_id, conversation.id, text, replyTarget?.id);
       if (selectedConversationId === conversation.id) {
         const exists = messages.some((m) => m.id === sent.id);
-        if (!exists) messages = [...messages, sent];
+        // Sending from a run that stops short of the live end returns to the newest page, where
+        // the new message is, instead of leaving a hole under the rows on screen.
+        if (!exists && hasNewer) applyWindow(openWindow(await getMessagePage(conversation.id)));
+        else if (!exists) messages = [...messages, sent];
       }
       patchConversation({
         ...conversation,
@@ -841,8 +984,10 @@
         last_message_sender_id: null,
         last_message_sender_name: null,
       });
-      const latestMessages = await getMessages(conversation.id);
-      if (selectedConversationId === conversation.id) messages = latestMessages;
+      const latestMessages = await getMessagePage(conversation.id);
+      if (selectedConversationId === conversation.id) {
+        applyWindow(mergeNewest(currentWindow(), latestMessages));
+      }
     } catch (e) {
       sendError = e instanceof Error ? e.message : String(e);
       await loadMessages(conversation.id);
@@ -1490,6 +1635,28 @@
     void updateTrayUnread(unreadTotal);
   });
 
+  const DRAFT_SAVE_DEBOUNCE_MS = 400;
+  let draftSaveTimer: number | undefined;
+
+  // The open filters, chat and half-written replies outlive the window, so the tray can rebuild
+  // it without the user losing their place.
+  $effect(() => {
+    if (!hydrated) return;
+    saveUiPlace({
+      workspaceId: selectedWorkspace,
+      accountId: selectedAccountId,
+      conversationId: selectedConversationId,
+    });
+  });
+
+  $effect(() => {
+    const conversationId = selectedConversationId;
+    const body = draft;
+    if (!hydrated || !conversationId) return;
+    window.clearTimeout(draftSaveTimer);
+    draftSaveTimer = window.setTimeout(() => saveDraft(conversationId, body), DRAFT_SAVE_DEBOUNCE_MS);
+  });
+
   $effect(() => {
     if (selectedConversationId && !listFocusId) {
       listFocusId = selectedConversationId;
@@ -1511,6 +1678,8 @@
     window.addEventListener('resize', measureExtras);
     window.addEventListener('keydown', handleGlobalKeydown);
     listConnectors().then((c) => (connectors = c));
+    void checkForNewRelease(true);
+    const updateTimer = setInterval(() => void checkForNewRelease(false), 6 * 60 * 60 * 1000);
     getAppConfig().then((cfg) => {
       appConfig = cfg;
       applyAppConfig(cfg);
@@ -1519,6 +1688,16 @@
     if (setupOnly) {
       showSetup = true;
     } else {
+      const saved = loadUiState();
+      selectedWorkspace = saved.workspaceId;
+      selectedAccountId = saved.accountId;
+      restoreConversationId = saved.conversationId;
+      hydrated = true;
+      void currentCall()
+        .then((call) => {
+          if (call) activeCall = call;
+        })
+        .catch(() => {});
       refresh();
     }
     void markAppReady(Math.round(performance.now() - startedAt));
@@ -1550,11 +1729,7 @@
             ? event.payload.account_id === open?.account_id
             : !!open && (accountsHit ?? []).includes(open.account_id);
         if (open && touched) {
-          getMessages(open.id)
-            .then((fresh) => {
-              if (selectedConversationId === open.id) messages = fresh;
-            })
-            .catch(() => {});
+          refreshWindow(open.id).catch(() => {});
         }
       }
       if (event.kind === 'avatar.updated') {
@@ -1717,7 +1892,7 @@
           conv &&
           (typeof remote !== 'string' || !remote || conv.remote_id === remote)
         ) {
-          messages = await getMessages(selectedConversationId);
+          await refreshWindow(selectedConversationId);
         }
       }
       if (
@@ -1745,9 +1920,11 @@
       phoneQuery.removeEventListener('change', syncPhone);
       window.removeEventListener('resize', measureExtras);
       window.removeEventListener('keydown', handleGlobalKeydown);
+      clearInterval(updateTimer);
       window.clearTimeout(inboxReloadTimer);
       window.clearTimeout(unreadCountsTimer);
       window.clearTimeout(profileTimer);
+      window.clearTimeout(draftSaveTimer);
       unsub.then((fn) => fn());
     };
   });
@@ -1777,6 +1954,16 @@
       <button type="button" onclick={() => (sendError = null)} aria-label="Dismiss">×</button>
     </div>
   {/if}
+  {#if updateNoticeOpen && availableUpdate}
+    <UpdateNotice
+      update={availableUpdate}
+      onview={() => {
+        updateNoticeOpen = false;
+        selectMobileTab('settings');
+      }}
+      onclose={() => (updateNoticeOpen = false)}
+    />
+  {/if}
   <div class="sidebar-wrap" class:hidden-mobile={mobileView === 'thread'}>
     <Sidebar
       accounts={accountsForRail}
@@ -1787,8 +1974,12 @@
       {unreadCounts}
       {mobileTab}
       settingsActive={settingsOpen}
+      updateAvailable={!!availableUpdate}
       ontabchange={selectMobileTab}
-      onsettings={() => selectMobileTab('settings')}
+      onsettings={() => {
+        updateNoticeOpen = false;
+        selectMobileTab('settings');
+      }}
       onaccountmenu={accountMenu}
     />
   </div>
@@ -1936,6 +2127,11 @@
         conversation={selectedConversation}
         {messages}
         loading={messagesLoading}
+        hasolder={hasOlder}
+        hasnewer={hasNewer}
+        loadingolder={loadingOlder}
+        onloadolder={loadOlder}
+        onloadnewer={loadNewer}
         {accounts}
         {draft}
         ondraft={(v) => (draft = v)}
@@ -1952,6 +2148,7 @@
         {connectors}
         onmsgmenu={msgMenu}
         {translations}
+        onstartchat={openStartedChat}
         ondismisstranslation={(id) => (translations = Object.fromEntries(Object.entries(translations).filter(([k]) => k !== id)))}
         onselectionaction={runSelectionAction}
         ontextmenu={textMenu}

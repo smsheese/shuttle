@@ -198,6 +198,31 @@ pub struct Message {
     pub reply: Option<ReplyPreview>,
 }
 
+/// Where a message page starts. Every anchor but `Newest` names a message the caller already
+/// holds, so the page picks up at the same total order the database pages on.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MessageAnchor {
+    /// The newest messages of the chat.
+    Newest,
+    /// Strictly older than the named message.
+    Before { message_id: String },
+    /// The named message and older ones (re-reading a window the reader already holds).
+    From { message_id: String },
+    /// Strictly newer than the named message, oldest first.
+    After { message_id: String },
+    /// Half older, half newer around the named message (a jump to a search hit).
+    Around { message_id: String },
+}
+
+/// One contiguous page of a chat, oldest first, and whether the chat continues on each side.
+#[derive(Debug, Clone, Serialize)]
+pub struct MessagePage {
+    pub messages: Vec<Message>,
+    pub has_older: bool,
+    pub has_newer: bool,
+}
+
 /// What a reply's quote block shows. Built from the stored original when it exists, else from
 /// the snippet the connector reported (`available` is then false and the quote is not a link).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -33,3 +33,18 @@ test('keeps the newest rows of a chat and replaces older ones', () => {
   cache.set('a', rows('m4'));
   assert.deepEqual(cache.get('a').map((row) => row.id), ['m4']);
 });
+
+test('an entry idle past the time limit is dropped, and reading refreshes it', () => {
+  let t = 0;
+  const cache = new MessageCache(5, 100, 1000, () => t);
+  cache.set('a', rows('a1'));
+  cache.set('b', rows('b1'));
+  t = 600;
+  assert.ok(cache.get('a'));
+  t = 1200;
+  assert.equal(cache.sweep(), 1);
+  assert.equal(cache.has('b'), false);
+  assert.equal(cache.has('a'), true);
+  t = 2500;
+  assert.equal(cache.get('a'), undefined);
+});

@@ -456,6 +456,7 @@ mod consent_tests {
         cfg.privacy = PrivacyConfig {
             crash_reports: false,
             usage_diagnostics: true,
+            ..PrivacyConfig::default()
         };
         config.save(cfg).unwrap();
         let mgr = TelemetryManager::new("0.1.0", "id".into(), config, db);

@@ -281,6 +281,8 @@ impl ComponentManager {
         let manifest = self.fetch_manifest().await.ok();
         let registry = self.registry.lock().clone();
         let python_ready = self.python_runtime_ready();
+        // A usable system Python stands in for the managed runtime, so it is not "missing".
+        let python_system = !python_ready && detect_system_python().is_some();
         let connectors = CONNECTORS
             .iter()
             .map(|row| ConnectorComponentStatus {
@@ -291,10 +293,10 @@ impl ComponentManager {
                     .iter()
                     .map(|id| {
                         let artifact = manifest.as_ref().and_then(|m| m.artifact(platform, id));
-                        let optional = *id == "python-runtime" && !python_ready;
+                        let optional = *id == "python-runtime" && !python_ready && !python_system;
                         let managed = registry.components.get(*id);
                         let installed = if *id == "python-runtime" {
-                            python_ready
+                            python_ready || python_system
                         } else {
                             registry.is_installed(id) || dev_component_exists(id)
                         };
@@ -307,7 +309,11 @@ impl ComponentManager {
                                 .and_then(|c| c.version.clone())
                                 .or_else(|| artifact.and_then(|a| a.version.clone())),
                             size: artifact.map(|a| a.size).filter(|size| *size > 0),
-                            source: managed.map(|c| c.source.clone()),
+                            source: if *id == "python-runtime" && python_system {
+                                Some("system".to_string())
+                            } else {
+                                managed.map(|c| c.source.clone())
+                            },
                         }
                     })
                     .collect(),

@@ -95,6 +95,12 @@ Nothing animates while the app is idle: the sidebar's active-account ring is a s
 
 On Linux the WebView gets WebKit's smallest cache model (`DocumentViewer`), no page cache and no WebGL, since the UI draws 2D canvas only. `performance.low_memory_webview` in `config.json` (default `true`) turns that off when something needs WebGL (see [storage.md](storage.md#configjson)). Windows and macOS keep their engines' defaults, and the hardware-acceleration policy is unchanged on all three. Conversation rows carry `content-visibility: auto`, so rows below the fold skip layout and paint until they scroll into view.
 
+Closing the window hides it to the tray, so for most of the day Shuttle's WebView is alive for a UI nobody is looking at. After `performance.unload_hidden_after_secs` hidden (default 120), `src-tauri/src/main_window.rs` destroys the window and its renderer process exits. The tray icon, a second launch and the macOS Dock icon all go through `main_window::show`, which rebuilds the window from the `main` entry in `tauri.conf.json` and re-runs the per-window setup (`prepare_main_window`). The frontend restores the open chat, its filters and each chat's unsent draft from one small `localStorage` key, and `current_call` puts a call panel back.
+
+On Linux, destroying the window is not enough on its own: WebKitGTK keeps its `WebProcess` (the renderer) running, so the unload also calls `webkit_web_view_terminate_web_process`. Measured on this repo's dev build, a loaded window held about 137 MB of app PSS plus 191 MB of renderer and 40 MB of network process; with the window unloaded it was 165 MB of app PSS and 45 MB of network process, with no renderer process at all. A rebuild takes 0.1-0.2 s to map the window and about a second to paint the same chat. Windows (WebView2) and macOS (WKWebView) compile and follow the same lifecycle, but whether their renderer exits on unload was not measured here.
+
+The unload is held off while a call is ringing or connected (`call.*` events tracked in Rust), and `RunEvent::ExitRequested` with no exit code is prevented, because losing the last window is not a quit: tray Quit and restart pass a code and still exit.
+
 ### Microphone access (voice notes)
 
 The recorder calls `navigator.mediaDevices.getUserMedia`, which every webview engine treats as a permission request. Shuttle answers it for its own UI in `src-tauri/src/permissions.rs` (`allow_microphone`, called from `setup` once the main window exists) and leaves every other request on the engine's default answer.

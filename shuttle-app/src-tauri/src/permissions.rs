@@ -47,7 +47,7 @@ pub fn is_app_url(url: &str) -> bool {
 }
 
 /// Grants the microphone to the main window's webview. Call once, when the window exists.
-pub fn allow_microphone(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+pub fn allow_microphone<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) -> tauri::Result<()> {
     #[cfg(target_os = "linux")]
     {
         window.with_webview(|platform| install_on(&platform.inner()))

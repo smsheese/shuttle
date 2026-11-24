@@ -3,7 +3,7 @@
   import { SvelteSet } from 'svelte/reactivity';
   import DateTimePopover from '$lib/components/DateTimePopover.svelte';
   import { nextMinute, toLocalDateTime } from '$lib/localDateTime';
-  import { avatarColor, conversationAvatar, downloadMessageMedia, downloadMessageMediaAndWait, fetchContactProfile, getInitials, listContacts, openExternal, readMessageMedia } from '$lib/api';
+  import { avatarColor, conversationAvatar, downloadMessageMedia, downloadMessageMediaAndWait, fetchContactProfile, getInitials, listContacts, openExternal, readMessageMedia, searchMessages, startConversation } from '$lib/api';
   import { mediaNameOwner, saveMessageMediaFile, shouldAutoDownload } from '$lib/mediaSave';
   import NetworkIcon from '$lib/components/NetworkIcon.svelte';
   import EmojiPickerPop from '$lib/components/EmojiPickerPop.svelte';
@@ -11,6 +11,10 @@
   import ImageEditor from '$lib/components/ImageEditor.svelte';
   import MediaLightbox, { type LightboxItem } from '$lib/components/MediaLightbox.svelte';
   import PollCard from '$lib/components/PollCard.svelte';
+  import ContactCard from '$lib/components/ContactCard.svelte';
+  import LocationCard from '$lib/components/LocationCard.svelte';
+  import LinkPreviewCard from '$lib/components/LinkPreviewCard.svelte';
+  import { firstUrl, richPayload } from '$lib/messageKinds';
   import { pollDataFromMessage } from '$lib/poll';
   import { giphyUrlToBase64, type GiphyItem } from '$lib/giphy';
   import {
@@ -21,6 +25,8 @@
     mediaFailed,
     mediaFilename,
     mediaIconLabel,
+    isInlineMediaKind,
+    isUnsupportedKind,
     mediaKindFromMessage,
     mediaPathFromMessage,
     mediaSizeFromMessage,
@@ -46,7 +52,7 @@
   import { wrapSelection } from '$lib/richText';
   import { composeLocked } from '$lib/composeLock';
   import { senderHue, senderKey, senderLabel } from '$lib/senderIdentity';
-  import { CONNECTOR_COLORS, type Account, type AttachmentKind, type AttachmentPayload, type Contact, type Conversation, type Message, type ReactionGroup } from '$lib/types';
+  import { CONNECTOR_COLORS, type Account, type AttachmentKind, type AttachmentPayload, type Contact, type Conversation, type Message, type ReactionGroup, type SearchMessageHit } from '$lib/types';
   import {
     classifyFile,
     removeAttachment,
@@ -91,6 +97,13 @@
     oncancelreply?: () => void;
     /** Jump to a message by its local id (the quote of a reply links to its original). */
     onjumptomessage?: (messageId: string) => void;
+    /** The chat holds older messages above the ones shown: the reader reached the top. */
+    hasolder?: boolean;
+    /** The chat holds newer messages below the ones shown (the run stops short of the live end). */
+    hasnewer?: boolean;
+    loadingolder?: boolean;
+    onloadolder?: () => void;
+    onloadnewer?: () => void;
     onback?: () => void;
     showBack?: boolean;
     onmsgmenu?: (msg: Message, x: number, y: number) => void;
@@ -104,6 +117,8 @@
     /** Translations shown under messages, by message id. */
     translations?: Record<string, TranslationView>;
     ondismisstranslation?: (messageId: string) => void;
+    /** A chat was opened or created from a shared contact card. */
+    onstartchat?: (conv: Conversation) => void;
     /** An action of the selection bar, with the selected messages in chat order. */
     onselectionaction?: (action: SelectionAction, msgs: Message[]) => void;
   }
@@ -121,6 +136,11 @@
     replyingTo = null,
     oncancelreply,
     onjumptomessage,
+    hasolder = false,
+    hasnewer = false,
+    loadingolder = false,
+    onloadolder,
+    onloadnewer,
     onback,
     showBack = false,
     onmsgmenu,
@@ -133,6 +153,7 @@
     channelColor,
     translations = {},
     ondismisstranslation,
+    onstartchat,
     onselectionaction,
   }: Props = $props();
   let composerEl = $state<HTMLTextAreaElement | null>(null);
@@ -167,6 +188,30 @@
   let fileDocEl = $state<HTMLInputElement | null>(null);
   let chatSearchOpen = $state(false);
   let chatSearchQuery = $state('');
+  /**
+   * Hits from the database for the in-chat find, so it reaches history the run has not loaded.
+   * Clicking one asks the parent to read the page around that message and scroll to it.
+   */
+  let chatHits = $state<SearchMessageHit[]>([]);
+
+  $effect(() => {
+    const query = chatSearchQuery.trim();
+    const convId = conversation?.id;
+    chatHits = [];
+    if (!query || !convId) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void searchMessages(query, 'conversation', undefined, convId)
+        .then((results) => {
+          if (!cancelled) chatHits = results.messages.slice(0, 30);
+        })
+        .catch(() => {});
+    }, 200);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  });
   let messagesEl = $state<HTMLDivElement | null>(null);
   let lightboxOpen = $state(false);
   let lightboxId = $state<string | null>(null);
@@ -194,6 +239,8 @@
   );
 
   const listAheadOfBodies = $derived.by(() => {
+    // A run stopped short of the live end is meant to end early: that is a jump, not a gap.
+    if (hasnewer) return false;
     const listAt = conversation?.last_message_at
       ? Date.parse(conversation.last_message_at)
       : NaN;
@@ -280,6 +327,16 @@
   const callFallback = $derived(
     callMenu ? whatsappCallFallback(callMenu, conversation?.remote_id) : null
   );
+
+  async function openContactChat(digits: string, name: string) {
+    if (!conversation) return;
+    try {
+      const conv = await startConversation(conversation.account_id, `${digits}@s.whatsapp.net`, name);
+      onstartchat?.(conv);
+    } catch {
+      // the card keeps its other actions; a failed start leaves the thread as it was
+    }
+  }
 
   function startCall(mode: 'audio' | 'video') {
     if (callTarget === 'connector') {
@@ -398,6 +455,7 @@
   const mediaTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
   // Audio the user pressed play on while it was not downloaded: play it once it arrives.
   const playWhenReady = new Set<string>();
+  let videoErrors = $state<Set<string>>(new Set());
   let mediaTimedOut = $state<Set<string>>(new Set());
   /** Downloads in flight (started by the user or automatically). */
   let downloading = $state<Set<string>>(new Set());
@@ -431,7 +489,7 @@
     return mediaFailed(msg) || mediaTimedOut.has(msg.id);
   }
 
-  function playOnReady(node: HTMLAudioElement, id: string) {
+  function playOnReady(node: HTMLMediaElement, id: string) {
     if (playWhenReady.delete(id)) void node.play().catch(() => {});
   }
 
@@ -463,6 +521,8 @@
   // the view back; every reaction, receipt or thumbnail update re-ran it the same way.)
   const BOTTOM_THRESHOLD = 80;
   const AT_END = 24;
+  /** How close to the top asks for the previous page of history. */
+  const OLDER_THRESHOLD = 320;
   let atBottom = true;
   /** The reader moved up on purpose (wheel, touch): stays set until they are back at the end. */
   let leftBottom = false;
@@ -503,6 +563,17 @@
     } else {
       atBottom = !leftBottom && distance < BOTTOM_THRESHOLD;
     }
+    requestPages(el, distance);
+  }
+
+  /**
+   * Ask for the page on the side the reader reached. The parent ignores a request while one is in
+   * flight (`loadingolder`), and the page that arrives prepends under the same anchor the effects
+   * below already restore, so one scroll gesture never loads twice.
+   */
+  function requestPages(el: HTMLElement, distance: number) {
+    if (hasolder && !loadingolder && el.scrollTop < OLDER_THRESHOLD) onloadolder?.();
+    if (hasnewer && distance <= AT_END) onloadnewer?.();
   }
 
   function onMessagesWheel(e: WheelEvent) {
@@ -560,6 +631,9 @@
 
       if (pendingSnapToLatest) {
         if (count > 0) snapToLatest();
+      } else if (hasnewer) {
+        // The run stops short of the live end: nothing may pull the view down to it, and a row
+        // appended to the run leaves what the reader is looking at where it is.
       } else if (newTail && ((atBottom && !leftBottom) || justSent)) {
         snapToLatest();
       } else if (prepended) {
@@ -728,7 +802,7 @@
       if (mediaFailed(msg) || path) continue;
       // Only media the effective setting (chat override, else account default) allows is fetched
       // by itself; everything else waits for the user. Voice notes still download on play.
-      if (!shouldAutoDownload(kind, chatPrefs, accountPrefs) || requestedMedia.has(msg.id)) continue;
+      if (!shouldAutoDownload(kind, chatPrefs, accountPrefs, mediaSizeFromMessage(msg)) || requestedMedia.has(msg.id)) continue;
       requestedMedia.add(msg.id);
       downloading = toggleIn(downloading, msg.id, true);
       if (!mediaTimeouts.has(msg.id)) {
@@ -1506,6 +1580,19 @@
         />
         <button type="button" onclick={() => { chatSearchOpen = false; chatSearchQuery = ''; }} aria-label="Close search">×</button>
       </div>
+      {#if chatHits.length}
+        <ul class="chat-hits" aria-label="Messages that match in this chat">
+          {#each chatHits as hit (hit.message.id)}
+            <li>
+              <button type="button" onclick={() => onjumptomessage?.(hit.message.id)}>
+                <span class="hit-sender">{hit.message.direction === 'outbound' ? 'You' : (hit.message.sender_name ?? '')}</span>
+                <span class="hit-body">{hit.message.body || '\ud83d\udcce Media'}</span>
+                <span class="hit-time">{formatMsgTime(hit.message.timestamp)}</span>
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
     {/if}
 
     <!-- The time and ticks row. A poll card draws it inside its own frame, above "View votes". -->
@@ -1551,6 +1638,9 @@
           </p>
         </div>
       {/if}
+      {#if loadingolder}
+        <div class="thread-loading older" role="status" aria-label="Loading older messages"><span class="thread-spinner"></span></div>
+      {/if}
       {#if listAheadOfBodies && !loading}
         <div class="thread-empty-msgs history-gap">
           <p class="hint">
@@ -1566,11 +1656,13 @@
         {@const showDate = !prev || dateKey(prev.timestamp) !== dateKey(msg.timestamp)}
         {@const kind = mediaKindFromMessage(msg)}
         {@const poll = pollDataFromMessage(msg)}
+        {@const rich = kind ? null : richPayload(msg)}
         {@const pollInCard = kind === 'poll' && !!poll}
         {@const media = mediaUrlFor(msg)}
         {@const caption = captionText(msg)}
         {@const filename = mediaFilename(msg)}
         {@const revoked = isRevoked(msg)}
+        {@const previewUrl = !rich && !revoked && !kind ? firstUrl(msg.body) : null}
         {@const translation = translations[msg.id]}
         {@const hasContent = !!kind || !!caption || revoked}
         {@const searchHit = chatSearchQuery.trim() && (msg.body || '').toLowerCase().includes(chatSearchQuery.trim().toLowerCase())}
@@ -1655,9 +1747,16 @@
               {:else if media}
                 <div class="video-wrap">
                   <!-- svelte-ignore a11y_media_has_caption -->
-                  <video class="msg-media" src={media} controls></video>
+                  <video class="msg-media" src={media} controls playsinline preload="metadata" use:playOnReady={msg.id} onerror={() => (videoErrors = toggleIn(videoErrors, msg.id, true))}></video>
                   <button type="button" class="video-expand" onclick={() => openLightboxForMessage(msg)} aria-label="Expand video">⛶</button>
                 </div>
+                {#if videoErrors.has(msg.id)}
+                  <p class="hint">
+                    This video can't be played here.
+                    <button type="button" class="link-btn" onclick={() => conversation && saveMessageMediaFile(conversation.account_id, conversation.id, msg, nameOwner)}>Save it</button>
+                    to open it in your video player.
+                  </p>
+                {/if}
               {:else}
                 {@const state = mediaUnavailable(msg) ? 'failed' : downloading.has(msg.id) ? 'downloading' : 'idle'}
                 {@const thumb = thumbUrls[msg.id]}
@@ -1668,7 +1767,7 @@
                   class:sticker={kind === 'sticker'}
                   class:has-thumb={!!thumb}
                   disabled={state === 'downloading'}
-                  onclick={() => startDownload(msg)}
+                  onclick={() => startDownload(msg, kind === 'video')}
                   aria-label={state === 'failed' ? `Retry downloading ${mediaIconLabel(kind)}` : `Download ${mediaIconLabel(kind)}${size ? ` (${size})` : ''}`}
                 >
                   {#if thumb}
@@ -1731,21 +1830,30 @@
                   </button>
                 {/if}
               </div>
+            {:else if rich?.kind === 'contact'}
+              <ContactCard contact={rich} onAccent={msg.direction === 'outbound'} onmessage={conversation ? (digits, name) => openContactChat(digits, name) : undefined} />
+            {:else if rich?.kind === 'location'}
+              <LocationCard location={rich} />
             {:else if pollInCard}
               <PollCard {poll} {msg} trailing={msgFooter} onAccent={msg.direction === 'outbound'} />
-            {:else if kind === 'contact' || kind === 'poll' || kind === 'event' || kind === 'location'}
+            {:else if kind}
               <div class="media-card">
                 <span class="media-card-label">{mediaIconLabel(kind)}</span>
                 {#if caption}
                   <p>{caption}</p>
+                {:else if isUnsupportedKind(kind)}
+                  <p class="hint">Shuttle can't show this kind of message yet. Open it on your phone.</p>
                 {/if}
               </div>
             {/if}
             {#if kind && shouldDownloadMedia(kind) && mediaUnavailable(msg) && !media}
               <p class="hint">{typeof msg.metadata?.media_error === 'string' ? msg.metadata.media_error : 'Media download timed out.'}</p>
             {/if}
-            {#if caption && kind !== 'contact' && kind !== 'poll' && kind !== 'event' && kind !== 'location'}
+            {#if caption && !rich && (!kind || isInlineMediaKind(kind))}
               {@render messageBody(msg, caption, !!searchHit)}
+            {/if}
+            {#if previewUrl}
+              {#key previewUrl}<LinkPreviewCard url={previewUrl} />{/key}
             {/if}
             {#if translation}
               <div class="translation" class:failed={translation.state === 'error'} aria-live="polite">
@@ -3586,6 +3694,57 @@
     cursor: pointer;
   }
 
+  .chat-hits {
+    list-style: none;
+    margin: 0;
+    padding: 0 12px 6px;
+    max-height: 40vh;
+    overflow-y: auto;
+    border-bottom: 1px solid var(--border-subtle);
+    background: var(--bg-panel);
+  }
+
+  .chat-hits button {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    width: 100%;
+    padding: 6px 8px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-primary);
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .chat-hits button:hover {
+    background: var(--bg-hover);
+  }
+
+  .chat-hits .hit-sender {
+    flex: none;
+    max-width: 30%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-muted);
+  }
+
+  .chat-hits .hit-body {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .chat-hits .hit-time {
+    flex: none;
+    color: var(--text-muted);
+    font-size: 11px;
+  }
+
   .msg-row.search-hit .bubble {
     outline: 1px solid var(--accent);
   }
@@ -3665,6 +3824,28 @@
   .thread-loading {
     margin: auto;
     padding: 40px 20px;
+  }
+
+  .thread-loading.older {
+    /* Overlays the top of the thread: a spinner that grew the container would move the rows the
+       reader is looking at before the page they asked for arrives. */
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    height: 0;
+    padding: 0;
+    overflow: visible;
+    display: flex;
+    justify-content: center;
+    pointer-events: none;
+  }
+
+  .thread-loading.older .thread-spinner {
+    width: 16px;
+    height: 16px;
+    margin-top: 8px;
+    padding: 3px;
+    background: var(--bg-panel);
   }
 
   .thread-spinner {
@@ -3800,5 +3981,14 @@
     .empty-thread {
       display: none;
     }
+  }
+  .link-btn {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
   }
 </style>

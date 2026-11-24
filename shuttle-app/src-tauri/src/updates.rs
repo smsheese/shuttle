@@ -51,6 +51,8 @@ pub struct UpdateCheck {
     pub latest: String,
     pub available: bool,
     pub notes_url: String,
+    /// Release body (the changelog for `latest`), Markdown.
+    pub notes: String,
     pub asset: Option<UpdateAsset>,
     /// `SHA256SUMS` asset of the same release, when the publisher ships one.
     pub checksums_url: Option<String>,
@@ -62,6 +64,8 @@ struct RawRelease {
     tag_name: String,
     #[serde(default)]
     html_url: String,
+    #[serde(default)]
+    body: Option<String>,
     #[serde(default)]
     prerelease: bool,
     #[serde(default)]
@@ -261,6 +265,7 @@ impl UpdateManager {
         let check = UpdateCheck {
             available: is_newer(&latest, &current),
             notes_url: release.html_url,
+            notes: release.body.unwrap_or_default(),
             current,
             latest,
             asset,

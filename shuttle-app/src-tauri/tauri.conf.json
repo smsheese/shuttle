@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Shuttle",
-  "version": "0.6.4",
+  "version": "0.7.0",
   "identifier": "com.shuttle.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -25,7 +25,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' https: http://localhost:* ws://localhost:*; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https: asset: http://asset.localhost; media-src 'self' data: asset: http://asset.localhost; frame-src 'self' asset: http://asset.localhost",
+      "csp": "default-src 'self'; connect-src 'self' https: http://localhost:* ws://localhost:*; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https: asset: http://asset.localhost; media-src 'self' data: asset: http://asset.localhost; frame-src 'self' asset: http://asset.localhost https://www.youtube-nocookie.com https://player.vimeo.com http://127.0.0.1:*",
       "assetProtocol": {
         "enable": true,
         "scope": []

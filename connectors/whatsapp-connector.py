@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import ctypes
 import json
 import os
 import queue
@@ -45,6 +47,10 @@ CONNECTOR_ID = "whatsapp"
 VERSION = "1.0.0"
 CAPABILITIES = ["text", "media", "read_receipts", "groups"]
 GOWA_USER = "shuttle"
+# Go's soft heap limit for the GOWA sidecar. It binds only once a history sync or a media burst
+# has grown GOWA's heap past it, which is when the process would otherwise keep that memory
+# (and get swapped) until its next GC. An operator can override it from the environment.
+GOWA_MEMORY_LIMIT = "64MiB"
 # GOWA v9.9.0 route under /message/:message_id for each message op (checked on the pinned binary).
 MESSAGE_OP_ROUTES = {
     "react": "reaction",
@@ -101,6 +107,39 @@ def read_line() -> Optional[dict[str, Any]]:
     if not line:
         return {}
     return json.loads(line)
+
+
+# glibc keeps freed heap pages, so one bulk job (a history import, a large media buffer) leaves
+# tens of MB of free memory in the process for the kernel to swap out. musl, macOS and Windows
+# hand it back on their own, so both calls are Linux + glibc only and do nothing anywhere else.
+_M_ARENA_MAX = -8
+try:
+    _libc = ctypes.CDLL(None)
+    _mallopt = _libc.mallopt
+    _mallopt.argtypes = [ctypes.c_int, ctypes.c_int]
+    _mallopt.restype = ctypes.c_int
+    _malloc_trim = _libc.malloc_trim
+    _malloc_trim.argtypes = [ctypes.c_size_t]
+    _malloc_trim.restype = ctypes.c_int
+except (AttributeError, OSError):
+    _mallopt = None
+    _malloc_trim = None
+
+
+def limit_malloc_arenas() -> None:
+    """Stop each thread from holding a spare heap (glibc caps arenas at 8 per core by default)."""
+    if _mallopt is None:
+        return
+    with contextlib.suppress(Exception):
+        _mallopt(_M_ARENA_MAX, 2)
+
+
+def release_free_heap() -> None:
+    """Give free heap pages back to the OS once a bulk job is done (see `limit_malloc_arenas`)."""
+    if _malloc_trim is None:
+        return
+    with contextlib.suppress(Exception):
+        _malloc_trim(0)
 
 
 def data_dir() -> Path:
@@ -413,6 +452,7 @@ def load_or_start_gowa(
                 "DB_URI": f"file:{home / 'storages' / 'whatsapp.db'}?_foreign_keys=on",
             }
         )
+        env.setdefault("GOMEMLIMIT", GOWA_MEMORY_LIMIT)
         cmd = [
             str(binary),
             "rest",
@@ -1603,6 +1643,10 @@ _NESTED_TEXT_SKIP = {
 }
 
 _MIME_TEXT_RE = re.compile(r"^[a-z]+/[a-z0-9.+-]+\s*(;.*)?$", re.IGNORECASE)
+# A message's own timestamp, which GOWA rows carry and nested_text can pick up as a caption.
+_TIMESTAMP_TEXT_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$"
+)
 # GOWA's live webhook names the media by type instead of sending a `media_type` field.
 _LIVE_MEDIA_KEYS = ("image", "video", "audio", "document", "sticker")
 # The file hash WhatsApp puts in the body of a media message that has no caption.
@@ -1654,7 +1698,7 @@ def _is_media_noise(text: str, row: dict[str, Any], extra: dict[str, Any]) -> bo
     """Body text of a media message that is not a caption: the sender's name, a mime type, a file
     hash or the file's own name. Real captions are kept."""
     t = text.strip()
-    if _MIME_TEXT_RE.match(t) or _FILE_HASH_RE.match(t):
+    if _MIME_TEXT_RE.match(t) or _FILE_HASH_RE.match(t) or _TIMESTAMP_TEXT_RE.match(t):
         return True
     names = {str(row.get(k)).strip() for k in _NAME_KEYS if row.get(k)}
     if t in names:
@@ -2074,40 +2118,50 @@ def parse_history_conversations(paths: list[Path]) -> tuple[list[dict[str, Any]]
             continue
         readable.append(path)
         rows = payload.get("conversations") if isinstance(payload, dict) else None
-        if not isinstance(rows, list):
-            continue
-        for conv in rows:
-            if not isinstance(conv, dict):
-                continue
-            cid = str(
-                conv.get("pnJID")
-                or conv.get("pnJid")
-                or conv.get("ID")
-                or conv.get("id")
-                or ""
-            )
-            if not cid or cid.endswith("@broadcast") or cid.startswith("status@"):
-                continue
-            prev = merged.get(cid)
-            if prev is None:
-                merged[cid] = conv
-                continue
-            # Unchanged from before: the earlier dump's messages are only kept when it had some.
-            prev_msgs: list[Any] = _as_list(conv.get("messages")) if isinstance(prev.get("messages"), list) else []
-            new_msgs: list[Any] = _as_list(conv.get("messages"))
-            by_id: dict[str, Any] = {}
-            for wrap in [*prev_msgs, *new_msgs]:
-                if not isinstance(wrap, dict):
-                    continue
-                msg = wrap.get("message") if isinstance(wrap.get("message"), dict) else wrap
-                key = (msg.get("key") or {}) if isinstance(msg, dict) else {}
-                mid = str(key.get("ID") or key.get("id") or wrap.get("msgOrderID") or len(by_id))
-                by_id[mid] = wrap
-            prev["messages"] = list(by_id.values())
-            for field in ("name", "pnJID", "conversationTimestamp"):
-                if conv.get(field) not in (None, "", 0) and not prev.get(field):
-                    prev[field] = conv.get(field)
+        if isinstance(rows, list):
+            for conv in rows:
+                if isinstance(conv, dict):
+                    merge_history_conversation(merged, conv)
+        # One dump is resident at a time: what the merge kept is reachable from `merged`, and the
+        # rest of this payload (the rows it skipped, its wrapper, its text) goes before the next
+        # dump is read, so a run never holds two dumps at once.
+        del payload, rows
     return list(merged.values()), readable
+
+
+def merge_history_conversation(
+    merged: dict[str, dict[str, Any]], conv: dict[str, Any]
+) -> None:
+    """Fold one dump conversation into the merge: the first row wins, a later one adds its
+    messages and any name, JID or timestamp the first row was missing."""
+    cid = str(
+        conv.get("pnJID") or conv.get("pnJid") or conv.get("ID") or conv.get("id") or ""
+    )
+    if not cid or cid.endswith("@broadcast") or cid.startswith("status@"):
+        return
+    prev = merged.get(cid)
+    if prev is None:
+        merged[cid] = conv
+        return
+    # One row per message id: the later dump's copy of a message replaces the earlier one. The
+    # map is built from this dump's messages, and twice when the earlier row had a message list,
+    # which is what the merge has always done: a wrap with no id of its own then lands under its
+    # position in each pass, so it is reported twice.
+    pending = _as_list(conv.get("messages"))
+    twice = isinstance(prev.get("messages"), list)
+    by_id: dict[str, Any] = {}
+    for _ in range(2 if twice else 1):
+        for wrap in pending:
+            if not isinstance(wrap, dict):
+                continue
+            msg = wrap.get("message") if isinstance(wrap.get("message"), dict) else wrap
+            key = (msg.get("key") or {}) if isinstance(msg, dict) else {}
+            mid = str(key.get("ID") or key.get("id") or wrap.get("msgOrderID") or len(by_id))
+            by_id[mid] = wrap
+    prev["messages"] = list(by_id.values())
+    for field in ("name", "pnJID", "conversationTimestamp"):
+        if conv.get(field) not in (None, "", 0) and not prev.get(field):
+            prev[field] = conv.get(field)
 
 
 def history_message_fields(wrap: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -3444,10 +3498,18 @@ class WhatsAppSession:
         ]
         if not pending:
             return
+        facts: list[dict[str, str]] = []
+        readable: list[Path] = []
         try:
-            convs = self._read_dump_conversations(pending)
-            readable = [p for p, _ in convs]
-            facts = self._store_dump_thumbnails([c for _, rows in convs for c in rows])
+            for path in pending:
+                # One dump at a time: its previews are written, then that parsed dump goes before
+                # the next one is read, so this pass never holds every dump at once.
+                convs = self._read_dump_conversations(path)
+                if convs is None:
+                    continue
+                readable.append(path)
+                facts.extend(self._store_dump_thumbnails(convs))
+                del convs
         except Exception as e:
             log(f"dump thumbnails: {type(e).__name__}")
             return
@@ -3458,17 +3520,15 @@ class WhatsAppSession:
         log(f"dump thumbnails: {len(facts)} previews from {len(readable)} dump(s)")
 
     @staticmethod
-    def _read_dump_conversations(paths: list[Path]) -> list[tuple[Path, list[dict[str, Any]]]]:
-        """Conversations per readable dump, status broadcasts included (their posts have previews)."""
-        out: list[tuple[Path, list[dict[str, Any]]]] = []
-        for path in paths:
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-            except Exception:
-                continue
-            rows = payload.get("conversations") if isinstance(payload, dict) else None
-            out.append((path, [c for c in rows if isinstance(c, dict)] if isinstance(rows, list) else []))
-        return out
+    def _read_dump_conversations(path: Path) -> list[dict[str, Any]] | None:
+        """Conversations of one dump, or None when it cannot be read. Status broadcasts included:
+        their posts carry previews."""
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            return None
+        rows = payload.get("conversations") if isinstance(payload, dict) else None
+        return [c for c in rows if isinstance(c, dict)] if isinstance(rows, list) else []
 
     def _emit_message(self, ref: dict[str, Any], msg: dict[str, Any], history: bool) -> None:
         remote = ref["remote_id"]
@@ -4215,6 +4275,7 @@ class WhatsAppSession:
             self._repair_history_dumps()
             self._repair_dump_replies()
             self._backfill_dump_thumbnails()
+            release_free_heap()
             return
         convs, readable = parse_history_conversations(pending)
         imported = 0
@@ -4258,6 +4319,7 @@ class WhatsAppSession:
         self._repair_history_dumps()
         self._repair_dump_replies()
         self._backfill_dump_thumbnails()
+        release_free_heap()
 
     def _emit_dump_reactions(self, ref: dict[str, Any], wraps: Any) -> int:
         """Report the reactions stored on a chat's dump messages. Returns how many were sent."""
@@ -5440,6 +5502,8 @@ class WhatsAppSession:
                 {"file": (filename or "file.bin", raw, mime)},
             )
         self._send_reply(code, body, kind, remote_id, request_id)
+        # A media send holds the whole file in memory plus its base64: hand the free pages back.
+        release_free_heap()
 
     def mark_read(self, remote_id: str, message_id: Optional[str] = None) -> None:
         """Send a read receipt for `message_id` (the newest inbound message). No id: no-op."""
@@ -5512,10 +5576,8 @@ class WhatsAppSession:
         self.stop.set()
         if _sessions_by_account.get(self.account_id) is self:
             _sessions_by_account.pop(self.account_id, None)
-        try:
+        with contextlib.suppress(Exception):
             self.state.save()
-        except Exception:
-            pass
         # GOWA is shared across accounts in this process; stopped in main()'s finally.
 
 
@@ -5753,6 +5815,7 @@ class Dispatcher:
 
 
 def main() -> None:
+    limit_malloc_arenas()
     spawn_parent_death_watchdog()
     dispatcher = Dispatcher(os.environ.get("SHUTTLE_ACCOUNT_ID"))
     try:

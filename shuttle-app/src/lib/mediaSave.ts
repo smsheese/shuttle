@@ -55,14 +55,26 @@ export function effectiveAutoDownload(
   return chat?.[group] ?? account?.[group] ?? AUTO_DOWNLOAD_DEFAULTS[group];
 }
 
+/** Largest audio file that downloads without a tap when the user has not chosen. */
+export const AUDIO_AUTO_DOWNLOAD_MAX_BYTES = 8 * 1024 * 1024;
+
 /** Whether a message's media should download by itself (voice play always downloads on demand). */
 export function shouldAutoDownload(
   kind: string | null | undefined,
   chat?: AutoDownloadPrefs | null,
-  account?: AutoDownloadPrefs | null
+  account?: AutoDownloadPrefs | null,
+  sizeBytes?: number | null
 ): boolean {
+  const k = (kind ?? '').toLowerCase();
   // A sticker is not a file the reader chooses to fetch: it is the message. It always loads.
-  if ((kind ?? '').toLowerCase() === 'sticker') return true;
+  if (k === 'sticker') return true;
+  // A voice note is small and meant to be played in place. It loads by itself unless the chat
+  // or account turned Files off on purpose; a large audio file still waits for a tap.
+  if (k === 'audio' || k === 'ptt') {
+    const chosen = chat?.files ?? account?.files;
+    if (chosen !== undefined && chosen !== null) return chosen;
+    return !sizeBytes || sizeBytes <= AUDIO_AUTO_DOWNLOAD_MAX_BYTES;
+  }
   const group = autoDownloadGroup(kind);
   return group !== null && effectiveAutoDownload(group, chat, account);
 }

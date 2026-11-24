@@ -16,6 +16,7 @@ const PREVIEW_LABELS: Record<string, string> = {
   poll: '📊 Poll',
   event: '📅 Event',
   location: '📍 Location',
+  call: '📞 Call',
 };
 
 const DOWNLOADABLE = new Set([
@@ -35,6 +36,7 @@ export function normalizeMediaKind(raw: string | null | undefined): string | nul
   const k = raw.toLowerCase();
   if (k === 'ptt') return 'audio';
   if (k === 'photo') return 'image';
+  if (k === 'video_note' || k === 'ptv') return 'video';
   return k;
 }
 
@@ -180,6 +182,7 @@ function isMediaNoise(msg: Message, body: string): boolean {
   const name = (msg.sender_name ?? '').trim();
   if (name && body === name) return true;
   if (/^[a-z]+\/[a-z0-9.+-]+\s*(;.*)?$/i.test(body)) return true;
+  if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$/.test(body)) return true;
   const filename = mediaFilename(msg);
   return !!filename && body === filename;
 }
@@ -226,6 +229,18 @@ export function shouldDownloadMedia(kind: string | null): boolean {
 
 export function mediaIconLabel(kind: string): string {
   return PREVIEW_LABELS[kind] ?? kind;
+}
+
+/** Kinds the thread draws as a file or inline media; anything else gets a card. */
+const INLINE_KINDS = new Set(['image', 'sticker', 'video', 'audio', 'document']);
+
+export function isInlineMediaKind(kind: string | null | undefined): boolean {
+  return !!kind && INLINE_KINDS.has(kind);
+}
+
+/** True for a kind with no dedicated rendering, so the card says so instead of going blank. */
+export function isUnsupportedKind(kind: string | null | undefined): boolean {
+  return !!kind && !INLINE_KINDS.has(kind) && !(kind in PREVIEW_LABELS);
 }
 
 export function listPreview(preview: string | null | undefined): string {

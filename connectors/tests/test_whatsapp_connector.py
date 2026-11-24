@@ -264,6 +264,16 @@ def thumb_wrap(mid, key="imageMessage", thumb=JPEG, **extra):
     return {"message": {"key": {"ID": mid, "fromMe": False}, "message": {key: part}, "messageTimestamp": 1740823200}}
 
 
+def text_wrap(mid, text):
+    return {
+        "message": {
+            "key": {"ID": mid, "fromMe": False},
+            "message": {"conversation": text},
+            "messageTimestamp": 1740823200,
+        }
+    }
+
+
 class MediaCacheTests(unittest.TestCase):
     """Downloads go to the app-private cache, never to the user's Documents folder."""
 
@@ -772,6 +782,128 @@ class HistoryDumpTests(unittest.TestCase):
                         with Capture() as cap2:
                             s.refresh_chat(PHONE)
                 self.assertEqual(cap2.events("chat.synced")[0]["payload"]["remote_id"], PHONE)
+
+
+class HistoryMergeTests(unittest.TestCase):
+    """`parse_history_conversations` merges dumps: one row per chat, one row per message id."""
+
+    def _dumps(self, store: Path) -> tuple[Path, Path, Path]:
+        older = store / "history-1700-628100000001:1@s.whatsapp.net-1-INITIAL_BOOTSTRAP.json"
+        newer = store / "history-1700-628100000001:1@s.whatsapp.net-2-RECENT.json"
+        broken = store / "history-1700-628100000001:1@s.whatsapp.net-3-PUSH_NAME.json"
+        older.write_text(
+            json.dumps(
+                {
+                    "conversations": [
+                        {
+                            "ID": PHONE,
+                            "messages": [
+                                text_wrap("M1", "older only"),
+                                text_wrap("M2", "older copy"),
+                                "not a wrap",
+                            ],
+                        },
+                        {"ID": "status@broadcast", "messages": [text_wrap("S1", "a status")]},
+                        {
+                            "ID": "120363000000000000@broadcast",
+                            "messages": [text_wrap("B1", "a broadcast")],
+                        },
+                        {"pnJID": "628222222222@s.whatsapp.net", "messages": []},
+                    ]
+                }
+            )
+        )
+        newer.write_text(
+            json.dumps(
+                {
+                    "conversations": [
+                        {
+                            "ID": PHONE,
+                            "name": "Bob",
+                            "conversationTimestamp": 1740823300,
+                            "messages": [
+                                text_wrap("M2", "newer copy"),
+                                text_wrap("M3", "newer only"),
+                                {"msgOrderID": "M4", "message": {"conversation": "no key id"}},
+                                {
+                                    "message": {
+                                        "key": {"id": "M5"},
+                                        "message": {"conversation": "lowercase id"},
+                                    }
+                                },
+                                {"message": {"key": {"ID": "", "fromMe": False}}},
+                            ],
+                        }
+                    ]
+                }
+            )
+        )
+        broken.write_text("{half a dump")
+        return older, newer, broken
+
+    def test_first_row_wins_and_the_later_dump_brings_its_messages(self):
+        with tempfile.TemporaryDirectory() as d:
+            older, newer, broken = self._dumps(Path(d))
+            convs, readable = wa.parse_history_conversations([older, newer, broken])
+            self.assertEqual([p.name for p in readable], [older.name, newer.name])
+            self.assertEqual(
+                [c.get("ID") or c.get("pnJID") for c in convs],
+                [PHONE, "628222222222@s.whatsapp.net"],
+            )
+            merged = convs[0]
+            # The later dump's copy of a message replaces the earlier one, and a message that
+            # only the earlier dump had is not carried over (that is what the merge has always
+            # produced). A wrap with no id of its own lands under its position in each of the two
+            # passes the merge makes over a chat's messages, so it shows up twice.
+            self.assertEqual(
+                [w["message"].get("key", {}).get("ID") for w in merged["messages"]],
+                ["M2", "M3", None, None, "", ""],
+            )
+            self.assertEqual(
+                [w["message"].get("key", {}).get("id") for w in merged["messages"][2:4]],
+                [None, "M5"],
+            )
+            self.assertEqual(
+                merged["messages"][0]["message"]["message"]["conversation"], "newer copy"
+            )
+            self.assertEqual((merged["name"], merged["conversationTimestamp"]), ("Bob", 1740823300))
+
+
+class GowaEnvironmentTests(unittest.TestCase):
+    """The env the sidecar is started with: Go's heap limit is set, and an operator's wins."""
+
+    def _start(self, extra_env: dict[str, str]) -> dict[str, str]:
+        started: dict[str, dict[str, str]] = {}
+
+        class FakeProc:
+            pid = 4242
+
+            def kill(self) -> None:
+                pass
+
+        def fake_popen(cmd, **kwargs):
+            started["env"] = dict(kwargs["env"])
+            return FakeProc()
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.dict(os.environ, {"SHUTTLE_DATA_DIR": d, **extra_env}):
+                for var in ("SHUTTLE_GOWA_URL", "GOMEMLIMIT"):
+                    if var not in extra_env:
+                        os.environ.pop(var, None)
+                with (
+                    mock.patch.object(wa, "find_gowa_binary", lambda: Path("/bin/false")),
+                    mock.patch.object(wa, "_find_gowa_pids", lambda binary: []),
+                    mock.patch.object(wa, "wait_http", lambda *a, **k: True),
+                    mock.patch.object(wa.subprocess, "Popen", fake_popen),
+                ):
+                    wa.load_or_start_gowa()
+        return started["env"]
+
+    def test_the_sidecar_gets_a_go_heap_limit(self):
+        self.assertEqual(self._start({})["GOMEMLIMIT"], wa.GOWA_MEMORY_LIMIT)
+
+    def test_an_operator_value_wins(self):
+        self.assertEqual(self._start({"GOMEMLIMIT": "128MiB"})["GOMEMLIMIT"], "128MiB")
 
 
 class ChatSettingsTests(unittest.TestCase):
@@ -1818,6 +1950,10 @@ class MentionAndCaptionTests(unittest.TestCase):
         for blob in ("nDXT4hDDZalrGuLwhkDIwABBzwR5YkjTGaJcVPOhQJs=", "9f86d081884c7d659a2feaa0c55ad015"):
             text, _ = wa.message_body_and_media({"media_type": "image", "content": blob})
             self.assertEqual(text, "[image]", blob)
+        # The message's own timestamp is not a caption either.
+        for stamp in ("2026-11-24T07:09:13Z", "2026-11-24 07:09:13+00:00"):
+            text, _ = wa.message_body_and_media({"media_type": "image", "content": stamp})
+            self.assertEqual(text, "[image]", stamp)
         # A real caption stays.
         text, _ = wa.message_body_and_media({"media_type": "image", "content": "Look at this", "from_name": "Bob"})
         self.assertEqual(text, "Look at this")

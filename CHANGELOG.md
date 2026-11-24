@@ -9,8 +9,35 @@ Versions **0.0.1–0.0.9** reconstruct the development history from Cursor agent
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-24
+
 ### Added
-- Static landing page in `site/` (features, tweakcn themes, tech stack, feedback, download links), published to GitHub Pages by `.github/workflows/pages.yml`. Download buttons read the latest GitHub release at page load, pick the installer for the visitor's OS and CPU, and fall back to the releases page if the API is unavailable.
+- Update notices: Shuttle checks for a new release when it opens and every 6 hours while it runs (the Rust side still caches the GitHub answer for an hour). If one is found at launch, a popover next to the settings button shows the version and its release notes. If one turns up while the app is running, the settings button gets a dot with an up arrow instead.
+- Static landing page in `site/index.html` (features, why Shuttle, download links). Download buttons read the latest GitHub release at page load, pick the installer for the visitor's OS and CPU, and fall back to the releases page if the API is unavailable.
+- Shared WhatsApp contacts show as a contact card (name, number, Message, Copy number, Save .vcf) instead of `Contact: Name (+number)` text.
+- Shared locations show a small OpenStreetMap image with the coordinates, Open map and Copy coordinates, instead of a bare Google Maps link.
+- The first link in a message gets a preview card with a thumbnail, site, title and description.
+- YouTube and Vimeo links get a card with a play button that plays the video in the chat (through a page served on 127.0.0.1, which gives YouTube the normal web origin it needs), plus an Open in browser link. The title and description take one line each and scroll sideways when they are longer than the card.
+- Calls get a card, round videos play as videos, and a message type Shuttle can't show says so instead of rendering blank.
+- Settings → Privacy: "Show a preview card for the first link" and "Show a small map for shared locations", both on by default. The app fetches these itself (public addresses only, 3 redirects, 4 s, size caps) and caches them under `media_cache/previews`, capped at 50 MB.
+- Shuttle hands back its WebView memory while it sits hidden in the tray. After 120 seconds hidden (`performance.unload_hidden_after_secs`) the main window is destroyed and its renderer process exits; clicking the tray icon, launching Shuttle again, or the macOS Dock icon rebuilds it in about a second, with the open chat, its filters and every chat's unsent draft still in place. Notifications, account sync, reminders, scheduled sends and the tray unread count keep running in the background, and a ringing or connected call holds the window open. On Linux with the dev build a loaded window held about 368 MB of process PSS against 210 MB with the window unloaded. Settings → Performance turns this off and sets the delay.
+
+### Changed
+- The content security policy allows `frame-src` for `youtube-nocookie.com`, `player.vimeo.com` and the local `127.0.0.1` player page, for the video cards.
+- A chat's cached messages are dropped after 5 minutes without being opened, instead of staying for the whole session.
+- About: Components and Attributions are compact cards, four per row. Each card shows the name and a status or licence badge; versions, sizes and roles open on hover or keyboard focus (always visible on touch screens). The licence summary now sits under the app description.
+- Settings: channel colours moved into Appearance, Feedback moved into About, and the account cards sit up to four per row.
+- Chats open on their newest 50 messages instead of a 500-row slice, and reading further back loads another 50 each time you scroll to the top, keeping the message you were reading where it was. A long chat no longer holds its whole history in the window, so switching between chats costs less memory and paints sooner.
+- Jumping to a search hit, a reply quote, a todo or a note reads the page around that message and scrolls to it, instead of widening the loaded slice 1000, 4000, 16000 and 64000 rows at a time. Scrolling down from there loads the messages in between until you are back at the newest one.
+- Events that refresh a chat (a sync, purged or newly downloaded media) re-read what is on screen rather than replacing it, so history you scrolled to is not thrown away and a new message no longer resets the view.
+- Search in a chat now searches the whole chat, not only the loaded messages, and lists the hits with their sender and time so you can jump to any of them.
+
+### Fixed
+- About > Components read once and kept that answer, so a component that finished installing afterwards (for example the WhatsApp helper at launch) kept showing "Not installed". It now reads again each time About opens, and a usable system Python shows as "System Python" instead of a missing optional download.
+- The WhatsApp connector gives a history import's freed memory back to the OS and reads one history dump at a time (about 44 MB less held after an import and a 96 MB lower peak in a synthetic 112k-message test), and GOWA starts with a 64 MiB Go soft memory limit (`GOMEMLIMIT`, overridable from the environment).
+- Voice notes and audio up to 8 MB now download by themselves, so the player is there to press play; a Files setting you chose still wins. Larger audio waits for a tap.
+- Tapping a video downloads it and then plays it. A video that cannot be played here says so and offers Save.
+- Photos, voice messages and other media without a caption no longer show their own timestamp (`2026-11-24T07:09:13Z`) as caption text. Fixed in the WhatsApp connector for new messages, and in the chat view for messages already stored.
 
 ## [0.6.4] - 2026-11-24
 

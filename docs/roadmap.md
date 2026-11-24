@@ -362,7 +362,8 @@ Comparable **messaging** load for Shuttle: **4 WhatsApp accounts + 1 Telegram** 
 2. **Shared connector processes** — **landed** (one Python sidecar per network; attach multiple accounts). Native helpers (GOWA, TDLib, signal-cli) still scale with how those tools are spawned.
 3. **Lazy connectors** — keep release installers slim; never keep Signal’s JVM warm unless a Signal account is active (Signal is the known heavy sidecar).
 4. **No background webviews** — never embed ChatGPT / Slack / Gmail as webviews to “match Ferdium service count”; breadth comes from connectors or stays out of the resource budget.
-5. **Measure** — `scripts/rss-sample.sh` samples `shuttle` + child PIDs the same way as the Ferdium run.
+5. **Unload the hidden UI** — **landed** (`src-tauri/src/main_window.rs`): after `performance.unload_hidden_after_secs` hidden in the tray the window and its renderer are destroyed, and showing it again rebuilds it with the same chat and drafts. Dev-build measurement on Linux: 368 MB of process PSS loaded, 210 MB with the window unloaded, rebuild in about a second. Windows and macOS take the same path; their renderer exit is still unmeasured.
+6. **Measure** — `scripts/rss-sample.sh` samples `shuttle` + child PIDs the same way as the Ferdium run.
 
 Re-run the 4 WhatsApp + 1 Telegram idle hour and put Shuttle numbers in the table above — do not invent them.
 

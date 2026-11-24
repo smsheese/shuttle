@@ -5,6 +5,8 @@ mod config;
 mod connectors;
 mod db;
 mod env;
+mod link_preview;
+mod main_window;
 mod media_store;
 mod models;
 mod notifications;
@@ -19,7 +21,7 @@ use commands::{init_state, AppState, APP_HANDLE};
 use tauri::{Manager, RunEvent, WindowEvent};
 
 #[cfg(not(target_os = "macos"))]
-fn apply_window_icon(win: &tauri::WebviewWindow) -> tauri::Result<()> {
+fn apply_window_icon<R: tauri::Runtime>(win: &tauri::WebviewWindow<R>) -> tauri::Result<()> {
     #[cfg(target_os = "linux")]
     let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon-128.png"))
         .ok()
@@ -32,10 +34,25 @@ fn apply_window_icon(win: &tauri::WebviewWindow) -> tauri::Result<()> {
     }
 }
 
+/// Everything the main window needs that the config file alone cannot give it: engine tuning, its
+/// window icon, and the microphone grant. Runs at startup and again whenever the tray rebuilds
+/// the window after an unload.
+pub(crate) fn prepare_main_window<R: tauri::Runtime>(
+    win: &tauri::WebviewWindow<R>,
+) -> tauri::Result<()> {
+    #[cfg(target_os = "linux")]
+    if commands::performance_config(win.app_handle()).low_memory_webview {
+        apply_low_memory_webview(win);
+    }
+    #[cfg(not(target_os = "macos"))]
+    apply_window_icon(win)?;
+    permissions::allow_microphone(win)
+}
+
 /// Shrink WebKit's memory footprint for a local messaging UI: the smallest cache model, no
 /// page cache, and no WebGL (the frontend draws 2D canvas only). See docs/platforms.md.
 #[cfg(target_os = "linux")]
-fn apply_low_memory_webview(win: &tauri::WebviewWindow) {
+fn apply_low_memory_webview<R: tauri::Runtime>(win: &tauri::WebviewWindow<R>) {
     use webkit2gtk::{CacheModel, SettingsExt, WebContextExt, WebViewExt};
 
     let _ = win.with_webview(|platform| {
@@ -61,11 +78,7 @@ pub fn run() {
     {
         // Must be registered first so a second launch focuses the existing window.
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.show();
-                let _ = win.unminimize();
-                let _ = win.set_focus();
-            }
+            main_window::show(app);
         }));
     }
 
@@ -74,8 +87,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let state = init_state(app.handle());
-            #[cfg(target_os = "linux")]
-            let low_memory_webview = state.config.get().performance.low_memory_webview;
             // Downloads live in the app-private cache; older builds wrote to Documents, and
             // those files stay viewable.
             let cache = media_store::media_cache_root(state.db.data_dir());
@@ -90,23 +101,13 @@ pub fn run() {
                 .allow_directory(media_store::shuttle_documents_root(), true)?;
             app.manage(state);
             *APP_HANDLE.lock() = Some(app.handle().clone());
-            #[cfg(target_os = "linux")]
-            if low_memory_webview {
-                if let Some(win) = app.get_webview_window("main") {
-                    apply_low_memory_webview(&win);
-                }
-            }
             // macOS uses the application bundle icon (.icns, up to 1024 px) for the Dock. On
             // Windows and Linux, also apply a large icon to the native window: alt-tab
             // switchers read it (X11 `_NET_WM_ICON`) and a 32 px one looks pixelated.
             // Linux sets the 128 px PNG explicitly (GDK on X11 drops 512 px icons); Windows uses `default_window_icon()`,
             // which is the first `.ico` entry (256 px, see `bundle.icon` in tauri.conf.json).
-            #[cfg(not(target_os = "macos"))]
             if let Some(win) = app.get_webview_window("main") {
-                apply_window_icon(&win)?;
-            }
-            if let Some(win) = app.get_webview_window("main") {
-                permissions::allow_microphone(&win)?;
+                prepare_main_window(&win)?;
             }
             tray::setup_tray(app)?;
             Ok(())
@@ -129,11 +130,14 @@ pub fn run() {
             }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                main_window::hide(window.app_handle());
             }
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_accounts,
+            commands::get_link_preview,
+            commands::get_map_tile,
+            commands::get_embed_host,
             commands::list_connectors,
             commands::create_account,
             commands::delete_account,
@@ -173,6 +177,7 @@ pub fn run() {
             commands::reject_call,
             commands::hangup_call,
             commands::total_unread,
+            commands::current_call,
             commands::unread_by_account,
             commands::connect_account,
             commands::submit_auth,
@@ -230,11 +235,21 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| {
-            if let RunEvent::Exit = event {
+        .run(|app, event| match event {
+            RunEvent::ExitRequested { code, api, .. } => {
+                // The last window closing is not a quit the user asked for: the tray is.
+                if main_window::keeps_app_alive(code) {
+                    api.prevent_exit();
+                }
+            }
+            RunEvent::Exit => {
                 if let Some(state) = app.try_state::<AppState>() {
                     state.connectors.shutdown_all();
                 }
             }
+            // macOS sends this when the Dock icon is clicked with no window open.
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen { .. } => main_window::show(app),
+            _ => {}
         });
 }

@@ -27,8 +27,10 @@ import type {
   ForwardResult,
   ForwardTarget,
   Message,
+  MessageAnchor,
   MessageOp,
   MessageOpResult,
+  MessagePage,
   PriorityGroup,
   BackupManifest,
   ChatNote,
@@ -319,6 +321,59 @@ export async function downloadMessageMediaAndWait(
   }
 }
 
+export interface LinkPreview {
+  url: string;
+  title?: string;
+  description?: string;
+  site?: string;
+  /** Channel or author, when the page names one. */
+  author?: string;
+  /** Publication date, ISO 8601 as the page states it. */
+  published?: string;
+  /** Cached thumbnail path; turn it into a URL with `resolveThumbUrl`. */
+  image_path?: string;
+}
+
+const previewRequests = new Map<string, Promise<LinkPreview | null>>();
+const tileRequests = new Map<string, Promise<string | null>>();
+
+/** Preview of a link, fetched by the backend (never the webview). One request per URL per run. */
+export function getLinkPreview(url: string): Promise<LinkPreview | null> {
+  if (!isTauri()) return Promise.resolve(null);
+  let pending = previewRequests.get(url);
+  if (!pending) {
+    pending = invoke<LinkPreview | null>('get_link_preview', { url }).catch(() => null);
+    previewRequests.set(url, pending);
+  }
+  return pending;
+}
+
+/**
+ * Base URL of the loopback page that hosts a YouTube or Vimeo player so it sees a normal http
+ * origin (the webview's own `tauri://` origin makes YouTube fail with Error 153). Null outside
+ * the desktop app, where the page's own http origin already works.
+ */
+export async function getEmbedHost(): Promise<string | null> {
+  if (!isTauri()) return null;
+  try {
+    return await invoke<string>('get_embed_host');
+  } catch {
+    return null;
+  }
+}
+
+/** Cached map image path for a shared location, or null (off, offline, or no tiles). */
+export function getMapTile(lat: number, lng: number): Promise<string | null> {
+  if (!isTauri()) return Promise.resolve(null);
+  const key = `${lat},${lng}`;
+  let pending = tileRequests.get(key);
+  if (!pending) {
+    pending = invoke<string | null>('get_map_tile', { lat, lng }).catch(() => null);
+    tileRequests.set(key, pending);
+  }
+  return pending;
+}
+
 export async function readMessageMedia(path: string): Promise<string> {
   const localPath = await invoke<string>('read_message_media', { path });
   return convertFileSrc(localPath);
@@ -423,10 +478,21 @@ export async function updateConversation(
     : mockApi.updateConversation(conversationId, patch);
 }
 
-export async function getMessages(conversationId: string, limit?: number): Promise<Message[]> {
+/** The page a chat opens with, and the size every history and live-end page uses. */
+export const MESSAGE_PAGE_ROWS = 50;
+
+/**
+ * One page of a chat's messages, oldest first, with whether the chat has more on each side.
+ * The anchor names a message already on screen, so no timestamp ever crosses the IPC boundary.
+ */
+export async function getMessagePage(
+  conversationId: string,
+  anchor: MessageAnchor = { kind: 'newest' },
+  limit: number = MESSAGE_PAGE_ROWS
+): Promise<MessagePage> {
   return isTauri()
-    ? invoke('get_messages', { conversationId, limit })
-    : mockApi.getMessages(conversationId);
+    ? invoke('get_messages', { conversationId, limit, anchor })
+    : mockApi.getMessagePage(conversationId, anchor, limit);
 }
 
 export async function sendMessage(
@@ -600,6 +666,11 @@ export async function rejectCall(accountId: string, callId: string): Promise<voi
 
 export async function hangupCall(accountId: string, callId: string): Promise<void> {
   if (isTauri()) await invoke('hangup_call', { accountId, callId });
+}
+
+/** The call in progress, so a window rebuilt from the tray puts its call panel back. */
+export async function currentCall(): Promise<CallState | null> {
+  return isTauri() ? invoke('current_call') : null;
 }
 
 export async function unreadByAccount(): Promise<Record<string, number>> {

@@ -43,14 +43,13 @@
     | 'appearance'
     | 'notifications'
     | 'privacy'
-    | 'channels'
     | 'workspaces'
     | 'accounts'
     | 'media'
     | 'routing'
     | 'backup'
     | 'keyboard'
-    | 'feedback'
+    | 'performance'
     | 'about';
 
   interface Props {
@@ -184,14 +183,13 @@
     { id: 'appearance', label: 'Appearance' },
     { id: 'notifications', label: 'Notifications' },
     { id: 'privacy', label: 'Privacy' },
-    { id: 'channels', label: 'Channels' },
     { id: 'workspaces', label: 'Workspaces & priorities' },
     { id: 'accounts', label: 'Accounts' },
     { id: 'media', label: 'Media & storage' },
     { id: 'routing', label: 'Routing' },
     { id: 'backup', label: 'Backup' },
     { id: 'keyboard', label: 'Keyboard' },
-    { id: 'feedback', label: 'Feedback' },
+    { id: 'performance', label: 'Performance' },
     { id: 'about', label: 'About' },
   ];
 
@@ -210,14 +208,26 @@
 
   let aboutLoaded = false;
   $effect(() => {
-    if (activeTab !== 'about' || aboutLoaded) return;
+    if (activeTab !== 'about') {
+      aboutLoaded = false;
+      return;
+    }
+    if (aboutLoaded) return;
+    // Read again every time About opens: components can finish installing after the last look.
     aboutLoaded = true;
     void loadAbout();
   });
 
+  /** Both the About facts and the Linux-only performance toggle need the OS name. */
+  let appFactsRequested = false;
+  $effect(() => {
+    if (appFactsRequested || (activeTab !== 'about' && activeTab !== 'performance')) return;
+    appFactsRequested = true;
+    void appInfo().then((value) => (appFacts = value)).catch(() => (appFacts = null));
+  });
+
   async function loadAbout() {
     void telemetryInstallationId().then((id) => (installationId = id));
-    void appInfo().then((value) => (appFacts = value)).catch(() => (appFacts = null));
     void componentsOverview()
       .then((value) => (overview = value))
       .catch(() => (overview = null));
@@ -386,6 +396,35 @@
       ...config,
       privacy: { ...config.privacy, ...partial },
     });
+  }
+
+  /** The WebView tuning the Rust core reads; the panel's own copy of the defaults. */
+  type PerformanceCfg = {
+    low_memory_webview: boolean;
+    unload_hidden_window: boolean;
+    unload_hidden_after_secs: number;
+  };
+  const performanceDefaults: PerformanceCfg = {
+    low_memory_webview: true,
+    unload_hidden_window: true,
+    unload_hidden_after_secs: 120,
+  };
+
+  function patchPerformance(partial: Partial<PerformanceCfg>) {
+    onconfig({
+      ...config,
+      performance: { ...performanceCfg, ...partial } as AppConfig['performance'],
+    });
+  }
+
+  const performanceCfg = $derived({ ...performanceDefaults, ...config.performance } as PerformanceCfg);
+
+  /** The WebKit tuning below only exists on Linux; the unload works on every platform. */
+  const lowMemorySupported = $derived((appFacts?.os ?? '').toLowerCase().includes('linux'));
+
+  function setUnloadAfter(raw: string) {
+    const secs = Math.floor(Number(raw));
+    if (Number.isFinite(secs) && secs >= 5) patchPerformance({ unload_hidden_after_secs: Math.min(secs, 3600) });
   }
 
   function accountSleepMode(account: Account): 'default' | 'always' | 'custom' {
@@ -630,6 +669,18 @@
               {/each}
             </select>
           </label>
+          <h3 class="privacy-subhead">Channel colours</h3>
+          {#each connectors as c (c.id)}
+            <label class="channel">
+              <NetworkIcon connectorId={c.id} size={14} />
+              {c.name}
+              <input
+                type="color"
+                value={config.channel_styles[c.id]?.tag ?? CONNECTOR_COLORS[c.id] ?? '#888888'}
+                onchange={(e) => setChannelTag(c.id, e.currentTarget.value)}
+              />
+            </label>
+          {/each}
         </section>
       {:else if activeTab === 'notifications'}
         <section>
@@ -729,6 +780,28 @@
             />
             Send anonymous usage and performance diagnostics
           </label>
+          <h3 class="privacy-subhead">Link and map previews</h3>
+          <p class="hint">
+            Shuttle fetches these itself, never the chat view. A website sees this device's IP address
+            when a message with its link scrolls into view. OpenStreetMap sees roughly where a shared
+            location is. Turn either off and the cards still show the name, coordinates and link.
+          </p>
+          <label class="check">
+            <input
+              type="checkbox"
+              checked={config.privacy?.link_previews ?? true}
+              onchange={(e) => patchPrivacy({ link_previews: e.currentTarget.checked })}
+            />
+            Show a preview card for the first link in a message
+          </label>
+          <label class="check">
+            <input
+              type="checkbox"
+              checked={config.privacy?.map_tiles ?? true}
+              onchange={(e) => patchPrivacy({ map_tiles: e.currentTarget.checked })}
+            />
+            Show a small map for shared locations
+          </label>
           <h3 class="privacy-subhead">AI and translation (OpenRouter)</h3>
           <p class="hint">
             Off until you add your own OpenRouter key. Translate sends only the message you pick to
@@ -770,21 +843,6 @@
               onchange={(e) => patchIntegrations({ giphy_api_key: e.currentTarget.value.trim() })}
             />
           </label>
-        </section>
-      {:else if activeTab === 'channels'}
-        <section>
-          <h2>Channel colours</h2>
-          {#each connectors as c (c.id)}
-            <label class="channel">
-              <NetworkIcon connectorId={c.id} size={14} />
-              {c.name}
-              <input
-                type="color"
-                value={config.channel_styles[c.id]?.tag ?? CONNECTOR_COLORS[c.id] ?? '#888888'}
-                onchange={(e) => setChannelTag(c.id, e.currentTarget.value)}
-              />
-            </label>
-          {/each}
         </section>
       {:else if activeTab === 'workspaces'}
         <section>
@@ -1225,27 +1283,47 @@
             </tbody>
           </table>
         </section>
-      {:else if activeTab === 'feedback'}
+      {:else if activeTab === 'performance'}
         <section>
-          <h2>Feedback</h2>
+          <h2>Performance</h2>
           <p class="hint">
-            Found a bug or have an idea? The form lives on forms.tfs.qa and does not allow itself to be shown inside
-            another app, so Shuttle opens it in your browser. Nothing about your chats goes with it.
+            Shuttle lives in the tray most of the day. Unloading the hidden window hands back the memory its
+            WebView takes; showing it again rebuilds it from where you left off. Messages, notifications,
+            reminders and scheduled sends keep running either way.
           </p>
-          <div class="feedback-actions">
-            <button type="button" class="apply-theme-btn" onclick={() => void openLink(FEEDBACK_FORM_URL)}>
-              Open the feedback form
-            </button>
-            <button type="button" class="tiny" onclick={() => void copyDiagnostics()}>
-              {diagnosticsCopied ? 'Copied' : 'Copy diagnostics'}
-            </button>
-          </div>
+          <label class="check">
+            <input
+              type="checkbox"
+              checked={performanceCfg.unload_hidden_window}
+              onchange={(e) => patchPerformance({ unload_hidden_window: e.currentTarget.checked })}
+            />
+            Unload the window while hidden in the tray
+          </label>
+          <label>
+            Wait before unloading (seconds)
+            <input
+              type="number"
+              min="5"
+              max="3600"
+              value={performanceCfg.unload_hidden_after_secs}
+              onchange={(e) => setUnloadAfter(e.currentTarget.value)}
+              disabled={!performanceCfg.unload_hidden_window}
+            />
+          </label>
           <p class="hint">
-            The diagnostics line holds the app version, your OS, the platform key and the installed component ids. Paste
-            it into the form so we know what to reproduce.
+            A window that is ringing or in a call is never unloaded. Drafts, the open chat and your filters
+            come back with it.
           </p>
-          {#if diagnosticsCopied}
-            <p class="hint"><code>{diagnosticsLine}</code></p>
+          {#if lowMemorySupported}
+            <label class="check">
+              <input
+                type="checkbox"
+                checked={performanceCfg.low_memory_webview}
+                onchange={(e) => patchPerformance({ low_memory_webview: e.currentTarget.checked })}
+              />
+              Use WebKit's smallest caches and no WebGL (Linux)
+            </label>
+            <p class="hint">Takes effect the next time the window is built. Turn it off if something needs WebGL.</p>
           {/if}
         </section>
       {:else if activeTab === 'about'}
@@ -1255,6 +1333,7 @@
             Shuttle is a local-first unified messaging desktop app. One inbox for WhatsApp, Telegram, Signal, Messenger,
             Instagram, Matrix, and email — on your machine, not in the cloud.
           </p>
+          <p class="hint about-license">{SHUTTLE_LICENSE.summary}</p>
           <p class="hint">
             Created by
             <button type="button" class="linkish" onclick={() => openLink('https://shee.se')}>Sheese Sheikh</button>
@@ -1315,6 +1394,29 @@
         </section>
 
         <section>
+          <h2>Feedback</h2>
+          <p class="hint">
+            Found a bug or have an idea? The form lives on forms.tfs.qa and does not allow itself to be shown inside
+            another app, so Shuttle opens it in your browser. Nothing about your chats goes with it.
+          </p>
+          <div class="feedback-actions">
+            <button type="button" class="apply-theme-btn" onclick={() => void openLink(FEEDBACK_FORM_URL)}>
+              Open the feedback form
+            </button>
+            <button type="button" class="tiny" onclick={() => void copyDiagnostics()}>
+              {diagnosticsCopied ? 'Copied' : 'Copy diagnostics'}
+            </button>
+          </div>
+          <p class="hint">
+            The diagnostics line holds the app version, your OS, the platform key and the installed component ids. Paste
+            it into the form so we know what to reproduce.
+          </p>
+          {#if diagnosticsCopied}
+            <p class="hint"><code>{diagnosticsLine}</code></p>
+          {/if}
+        </section>
+
+        <section>
           <h2>Components</h2>
           <p class="hint">
             A network's components install only when you add or use an account on it. Nothing installs on its own.
@@ -1324,24 +1426,29 @@
               {overview.platform} · manifest v{overview.manifest_version ?? overview.expected_version}
               {#if !overview.manifest_available}(unreachable, so sizes show as unknown){/if}
             </p>
-            <div class="components-grid">
+            <div class="grid4">
               {#each overview.connectors as connector (connector.connector_id)}
-                <div class="component-group">
-                  <div class="component-group-head">
-                    <NetworkIcon connectorId={connector.connector_id} size={14} />
-                    {connector.connector_label}
+                {@const ready = connector.components.filter((c) => c.installed).length}
+                <div class="info-card">
+                  <div class="info-card-head">
+                    <NetworkIcon connectorId={connector.connector_id} size={16} />
+                    <span class="info-card-title">{connector.connector_label}</span>
+                    <span class="info-card-badge" class:ok={ready === connector.components.length}>
+                      {ready}/{connector.components.length}
+                    </span>
                   </div>
                   <ul class="component-list">
                     {#each connector.components as component (component.id)}
                       <li class="component-row" class:missing={!component.installed}>
-                        <span class="component-name">
-                          {component.label}{component.optional ? ' (optional)' : ''}
+                        <span class="component-line">
+                          <span class="status-dot" class:on={component.installed} class:optional={!component.installed && component.optional}></span>
+                          <span class="component-name">{component.label}{component.optional ? ' (optional)' : ''}</span>
                         </span>
-                        <span class="component-state">
-                          {component.installed ? (component.version ?? 'Installed') : 'Not installed'}
-                        </span>
-                        <span class="component-size">
-                          {component.size ? formatBytes(component.size) : 'Size unknown'}
+                        <span class="reveal">
+                          <span class="reveal-inner">
+                            {component.installed ? (component.version ?? (component.source === 'system' ? 'System Python' : 'Installed')) : 'Not installed'}
+                            · {component.size ? formatBytes(component.size) : 'size unknown'}
+                          </span>
                         </span>
                       </li>
                     {/each}
@@ -1356,45 +1463,40 @@
 
         <section>
           <h2>Attributions</h2>
-          <div class="attribution-grid">
-            <div class="attribution-block">
-              <h3>{SHUTTLE_LICENSE.name}</h3>
-              <p class="hint">{SHUTTLE_LICENSE.summary}</p>
-              <p class="attribution-meta">
-                <button type="button" class="linkish" onclick={() => openLink(SHUTTLE_LICENSE.url)}>
-                  {SHUTTLE_LICENSE.license}
-                </button>
-                ·
-                <button type="button" class="linkish" onclick={() => openLink(SHUTTLE_LICENSE.sourceUrl)}>
-                  Source
-                </button>
-              </p>
+          <div class="grid4">
+            <div class="info-card">
+              <div class="info-card-head">
+                <span class="info-card-title">{SHUTTLE_LICENSE.name}</span>
+                <span class="info-card-badge">{SHUTTLE_LICENSE.license}</span>
+              </div>
+              <span class="reveal">
+                <span class="reveal-inner">
+                  <button type="button" class="linkish" onclick={() => openLink(SHUTTLE_LICENSE.url)}>License</button>
+                  ·
+                  <button type="button" class="linkish" onclick={() => openLink(SHUTTLE_LICENSE.sourceUrl)}>Source</button>
+                </span>
+              </span>
             </div>
           </div>
 
           {#each ATTRIBUTION_SECTIONS as section (section.title)}
-            <div class="attribution-block">
-              <h3>{section.title}</h3>
-              <ul class="attribution-list">
-                {#each section.entries as entry (entry.name)}
-                  <li class="attribution-item">
-                    <div class="attribution-head">
-                      {#if entry.url}
-                        <button type="button" class="linkish name" onclick={() => openLink(entry.url)}>
-                          {entry.name}
-                        </button>
-                      {:else}
-                        <span class="name">{entry.name}</span>
-                      {/if}
-                      <span class="attribution-license">{entry.license}</span>
-                    </div>
-                    <span class="account-identity">{entry.role}</span>
-                    {#if entry.notes}
-                      <span class="account-identity">{entry.notes}</span>
+            <h3 class="section-sub">{section.title}</h3>
+            <div class="grid4">
+              {#each section.entries as entry (entry.name)}
+                <div class="info-card">
+                  <div class="info-card-head">
+                    {#if entry.url}
+                      <button type="button" class="linkish info-card-title" onclick={() => openLink(entry.url)}>{entry.name}</button>
+                    {:else}
+                      <span class="info-card-title">{entry.name}</span>
                     {/if}
-                  </li>
-                {/each}
-              </ul>
+                    <span class="info-card-badge">{entry.license}</span>
+                  </div>
+                  <span class="reveal">
+                    <span class="reveal-inner">{entry.role}{entry.notes ? ` — ${entry.notes}` : ''}</span>
+                  </span>
+                </div>
+              {/each}
             </div>
           {/each}
 
@@ -1570,7 +1672,7 @@
   /* Accounts and About blocks read as compact cards, two to four per row. */
   .account-list {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(max(220px, calc((100% - 30px) / 4)), 1fr));
     gap: 10px;
     align-items: start;
   }
@@ -1698,76 +1800,118 @@
     color: #ef4444;
     line-height: 1.5;
   }
-  .components-grid {
+  /* Up to four cards per row; extra detail opens on hover or keyboard focus. */
+  .grid4 {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(max(200px, calc((100% - 30px) / 4)), 1fr));
     gap: 10px;
     align-items: start;
+    margin-bottom: 14px;
   }
-  .component-group {
+  .info-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
     padding: 10px 12px;
     background: var(--bg-input);
+    border: 1px solid transparent;
     border-radius: var(--radius-md);
+    transition: border-color 0.15s, box-shadow 0.15s;
+    outline: none;
   }
-  .component-group-head {
+  .info-card:hover,
+  .info-card:focus-within {
+    border-color: var(--border);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+  }
+  .info-card-head {
     display: flex;
     align-items: center;
     gap: 6px;
+    min-width: 0;
+  }
+  .info-card-title {
+    flex: 1;
+    min-width: 0;
     font-size: 13px;
     font-weight: 600;
-    margin-bottom: 6px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .info-card-badge {
+    font-size: 10.5px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--bg-active, rgba(128, 128, 128, 0.18));
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  .info-card-badge.ok {
+    color: var(--accent);
   }
   .component-list {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 2px;
     padding: 0;
     margin: 0;
+    list-style: none;
   }
-  .component-row {
+  .component-line {
     display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: 2px 8px;
+    align-items: center;
+    gap: 7px;
     font-size: 12px;
   }
   .component-name {
-    flex: 1;
     min-width: 0;
-    color: var(--text-primary, inherit);
   }
-  .component-state {
-    font-size: 11px;
-    color: var(--text-muted);
+  .status-dot {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #f59e0b; /* not installed */
   }
-  .component-size {
-    font-size: 11px;
-    color: var(--text-muted);
-    margin-left: auto;
+  .status-dot.on {
+    background: #22c55e; /* installed */
   }
-  .component-row.missing .component-state {
-    color: var(--text-muted);
-    opacity: 0.8;
+  .status-dot.optional {
+    background: #9ca3af; /* optional, not installed */
   }
-  .attribution-grid {
+  .reveal {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-    gap: 10px;
-    align-items: start;
+    grid-template-rows: 0fr;
+    transition: grid-template-rows 0.18s ease;
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.4;
   }
-  .attribution-block {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    margin-bottom: 14px;
+  .reveal-inner {
+    overflow: hidden;
+    min-height: 0;
+    padding-left: 14px;
   }
-  .attribution-block h3 {
-    font-size: 14px;
+  .info-card:hover .reveal,
+  .info-card:focus-within .reveal {
+    grid-template-rows: 1fr;
+  }
+  @media (hover: none) {
+    .reveal {
+      grid-template-rows: 1fr;
+    }
+  }
+  .section-sub {
+    font-size: 12px;
     font-weight: 600;
-    color: var(--text-primary, inherit);
-    text-transform: none;
-    letter-spacing: normal;
-    margin: 0;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    margin: 14px 0 8px;
+  }
+  .about-license {
+    margin-top: -4px;
   }
   .feedback-actions {
     display: flex;
@@ -1783,43 +1927,6 @@
     color: inherit;
     text-transform: none;
     letter-spacing: normal;
-  }
-  .attribution-list {
-    list-style: none;
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-    gap: 8px;
-    padding: 0;
-    margin: 0;
-  }
-  .attribution-item {
-    padding: 8px 10px;
-    background: var(--bg-input);
-    border-radius: var(--radius-md);
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    font-size: 12px;
-  }
-  .attribution-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .attribution-head .name {
-    font-weight: 600;
-    font-size: 13px;
-  }
-  .attribution-license {
-    font-size: 11px;
-    color: var(--text-muted);
-    white-space: nowrap;
-  }
-  .attribution-meta {
-    font-size: 12px;
-    color: var(--text-muted);
   }
   .linkish {
     border: none;

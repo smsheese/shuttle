@@ -49,12 +49,21 @@ pub struct PerformanceConfig {
     /// Linux: shrink WebKit's caches and drop WebGL (nothing in the UI uses it). On by default.
     #[serde(default = "default_true")]
     pub low_memory_webview: bool,
+    /// Destroy the main window's WebView once it has sat hidden in the tray, so its renderer
+    /// process exits. Showing the window again rebuilds it. On by default.
+    #[serde(default = "default_true")]
+    pub unload_hidden_window: bool,
+    /// How long it stays hidden before that happens, in seconds.
+    #[serde(default = "default_unload_hidden_after_secs")]
+    pub unload_hidden_after_secs: u32,
 }
 
 impl Default for PerformanceConfig {
     fn default() -> Self {
         Self {
             low_memory_webview: true,
+            unload_hidden_window: true,
+            unload_hidden_after_secs: default_unload_hidden_after_secs(),
         }
     }
 }
@@ -263,7 +272,6 @@ fn default_sleep_check() -> u32 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
 pub struct PrivacyConfig {
     /// Send anonymous crash reports via PostHog when enabled.
     #[serde(default)]
@@ -271,11 +279,32 @@ pub struct PrivacyConfig {
     /// Send anonymous usage and performance diagnostics via PostHog when enabled.
     #[serde(default)]
     pub usage_diagnostics: bool,
+    /// Fetch a title, description and image for the first link in a message. The site sees
+    /// this device's IP address when a message is opened.
+    #[serde(default = "default_true")]
+    pub link_previews: bool,
+    /// Fetch a small OpenStreetMap image for shared locations. OpenStreetMap sees roughly
+    /// where the shared point is, and this device's IP address.
+    #[serde(default = "default_true")]
+    pub map_tiles: bool,
 }
 
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            crash_reports: false,
+            usage_diagnostics: false,
+            link_previews: true,
+            map_tiles: true,
+        }
+    }
+}
 
 fn default_true() -> bool {
     true
+}
+fn default_unload_hidden_after_secs() -> u32 {
+    120
 }
 fn default_quiet_start() -> String {
     "22:00".into()
